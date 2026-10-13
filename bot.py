@@ -124,7 +124,7 @@ async def blacklist_command(interaction: discord.Interaction, user: discord.Memb
     blacklisted_users.add(user.id)
     await interaction.response.send_message(f"🚫 {user.mention} has been added to the blacklist.", ephemeral=True)
 
-TOKEN = os.getenv("MTU1OTI3NTU4MDM1OTMxNTUzNw.G3VwVn.u9cboSRl4F0WoiAyPN6aGHukl5W7Ezz05v5fZI")
+TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
     bot.run(TOKEN)
 else:
