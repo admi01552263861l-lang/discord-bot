@@ -1,6 +1,7 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import os
+import io
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -31,6 +32,7 @@ bot = commands.Bot(command_prefix='!', intents=intents, allowed_mentions=allowed
 
 blacklisted_users = set()
 
+# أزرار الهدايا ونظام الدعوات المحدث (2 دعوات = 12 ساعة، 4 دعوات = 2 أيام)
 class GiftView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -76,14 +78,56 @@ class GiftView(discord.ui.View):
         except Exception:
             pass
 
-        if total_invites >= 2:
+        if total_invites >= 4:
             script_code = 'loadstring(game:HttpGet("https://raw.githubusercontent.com/..."))()'
             await interaction.response.send_message(
-                f"🎉 **Congratulations!** Here is your 1-Hour Script:\n```lua\n{script_code}\n```\n*Note: This key/script is valid for 1 hour.*",
+                f"🎉 **Congratulations!** You unlocked the **2 Days** Script (Cost: 4 invites):\n```lua\n{script_code}\n```",
+                ephemeral=True
+            )
+        elif total_invites >= 2:
+            script_code = 'loadstring(game:HttpGet("https://raw.githubusercontent.com/..."))()'
+            await interaction.response.send_message(
+                f"🎉 **Congratulations!** You unlocked the **12 Hours** Script (Cost: 2 invites):\n```lua\n{script_code}\n```",
                 ephemeral=True
             )
         else:
-            await interaction.response.send_message(f"⚠️ You need at least **2 invites** to redeem the script. You currently have **{total_invites}**.", ephemeral=True)
+            await interaction.response.send_message(f"⚠️ You need at least **2 invites** (for 12 hours) or **4 invites** (for 2 days). You currently have **{total_invites}** invites.", ephemeral=True)
+
+# أزرار أمر /steals (نعم / لا) وإرسال الملف المطلوب
+class StealConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Yes ✅", style=discord.ButtonStyle.success)
+    async def yes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # محتوى الملف الذي طلبته مع توجيه وضع الـ Webhook
+        lua_script_content = """-- ADD WEBHOOK: standalone Secret Brainrot steal notifier.
+local WEBHOOK_URL = "PUT_YOUR_WEBHOOK_HERE"
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local player = Players.LocalPlayer
+if not player then return end
+
+local function getRequestFunction()
+    if type(request) == "function" then return request end
+    if type(http_request) == "function" then return http_request end
+    if type(syn) == "table" and type(syn.request) == "function" then return syn.request end
+    return nil
+end
+
+print("Secret notifier loaded. Put your webhook in the file!")
+"""
+        file = discord.File(io.BytesIO(lua_script_content.encode('utf-8')), filename="add_webhook.lua")
+        await interaction.response.send_message(
+            "📁 **Here is your file!** Put your webhook in the file (`PUT_YOUR_WEBHOOK_HERE`) and run it.", 
+            file=file, 
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="No ❌", style=discord.ButtonStyle.danger)
+    async def no_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("❌ Cancelled.", ephemeral=True)
 
 @bot.event
 async def on_ready():
@@ -99,12 +143,17 @@ async def on_ready():
 async def gift_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🎁 Invite Rewards System",
-        description="Invite **2 members** to unlock the exclusive script for 1 hour!\n\nUse the buttons below to manage your invites and claim rewards.",
+        description="• **2 Invites** = 12 Hours Script ⏳\n• **4 Invites** = 2 Days Script 🚀\n\nUse the buttons below to manage your invites and claim rewards.",
         color=0x2b2d31
     )
     view = GiftView()
     await interaction.response.send_message("Panel created successfully!", ephemeral=True)
     await interaction.channel.send(embed=embed, view=view)
+
+@bot.tree.command(name="steals", description="Share your steal report")
+async def steals_command(interaction: discord.Interaction):
+    view = StealConfirmView()
+    await interaction.response.send_message("Hey, do you wanna share what you steal today?", view=view, ephemeral=True)
 
 @bot.tree.command(name="update", description="Send an update announcement")
 @app_commands.describe(details="Enter update details")
