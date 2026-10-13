@@ -1,3 +1,18 @@
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
+# خادم وهمي لإبقاء Render مصدقاً أن التطبيق يعمل كـ Web Service
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+def run_server():
+    server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
+    server.serve_forever()
+# تشغيل الخادم الوهمي في الخلفية
+threading.Thread(target=run_server, daemon=True).start()
 import discord
 from discord import app_commands
 from discord.ext import commands
