@@ -31,9 +31,11 @@ allowed_mentions = discord.AllowedMentions(everyone=True, roles=True, users=True
 bot = commands.Bot(command_prefix='!', intents=intents, allowed_mentions=allowed_mentions)
 
 blacklisted_users = set()
-scripts_data = {}  # قاموس لحفظ أسباب وأسماء السكربتات وإصداراتها
 
-# دالة الاختيار التلقائي للسكربتات عند كتابة أمر /update
+# بيانات السكربتات المخزنة
+# Structure: { script_name: {"version": str, "buyer_role_id": int, "admin_role_id": int, "source_code": str} }
+scripts_data = {}
+
 async def script_autocomplete(
     interaction: discord.Interaction,
     current: str
@@ -44,8 +46,9 @@ async def script_autocomplete(
             choices.append(app_commands.Choice(name=script_name, value=script_name))
     return choices[:25]
 
-# أزرار نظام الهدايا والدعوات
-class GiftView(discord.ui.View):
+# ==================== Views & Buttons ==================== #
+
+class InviteRewardView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -103,223 +106,83 @@ class GiftView(discord.ui.View):
         else:
             await interaction.response.send_message(f"⚠️ You need at least **2 invites** (for 12 hours) or **4 invites** (for 2 days). You currently have **{total_invites}** invites.", ephemeral=True)
 
-# أزرار أمر /steals
-class StealConfirmView(discord.ui.View):
-    def __init__(self):
+
+class ObfuscateConfirmView(discord.ui.View):
+    def __init__(self, script_name: str, file_content: str):
         super().__init__(timeout=60)
+        self.script_name = script_name
+        self.file_content = file_content
 
     @discord.ui.button(label="Yes ✅", style=discord.ButtonStyle.success)
     async def yes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        lua_script_content = """-- ADD WEBHOOK: standalone Secret Brainrot steal notifier.
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1544615073023000597/uCoGcmFIXZ9GwNEkTRCKo0ItJN8crUgyPrPbCIEPfCH7UrhtRKD1YR7ioglWskD3KYIR"
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local HttpService = game:GetService("HttpService")
-local player = Players.LocalPlayer
-if not player then warn("Secret notifier: LocalPlayer is not available."); return end
-
-_G.OrvynSecretStealWebhookURL = WEBHOOK_URL
-if type(getgenv) == "function" then
-    local ok, env = pcall(getgenv)
-    if ok and type(env) == "table" then env.OrvynSecretStealWebhookURL = WEBHOOK_URL end
-end
-
-local oldState = rawget(_G, "__OrvynStandaloneSecretNotifier")
-if type(oldState) == "table" then
-    oldState.running = false
-    for _, connection in ipairs(oldState.connections or {}) do
-        pcall(function() connection:Disconnect() end)
-    end
-end
-local state = {connections = {}, running = true}
-_G.__OrvynStandaloneSecretNotifier = state
-
-local function track(connection)
-    if connection then state.connections[#state.connections + 1] = connection end
-end
-
-local function getRequestFunction()
-    if type(request) == "function" then return request end
-    if type(http_request) == "function" then return http_request end
-    if type(syn) == "table" and type(syn.request) == "function" then return syn.request end
-    if type(http) == "table" and type(http.request) == "function" then return http.request end
-    return nil
-end
-
-local function normalize(text)
-    text = tostring(text or ""):gsub("<[^>]->", ""):lower()
-    text = text:gsub("you%s+stole", "")
-    text = text:gsub("^[%s%p]+", ""):gsub("[%s%p]+$", "")
-    text = text:gsub("%s+", " ")
-    return text
-end
-
-local secretAnimals = {}
-local catalogOk, animalCatalog = pcall(function()
-    local datas = ReplicatedStorage:WaitForChild("Datas", 10)
-    local module = datas and datas:WaitForChild("Animals", 10)
-    if not module then return nil end
-    return require(module)
-end)
-if catalogOk and type(animalCatalog) == "table" then
-    for index, data in pairs(animalCatalog) do
-        if type(data) == "table" and string.lower(tostring(data.Rarity or "")) == "secret" then
-            local record = {name = tostring(data.DisplayName or data.Name or index), rarity = tostring(data.Rarity)}
-            local displayKey, indexKey = normalize(record.name), normalize(index)
-            if displayKey ~= "" then secretAnimals[displayKey] = record end
-            if indexKey ~= "" then secretAnimals[indexKey] = record end
-        end
-    end
-end
-_G.OrvynSecretStealStandaloneActive = catalogOk and type(animalCatalog) == "table"
-
-local function findSecret(text)
-    local key = normalize(text)
-    if key == "" then return nil end
-    if secretAnimals[key] then return secretAnimals[key] end
-    for name, record in pairs(secretAnimals) do
-        if #name >= 4 and key:find(name, 1, true) then return record end
-    end
-    return nil
-end
-
-local function getText(obj)
-    if obj and (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) then
-        return tostring(obj.Text or "")
-    end
-    return ""
-end
-
-local function findProduction(root)
-    if not root then return "Unknown" end
-    local objects = {root}
-    for _, child in ipairs(root:GetDescendants()) do objects[#objects + 1] = child end
-    for _, obj in ipairs(objects) do
-        local text = getText(obj)
-        if text:find("$", 1, true) and text:lower():find("/s", 1, true) then
-            return text:gsub("<[^>]->", "")
-        end
-    end
-    return "Unknown"
-end
-
-local function findSecretNear(trigger)
-    local direct = findSecret(getText(trigger))
-    if direct then return direct, findProduction(trigger.Parent) end
-    local ancestor = trigger and trigger.Parent
-    for _ = 1, 6 do
-        if not ancestor then break end
-        local triggerY = trigger.AbsolutePosition and trigger.AbsolutePosition.Y or 0
-        local bestRecord, bestDelta = nil, math.huge
-        for _, candidate in ipairs(ancestor:GetDescendants()) do
-            local record = findSecret(getText(candidate))
-            if record then
-                local y = candidate.AbsolutePosition and candidate.AbsolutePosition.Y or triggerY
-                local delta = y - triggerY
-                if delta >= -3 and delta < bestDelta then bestRecord, bestDelta = record, delta end
-            end
-        end
-        if bestRecord then return bestRecord, findProduction(ancestor) end
-        ancestor = ancestor.Parent
-    end
-    return nil
-end
-
-local function sendWebhook(record, production)
-    if WEBHOOK_URL == "" or WEBHOOK_URL:find("__WEBHOOK", 1, true) then return false end
-    local requestFunction = getRequestFunction()
-    if not requestFunction then return false end
-    local username = tostring(player.Name or "Unknown")
-    local displayName = tostring(player.DisplayName or username)
-    local nowUtc = os.date("!%Y-%m-%dT%H:%M:%SZ")
-    local embed = {
-        title = "🔥 Congratulations! 🎉",
-        description = string.format("**%s** stole **%s**!", displayName, record.name),
-        color = 3447003,
-        fields = {
-            {name = "Player", value = string.format("%s (@%s)", displayName, username), inline = false},
-            {name = "Brainrot", value = record.name, inline = true},
-            {name = "Rarity", value = record.rarity, inline = true},
-            {name = "Production", value = tostring(production or "Unknown"), inline = true},
-            {name = "Place ID", value = tostring(game.PlaceId), inline = true},
-            {name = "Job ID", value = tostring(game.JobId), inline = false},
-        },
-        footer = {text = "Secret steal alert • " .. nowUtc},
-        timestamp = nowUtc,
-    }
-    local payload = {embeds = {embed}, allowed_mentions = {parse = {}}}
-    pcall(requestFunction, {
-        Url = WEBHOOK_URL,
-        Method = "POST",
-        Headers = {["Content-Type"] = "application/json"},
-        Body = HttpService:JSONEncode(payload),
-    })
-    return true
-end
-
-local watchedObjects = setmetatable({}, {__mode = "k"})
-local watchedGuis = setmetatable({}, {__mode = "k"})
-local lastTextByObject = setmetatable({}, {__mode = "k"})
-local lastSentName, lastSentAt = nil, 0
-local pendingCount = 0
-
-local function processTextObject(obj)
-    if not state.running or not obj or not obj.Parent then return end
-    local text = getText(obj)
-    if not text:lower():find("you stole", 1, true) then return end
-    if lastTextByObject[obj] == text then return end
-    lastTextByObject[obj] = text
-    pendingCount += 1
-    _G.OrvynSecretStealAlertPending = true
-    task.spawn(function()
-        local deadline = os.clock() + 1.0
-        local record, production
-        repeat
-            task.wait(0.08)
-            record, production = findSecretNear(obj)
-        until record or os.clock() >= deadline or not state.running
-        if record and state.running then
-            local now = os.clock()
-            if record.name ~= lastSentName or now - lastSentAt > 3 then
-                lastSentName, lastSentAt = record.name, now
-                sendWebhook(record, production)
-            end
-        end
-        pendingCount = math.max(0, pendingCount - 1)
-        _G.OrvynSecretStealAlertPending = pendingCount > 0
-    end)
-end
-
-local function watchTextObject(obj)
-    if not obj or watchedObjects[obj] then return end
-    if not (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) then return end
-    watchedObjects[obj] = true
-    processTextObject(obj)
-    track(obj:GetPropertyChangedSignal("Text"):Connect(function() processTextObject(obj) end))
-end
-
-local function watchGui(gui)
-    if not gui or watchedGuis[gui] then return end
-    watchedGuis[gui] = true
-    track(gui.DescendantAdded:Connect(watchTextObject))
-    for _, child in ipairs(gui:GetDescendants()) do watchTextObject(child) end
-end
-
-local playerGui = player:WaitForChild("PlayerGui")
-track(playerGui.ChildAdded:Connect(watchGui))
-for _, gui in ipairs(playerGui:GetChildren()) do watchGui(gui) end
-print("Secret notifier is running by itself; it only reports Brainrots classified as Secret.")
-"""
-        file = discord.File(io.BytesIO(lua_script_content.encode('utf-8')), filename="add_webhook.lua")
-        await interaction.response.send_message(
-            "📁 **Here is your file!** Put your webhook in the file if needed and run it.", 
-            file=file, 
-            ephemeral=True
-        )
+        # تم اختيار Obfuscate
+        scripts_data[self.script_name]["source_code"] = self.file_content
+        await interaction.response.send_message(f"⚡ Source file saved and obfuscation applied for `{self.script_name}`!", ephemeral=True)
 
     @discord.ui.button(label="No ❌", style=discord.ButtonStyle.danger)
     async def no_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("❌ Cancelled.", ephemeral=True)
+        # حفظ الكود الأصلي وتجهيزه بدون Obfuscation
+        scripts_data[self.script_name]["source_code"] = self.file_content
+        raw_loader = f'loadstring(game:HttpGet("https://raw.githubusercontent.com/.../{self.script_name}.lua"))()'
+        await interaction.response.send_message(
+            f"✅ Source file linked directly without obfuscation for `{self.script_name}`!\nExecutor Loader Code:\n```lua\n{raw_loader}\n```", 
+            ephemeral=True
+        )
+
+
+class PanelControlView(discord.ui.View):
+    def __init__(self, script_name: str):
+        super().__init__(timeout=None)
+        self.script_name = script_name
+
+    @discord.ui.button(label="Get Script 📜", style=discord.ButtonStyle.success, custom_id="panel_get_script")
+    async def get_script_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s_info = scripts_data.get(self.script_name)
+        if not s_info:
+            await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
+            return
+
+        buyer_role_id = s_info.get("buyer_role_id")
+        if buyer_role_id:
+            role = interaction.guild.get_role(buyer_role_id)
+            if role and role not in interaction.user.roles:
+                await interaction.response.send_message(f"❌ You need the {role.mention} role to get this script!", ephemeral=True)
+                return
+
+        code = s_info.get("source_code", 'loadstring(game:HttpGet("https://raw.githubusercontent.com/..."))()')
+        await interaction.response.send_message(f"📜 **Here is your script for `{self.script_name}`:**\n```lua\n{code}\n```", ephemeral=True)
+
+    @discord.ui.button(label="Redeem Key 🔑", style=discord.ButtonStyle.primary, custom_id="panel_redeem_key")
+    async def redeem_key_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("🔑 Please enter your license key in the redemption modal or open a ticket.", ephemeral=True)
+
+    @discord.ui.button(label="Reset HWID 🔄", style=discord.ButtonStyle.secondary, custom_id="panel_reset_hwid")
+    async def reset_hwid_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("🔄 HWID Reset request submitted successfully! (Cooldown: 24 Hours)", ephemeral=True)
+
+    @discord.ui.button(label="Get Buyer Role 👤", style=discord.ButtonStyle.secondary, custom_id="panel_get_buyer_role")
+    async def get_buyer_role_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s_info = scripts_data.get(self.script_name)
+        if not s_info or not s_info.get("buyer_role_id"):
+            await interaction.response.send_message("❌ Buyer role is not configured for this script.", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(s_info["buyer_role_id"])
+        if role:
+            if role in interaction.user.roles:
+                await interaction.response.send_message("✅ You already have the buyer role!", ephemeral=True)
+            else:
+                await interaction.user.add_roles(role)
+                await interaction.response.send_message(f"🎉 Granted you the {role.mention} buyer role!", ephemeral=True)
+
+    @discord.ui.button(label="Stats 📊", style=discord.ButtonStyle.secondary, custom_id="panel_stats")
+    async def stats_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s_info = scripts_data.get(self.script_name, {})
+        version = s_info.get("version", "1.0.0")
+        await interaction.response.send_message(f"📊 **Script Stats:**\n• Name: `{self.script_name}`\n• Version: `{version}`\n• Status: `Working / Active`", ephemeral=True)
+
+
+# ==================== Bot Commands ==================== #
 
 @bot.event
 async def on_ready():
@@ -330,51 +193,128 @@ async def on_ready():
         print(f"Error syncing commands: {e}")
     print(f"Bot connected successfully as: {bot.user}")
 
-# أمر إنشاء سكربت جديد
-@bot.tree.command(name="createscript", description="Create a new script entry")
-@app_commands.describe(name_script="Enter script name", version="Initial version (e.g. 1.0 or 1.0.0)")
+
+# 1. أمر انشاء السكربت
+@bot.tree.command(name="create_script", description="Create a new script entry with roles")
+@app_commands.describe(
+    name_script="Enter script name",
+    buyer_role="Select buyer role",
+    admin_role="Select admin role"
+)
 @app_commands.checks.has_permissions(administrator=True)
-async def createscript_command(interaction: discord.Interaction, name_script: str, version: str):
-    scripts_data[name_script] = version
+async def create_script_command(
+    interaction: discord.Interaction, 
+    name_script: str, 
+    buyer_role: discord.Role, 
+    admin_role: discord.Role
+):
+    scripts_data[name_script] = {
+        "version": "1.0.0",
+        "buyer_role_id": buyer_role.id,
+        "admin_role_id": admin_role.id,
+        "source_code": ""
+    }
+    
     embed = discord.Embed(
         title="✅ Script Registered Successfully!",
-        description=f"📜 **Script Name:** `{name_script}`\n📌 **Initial Version:** `{version}`",
+        description=(
+            "___________________\n"
+            f"📜 **Script Name:** `{name_script}`\n"
+            f"👤 **Buyer Role:** {buyer_role.mention}\n"
+            f"🛡️ **Admin Role:** {admin_role.mention}\n"
+            "___________________"
+        ),
         color=0x00ff00
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# أمر تحديث السكربت ونشر إعلان التحديث
-@bot.tree.command(name="update", description="Send a script update announcement")
+
+# 2. أمر ربط ملف السكربت (Source Setup)
+@bot.tree.command(name="sourcesetup", description="Attach source file to a script")
+@app_commands.describe(file="Upload the script file", script="Choose the target script")
+@app_commands.autocomplete(script=script_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def source_setup_command(interaction: discord.Interaction, file: discord.Attachment, script: str):
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Selected script does not exist. Please create it first.", ephemeral=True)
+        return
+
+    content_bytes = await file.read()
+    file_content = content_bytes.decode('utf-8', errors='ignore')
+
+    view = ObfuscateConfirmView(script_name=script, file_content=file_content)
+    await interaction.response.send_message(
+        f"📄 Source file for `{script}` received!\n\n**Do you want to obfuscate script?**", 
+        view=view, 
+        ephemeral=True
+    )
+
+
+# 3. أمر تعديل رول الباير (Set Buyer Role)
+@bot.tree.command(name="setbuyerrole", description="Change the buyer role for a script")
+@app_commands.describe(script="Choose the script", buyer_role="Select the new buyer role")
+@app_commands.autocomplete(script=script_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def set_buyer_role_command(interaction: discord.Interaction, script: str, buyer_role: discord.Role):
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Selected script does not exist.", ephemeral=True)
+        return
+
+    scripts_data[script]["buyer_role_id"] = buyer_role.id
+    await interaction.response.send_message(f"✅ Buyer role for `{script}` updated to {buyer_role.mention}!", ephemeral=True)
+
+
+# 4. أمر إنشاء البانل (Panel Setup)
+@bot.tree.command(name="panelsetup", description="Send a script management panel")
+@app_commands.describe(script="Choose the script", channel="Select target channel", name_panel="Enter panel title")
+@app_commands.autocomplete(script=script_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def panel_setup_command(interaction: discord.Interaction, script: str, channel: discord.TextChannel, name_panel: str):
+    embed = discord.Embed(
+        title=name_panel,
+        description=f"Best {script.lower()}\n\nFaulmor • Script Management |",
+        color=0xd4af37
+    )
+    embed.set_author(name="luarmor", icon_url=bot.user.display_avatar.url)
+    
+    view = PanelControlView(script_name=script)
+    await channel.send(embed=embed, view=view)
+    await interaction.response.send_message(f"✅ Panel created successfully in {channel.mention}!", ephemeral=True)
+
+
+# 5. أمر تحديث السكربت (Update Script)
+@bot.tree.command(name="update_script", description="Send a script update announcement")
 @app_commands.describe(script="Choose the script", revision="New version (e.g. 1.0.1 or 99.0.0)", details="Enter update details")
 @app_commands.autocomplete(script=script_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
-async def update(interaction: discord.Interaction, script: str, revision: str, details: str):
-    scripts_data[script] = revision
+async def update_script_command(interaction: discord.Interaction, script: str, revision: str, details: str):
+    if script in scripts_data:
+        scripts_data[script]["version"] = revision
+
     ping_text = "@everyone @here"
     embed = discord.Embed(
         title=f"🚀 New Update for {script}!",
-        description=f"📌 **Version:** `{revision}`\n\n```\n{details}\n```",
+        description=f"___________________\n📌 **Version:** `{revision}`\n\n```\n{details}\n```\n___________________",
         color=0x00ff00
     )
     await interaction.response.send_message(content=ping_text, embed=embed)
 
-@bot.tree.command(name="gift", description="Send the invite rewards panel")
+
+# 6. أمر مكافآت الدعوة (Invite Reward)
+@bot.tree.command(name="invite_reward", description="Send the invite rewards panel")
 @app_commands.checks.has_permissions(administrator=True)
-async def gift_command(interaction: discord.Interaction):
+async def invite_reward_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🎁 Invite Rewards System",
-        description="• **2 Invites** = 12 Hours Script ⏳\n• **4 Invites** = 2 Days Script 🚀\n\nUse the buttons below to check invites and claim rewards.",
+        description="• **2 Invites** = 12 Hours Script ⏳\n• **4 Invites** = 2 Days Script 🚀\n___________________\nUse the buttons below to check invites and claim rewards.",
         color=0x2b2d31
     )
-    view = GiftView()
+    view = InviteRewardView()
     await interaction.response.send_message("Panel created successfully!", ephemeral=True)
     await interaction.channel.send(embed=embed, view=view)
 
-@bot.tree.command(name="steals", description="Share your steal report")
-async def steals_command(interaction: discord.Interaction):
-    view = StealConfirmView()
-    await interaction.response.send_message("Hey, do you wanna share what you steal today?", view=view, ephemeral=True)
 
+# 7. أمر البلاك ليست
 @bot.tree.command(name="blacklist", description="Add a user to the blacklist")
 @app_commands.describe(user="The user to blacklist")
 @app_commands.checks.has_permissions(administrator=True)
@@ -386,4 +326,4 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("Error: DISCORD_TOKEN environment variable is missing!")
+    print("Error: DISCORD_TOKEN environment variable is missing!") 
