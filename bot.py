@@ -70,7 +70,25 @@ def load_security_state():
             pass
     return {"reset_hwid_cooldown": DEFAULT_RESET_HWID_COOLDOWN, "reset_hwid_last_used": {}}
 
+
 security_state = load_security_state()
+
+# Persistent key -> device binding. The client reports a Roblox client identifier;
+# this is not a guaranteed physical hardware ID and must be treated as a best-effort lock.
+HWID_BINDINGS_FILE = "hwid_bindings.json"
+def load_hwid_bindings():
+    try:
+        with open(HWID_BINDINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+hwid_bindings = load_hwid_bindings()
+
+def save_hwid_bindings():
+    with open(HWID_BINDINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(hwid_bindings, f, indent=2, ensure_ascii=False)
 
 def save_security_state():
     temp_file = SECURITY_STATE_FILE + ".tmp"
@@ -91,6 +109,61 @@ def format_duration(seconds: int) -> str:
     return " ".join(parts)
 
 class DynamicScriptHandler(BaseHTTPRequestHandler):
+    def _send_text(self, status, body):
+        payload = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_POST(self):
+        parsed_path = urllib.parse.urlparse(self.path)
+        if parsed_path.path != "/hwid/check":
+            self._send_text(404, "not found")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 16_384:
+                self._send_text(400, "invalid request")
+                return
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            script_name = str(payload.get("script_name", ""))[:200]
+            user_key = str(payload.get("key", ""))[:200]
+            reported_hwid = str(payload.get("hwid", ""))[:300]
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self._send_text(400, "invalid request")
+            return
+
+        if not script_name or not user_key or not reported_hwid:
+            self._send_text(400, "missing fields")
+            return
+
+        s_info = scripts_data.get(script_name)
+        if not s_info or user_key not in s_info.get("valid_keys", set()):
+            self._send_text(403, "denied: invalid key")
+            return
+
+        binding_key = f"{script_name}:{user_key}"
+        existing_hwid = hwid_bindings.get(binding_key)
+        if existing_hwid is None:
+            hwid_bindings[binding_key] = reported_hwid
+            try:
+                save_hwid_bindings()
+            except OSError:
+                hwid_bindings.pop(binding_key, None)
+                self._send_text(500, "server storage error")
+                return
+            self._send_text(200, "ok: device bound")
+            return
+
+        if existing_hwid != reported_hwid:
+            self._send_text(403, "you need to reset hwid")
+            return
+
+        self._send_text(200, "ok")
+
     def do_GET(self):
         parsed_path = urllib.parse.urlparse(self.path)
         path_parts = parsed_path.path.strip("/").split("/")
@@ -100,57 +173,81 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             if script_name in scripts_data:
                 s_info = scripts_data[script_name]
                 raw_source = s_info.get("source_code", "-- No source code loaded")
-                
                 valid_keys = list(s_info.get("valid_keys", set()))
-                valid_keys_lua = "{" + ", ".join([f'["{k}"] = true' for k in valid_keys]) + "}"
+                valid_keys_lua = "{" + ", ".join(
+                    f'["{k}"] = true' for k in valid_keys
+                ) + "}"
+                app_url = os.getenv("RENDER_EXTERNAL_URL", "https://discord-bot-3u9m.onrender.com").rstrip("/")
+                script_name_lua = json.dumps(script_name)
 
                 secured_wrapper = f"""
 local valid_keys = {valid_keys_lua}
 local user_key = rawget(_G, "script_key") or script_key
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
 
 if not user_key or type(user_key) ~= "string" or not valid_keys[user_key] then
-    local player = game:GetService("Players").LocalPlayer
     if player then player:Kick("key not found") end
     return
 end
 
-local HttpService = game:GetService("HttpService")
 local RbxAnalytics = game:GetService("RbxAnalyticsService")
-local current_hwid = RbxAnalytics:GetClientId()
-local current_executor = identifyexecutor and select(1, identifyexecutor()) or "Unknown"
+local ok_hwid, current_hwid = pcall(function()
+    return RbxAnalytics:GetClientId()
+end)
+if not ok_hwid or type(current_hwid) ~= "string" or current_hwid == "" then
+    if player then player:Kick("HWID check failed. Please retry.") end
+    return
+end
 
-_G.__HWID_DATA = _G.__HWID_DATA or {{}}
-local user_hwid_info = _G.__HWID_DATA[user_key]
+local request_fn = (syn and syn.request) or http_request or request
+if type(request_fn) ~= "function" then
+    if player then player:Kick("HWID check unavailable. Use a supported executor.") end
+    return
+end
 
-if not user_hwid_info then
-    _G.__HWID_DATA[user_key] = {{ hwid = current_hwid, executor = current_executor }}
-else
-    if user_hwid_info.hwid ~= current_hwid or user_hwid_info.executor ~= current_executor then
-        local player = game:GetService("Players").LocalPlayer
-        if player then player:Kick("you need to reset hwid") end
-        return
+local HttpService = game:GetService("HttpService")
+local check_ok, response = pcall(function()
+    return request_fn({{
+        Url = "{app_url}/hwid/check",
+        Method = "POST",
+        Headers = {{ ["Content-Type"] = "application/json" }},
+        Body = HttpService:JSONEncode({{
+            script_name = {script_name_lua},
+            key = user_key,
+            hwid = current_hwid
+        }})
+    }})
+end)
+
+if not check_ok or type(response) ~= "table" then
+    if player then player:Kick("HWID check failed. Please retry.") end
+    return
+end
+
+local status_code = tonumber(response.StatusCode or response.Status or 0)
+local response_body = tostring(response.Body or "")
+if status_code ~= 200 then
+    if player then
+        if string.find(string.lower(response_body), "you need to reset hwid", 1, true) then
+            player:Kick("you need to reset hwid")
+        else
+            player:Kick("HWID validation failed")
+        end
     end
+    return
 end
 
 {raw_source}
 """
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(secured_wrapper.encode("utf-8"))
+                self._send_text(200, secured_wrapper)
                 return
 
         if len(path_parts) >= 2 and path_parts[0] == "script":
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"Script not found or deleted.")
+            self._send_text(404, "Script not found or deleted.")
             return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Crystal Hub API & Bot is online and running!")
+        self._send_text(200, "Crystal Hub API & Bot is online and running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -342,12 +439,15 @@ class PanelControlView(discord.ui.View):
             )
             return
 
+        user_key = s_info["user_keys"][user_id]
+        binding_key = f"{self.script_name}:{user_key}"
+        hwid_bindings.pop(binding_key, None)
+        save_hwid_bindings()
         security_state.setdefault("reset_hwid_last_used", {})[cooldown_key] = now
         save_security_state()
         await interaction.response.send_message(
-            "✅ HWID reset request accepted and cooldown started.\n"
-            "⚠️ The current loader still stores HWID in client-side session memory; "
-            "persistent device enforcement is not active until the loader uses a server-side activation check.",
+            "✅ HWID reset successfully. The key can now bind to the next device that launches the script. "
+            f"Cooldown started: **{format_duration(cooldown)}**.",
             ephemeral=True
         )
 
