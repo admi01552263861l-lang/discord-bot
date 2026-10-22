@@ -8,12 +8,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-# قاعدة بيانات السكربتات
-# Structure: { script_name: {"version": str, "buyer_role_id": int, "admin_role_id": int, "source_code": str, "keys": {user_id: key_string}} }
+# قاعدة البيانات المحدثة
+# Structure: { script_name: {"version": str, "buyer_role_id": int, "admin_role_id": int, "source_code": str, "valid_keys": set(), "user_keys": {user_id: key_string}} }
 scripts_data = {}
 blacklisted_users = set()
 
-# خادم الويب المدمج لخدمة السكربتات كموقع/API خاص
+# خادم الويب المدمج لخدمة السكربتات المباشرة مع فحص المفاتيح
 class DynamicScriptHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_path = urllib.parse.urlparse(self.path)
@@ -21,18 +21,38 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
 
         # المسار الخاص للسكربتات: /script/<script_name>
         if len(path_parts) >= 2 and path_parts[0] == "script":
-            script_name = path_parts[1]
+            script_name = urllib.parse.unquote(path_parts[1])
             if script_name in scripts_data:
                 s_info = scripts_data[script_name]
-                source_code = s_info.get("source_code", "-- No source code loaded")
+                raw_source = s_info.get("source_code", "-- No source code loaded")
                 
+                # قائمة المفاتيح المقبولة للسكربت
+                valid_keys = list(s_info.get("valid_keys", set()))
+                valid_keys_lua = "{" + ", ".join([f'["{k}"] = true' for k in valid_keys]) + "}"
+
+                # كود الفحص والأمان المدمج في الخادم للتحقق من المفتاح قبل التشغيل
+                secured_wrapper = f"""
+local valid_keys = {valid_keys_lua}
+local user_key = rawget(_G, "script_key") or script_key
+
+if not user_key or type(user_key) ~= "string" or not valid_keys[user_key] then
+    local player = game:GetService("Players").LocalPlayer
+    if player then
+        player:Kick("key not found")
+    end
+    return
+end
+
+-- True Source Code
+{raw_source}
+"""
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(source_code.encode("utf-8"))
+                self.wfile.write(secured_wrapper.encode("utf-8"))
                 return
 
-        # الصفحة الرئيسية الافتراضية
+        # الصفحة الرئيسية
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -56,9 +76,9 @@ intents.invites = True
 allowed_mentions = discord.AllowedMentions(everyone=True, roles=True, users=True)
 bot = commands.Bot(command_prefix='!', intents=intents, allowed_mentions=allowed_mentions)
 
-def generate_random_key(length=32):
+def generate_random_key(prefix="MUk5", length=32):
     chars = string.ascii_letters + string.digits
-    return "".join(random.choice(chars) for _ in range(length))
+    return prefix + "".join(random.choice(chars) for _ in range(length - len(prefix)))
 
 async def script_autocomplete(
     interaction: discord.Interaction,
@@ -140,12 +160,12 @@ class ObfuscateConfirmView(discord.ui.View):
     @discord.ui.button(label="Yes ✅", style=discord.ButtonStyle.success)
     async def yes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         scripts_data[self.script_name]["source_code"] = self.file_content
-        await interaction.response.send_message(f"⚡ Source file saved & hosted on custom bot endpoint for `{self.script_name}`!", ephemeral=True)
+        await interaction.response.send_message(f"⚡ Source file saved & protected for `{self.script_name}`!", ephemeral=True)
 
     @discord.ui.button(label="No ❌", style=discord.ButtonStyle.danger)
     async def no_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         scripts_data[self.script_name]["source_code"] = self.file_content
-        await interaction.response.send_message(f"✅ Source file hosted directly on custom bot endpoint for `{self.script_name}`!", ephemeral=True)
+        await interaction.response.send_message(f"✅ Source file attached for `{self.script_name}`!", ephemeral=True)
 
 
 class PanelControlView(discord.ui.View):
@@ -160,7 +180,7 @@ class PanelControlView(discord.ui.View):
             await interaction.response.send_message("❌ Script details not found. Please re-run /create_script.", ephemeral=True)
             return
 
-        # 1. فحص وجود الباير رول
+        # فحص الباير رول
         buyer_role_id = s_info.get("buyer_role_id")
         if buyer_role_id:
             role = interaction.guild.get_role(buyer_role_id)
@@ -168,16 +188,15 @@ class PanelControlView(discord.ui.View):
                 await interaction.response.send_message(f"❌ You must have the {role.mention} role to get this script!", ephemeral=True)
                 return
 
-        # 2. إنشاء المفتاح المخصص
+        # توليد أو استرجاع المفتاح المصرح به
         user_id = interaction.user.id
-        if user_id not in s_info["keys"]:
-            s_info["keys"][user_id] = generate_random_key()
+        if user_id not in s_info["user_keys"]:
+            new_key = generate_random_key()
+            s_info["user_keys"][user_id] = new_key
+            s_info["valid_keys"].add(new_key)
         
-        user_key = s_info["keys"][user_id]
-
-        # 3. بناء الرابط الخاص بالموقع (Hosted Endpoint)
-        # يمكنك تغيير هذا الرابط لاسم موقعك الخاص على Render
-        app_url = os.getenv("RENDER_EXTERNAL_URL", "https://your-app-name.onrender.com")
+        user_key = s_info["user_keys"][user_id]
+        app_url = os.getenv("RENDER_EXTERNAL_URL", "https://discord-bot-3u9m.onrender.com")
         custom_script_url = f"{app_url}/script/{urllib.parse.quote(self.script_name)}"
 
         response_text = (
@@ -191,7 +210,7 @@ class PanelControlView(discord.ui.View):
 
     @discord.ui.button(label="Redeem Key 🔑", style=discord.ButtonStyle.primary)
     async def redeem_key_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔑 Keys are tied directly to your buyer account. Click **Get Script 📜** to receive your key and loader.", ephemeral=True)
+        await interaction.response.send_message("🔑 Keys are generated automatically for authorized users. Click **Get Script 📜**.", ephemeral=True)
 
     @discord.ui.button(label="Reset HWID 🔄", style=discord.ButtonStyle.secondary)
     async def reset_hwid_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -219,7 +238,7 @@ class PanelControlView(discord.ui.View):
         await interaction.response.send_message(f"📊 **Script Stats:**\n• Name: `{self.script_name}`\n• Version: `{version}`\n• Status: `Active`", ephemeral=True)
 
 
-# ==================== Bot Commands ==================== #
+# ==================== Commands (Admin Protected) ==================== #
 
 @bot.event
 async def on_ready():
@@ -231,7 +250,65 @@ async def on_ready():
     print(f"Bot connected successfully as: {bot.user}")
 
 
-# 1. إنشاء السكربت
+# 1. إنشاء مفتاح جديد (Generate Key)
+@bot.tree.command(name="generate_key", description="Generate a single-use key for a script")
+@app_commands.describe(script="Target script")
+@app_commands.autocomplete(script=script_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def generate_key_command(interaction: discord.Interaction, script: str):
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        return
+
+    new_key = generate_random_key()
+    scripts_data[script]["valid_keys"].add(new_key)
+
+    await interaction.response.send_message(
+        f"🔑 **New Key Generated for `{script}`:**\n```text\n{new_key}\n```\n*This key is authorized for single-user activation.*",
+        ephemeral=True
+    )
+
+
+# 2. إضافة إلى القائمة البيضاء (Whitelist User)
+@bot.tree.command(name="whitelist", description="Whitelist a user for a script and notify them via DM")
+@app_commands.describe(user="The member to whitelist", script="Target script")
+@app_commands.autocomplete(script=script_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def whitelist_command(interaction: discord.Interaction, user: discord.Member, script: str):
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        return
+
+    s_info = scripts_data[script]
+    new_key = generate_random_key()
+    s_info["user_keys"][user.id] = new_key
+    s_info["valid_keys"].add(new_key)
+
+    # إرسال الباير رول إذا كانت مخصصة
+    if s_info.get("buyer_role_id"):
+        role = interaction.guild.get_role(s_info["buyer_role_id"])
+        if role and role not in user.roles:
+            try:
+                await user.add_roles(role)
+            except Exception:
+                pass
+
+    # إرسال رسالة للمستخدم عبر الخاص
+    try:
+        dm_embed = discord.Embed(
+            title="🎉 Whitelist Granted!",
+            description=f"You have been whitelisted in **{interaction.guild.name}** for script: **{script}**!\n\nYour Key: `{new_key}`",
+            color=0x00ff00
+        )
+        await user.send(embed=dm_embed)
+        dm_status = "DM sent successfully."
+    except Exception:
+        dm_status = "Could not send DM (user DMs closed)."
+
+    await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}`! ({dm_status})", ephemeral=True)
+
+
+# 3. إنشاء السكربت
 @bot.tree.command(name="create_script", description="Create a new script entry with roles")
 @app_commands.describe(
     name_script="Enter script name",
@@ -250,7 +327,8 @@ async def create_script_command(
         "buyer_role_id": buyer_role.id,
         "admin_role_id": admin_role.id,
         "source_code": "-- Default Script",
-        "keys": {}
+        "valid_keys": set(),
+        "user_keys": {}
     }
     
     embed = discord.Embed(
@@ -267,7 +345,7 @@ async def create_script_command(
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# 2. ربط السورس بملف (يتم رفعه للموقع الخاص بالبوت مباشرة)
+# 4. ربط السورس بملف
 @bot.tree.command(name="sourcesetup", description="Attach source file to a script")
 @app_commands.describe(file="Upload the script file", script="Choose the target script")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -288,7 +366,7 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
     )
 
 
-# 3. تحديد رول الباير
+# 5. تحديد رول الباير
 @bot.tree.command(name="setbuyerrole", description="Change the buyer role for a script")
 @app_commands.describe(script="Choose the script", buyer_role="Select the new buyer role")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -302,7 +380,7 @@ async def set_buyer_role_command(interaction: discord.Interaction, script: str, 
     await interaction.response.send_message(f"✅ Buyer role for `{script}` updated to {buyer_role.mention}!", ephemeral=True)
 
 
-# 4. إعداد البانل
+# 6. إعداد البانل
 @bot.tree.command(name="panelsetup", description="Send a script management panel")
 @app_commands.describe(script="Choose the script", channel="Select target channel", name_panel="Enter panel title")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -320,7 +398,7 @@ async def panel_setup_command(interaction: discord.Interaction, script: str, cha
     await interaction.response.send_message(f"✅ Panel created successfully in {channel.mention}!", ephemeral=True)
 
 
-# 5. تحديث السكربت
+# 7. تحديث السكربت
 @bot.tree.command(name="update_script", description="Send a script update announcement")
 @app_commands.describe(script="Choose the script", revision="New version (e.g. 1.0.1 or 99.0.0)", details="Enter update details")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -338,7 +416,7 @@ async def update_script_command(interaction: discord.Interaction, script: str, r
     await interaction.response.send_message(content=ping_text, embed=embed)
 
 
-# 6. مكافآت الدعوة
+# 8. مكافآت الدعوة
 @bot.tree.command(name="invite_reward", description="Send the invite rewards panel")
 @app_commands.checks.has_permissions(administrator=True)
 async def invite_reward_command(interaction: discord.Interaction):
@@ -352,7 +430,7 @@ async def invite_reward_command(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed, view=view)
 
 
-# 7. البلاك ليست
+# 9. البلاك ليست
 @bot.tree.command(name="blacklist", description="Add a user to the blacklist")
 @app_commands.describe(user="The user to blacklist")
 @app_commands.checks.has_permissions(administrator=True)
