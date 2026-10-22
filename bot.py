@@ -3,22 +3,47 @@ import threading
 import os
 import random
 import string
+import urllib.parse
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-class SimpleHandler(BaseHTTPRequestHandler):
+# قاعدة بيانات السكربتات
+# Structure: { script_name: {"version": str, "buyer_role_id": int, "admin_role_id": int, "source_code": str, "keys": {user_id: key_string}} }
+scripts_data = {}
+blacklisted_users = set()
+
+# خادم الويب المدمج لخدمة السكربتات كموقع/API خاص
+class DynamicScriptHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        parsed_path = urllib.parse.urlparse(self.path)
+        path_parts = parsed_path.path.strip("/").split("/")
+
+        # المسار الخاص للسكربتات: /script/<script_name>
+        if len(path_parts) >= 2 and path_parts[0] == "script":
+            script_name = path_parts[1]
+            if script_name in scripts_data:
+                s_info = scripts_data[script_name]
+                source_code = s_info.get("source_code", "-- No source code loaded")
+                
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(source_code.encode("utf-8"))
+                return
+
+        # الصفحة الرئيسية الافتراضية
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Bot is online and running!")
+        self.wfile.write(b"Crystal Hub API & Bot is online and running!")
 
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
 
 def run_server():
-    server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
+    server = HTTPServer(('0.0.0.0', 10000), DynamicScriptHandler)
     server.serve_forever()
 
 threading.Thread(target=run_server, daemon=True).start()
@@ -31,14 +56,8 @@ intents.invites = True
 allowed_mentions = discord.AllowedMentions(everyone=True, roles=True, users=True)
 bot = commands.Bot(command_prefix='!', intents=intents, allowed_mentions=allowed_mentions)
 
-blacklisted_users = set()
-
-# قاعدة بيانات السكربتات والمفاتيح
-# Structure: { script_name: {"version": str, "buyer_role_id": int, "admin_role_id": int, "source_code": str, "keys": {user_id: key_string}} }
-scripts_data = {}
-
-def generate_random_key(length=12):
-    chars = string.ascii_lowercase + string.digits
+def generate_random_key(length=32):
+    chars = string.ascii_letters + string.digits
     return "".join(random.choice(chars) for _ in range(length))
 
 async def script_autocomplete(
@@ -121,12 +140,12 @@ class ObfuscateConfirmView(discord.ui.View):
     @discord.ui.button(label="Yes ✅", style=discord.ButtonStyle.success)
     async def yes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         scripts_data[self.script_name]["source_code"] = self.file_content
-        await interaction.response.send_message(f"⚡ Source code attached and obfuscated for `{self.script_name}`! It is now linked to the panel.", ephemeral=True)
+        await interaction.response.send_message(f"⚡ Source file saved & hosted on custom bot endpoint for `{self.script_name}`!", ephemeral=True)
 
     @discord.ui.button(label="No ❌", style=discord.ButtonStyle.danger)
     async def no_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         scripts_data[self.script_name]["source_code"] = self.file_content
-        await interaction.response.send_message(f"✅ Source code attached directly for `{self.script_name}`! Linked to the panel successfully.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Source file hosted directly on custom bot endpoint for `{self.script_name}`!", ephemeral=True)
 
 
 class PanelControlView(discord.ui.View):
@@ -134,56 +153,51 @@ class PanelControlView(discord.ui.View):
         super().__init__(timeout=None)
         self.script_name = script_name
 
-    @discord.ui.button(label="Get Script 📜", style=discord.ButtonStyle.success, custom_id="panel_get_script")
+    @discord.ui.button(label="Get Script 📜", style=discord.ButtonStyle.success)
     async def get_script_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         if not s_info:
-            await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
+            await interaction.response.send_message("❌ Script details not found. Please re-run /create_script.", ephemeral=True)
             return
 
-        # 1. التحقق من وجود الباير رول
+        # 1. فحص وجود الباير رول
         buyer_role_id = s_info.get("buyer_role_id")
         if buyer_role_id:
             role = interaction.guild.get_role(buyer_role_id)
             if role and role not in interaction.user.roles:
-                await interaction.response.send_message(f"❌ You must have the {role.mention} role to use this panel!", ephemeral=True)
+                await interaction.response.send_message(f"❌ You must have the {role.mention} role to get this script!", ephemeral=True)
                 return
 
-        # 2. إنشاء أو جلب المفتاح المخصص للمستخدم
+        # 2. إنشاء المفتاح المخصص
         user_id = interaction.user.id
         if user_id not in s_info["keys"]:
             s_info["keys"][user_id] = generate_random_key()
         
         user_key = s_info["keys"][user_id]
 
-        # 3. بناء الكود المربوط بالمفتاح مع فحص الأمان وإغلاق اللعبة إذا كان غير موجود
-        loader_code = (
-            f'_G.scriptkey = "{user_key}"\n\n'
-            f'-- Protection Key Check\n'
-            f'if not _G.scriptkey or _G.scriptkey ~= "{user_key}" then\n'
-            f'    game:GetService("Players").LocalPlayer:Kick("key not found")\n'
-            f'    return\n'
-            f'end\n\n'
-            f'-- Executing Source\n'
-            f'{s_info.get("source_code", "print(\'Script Loaded Successfully!\')")}'
-        )
+        # 3. بناء الرابط الخاص بالموقع (Hosted Endpoint)
+        # يمكنك تغيير هذا الرابط لاسم موقعك الخاص على Render
+        app_url = os.getenv("RENDER_EXTERNAL_URL", "https://your-app-name.onrender.com")
+        custom_script_url = f"{app_url}/script/{urllib.parse.quote(self.script_name)}"
 
-        await interaction.response.send_message(
-            f"🔑 **Your Script Key:** `{user_key}`\n\n"
-            f"📜 **Script Loader for `{self.script_name}`:**\n"
-            f"```lua\n{loader_code}\n```", 
-            ephemeral=True
+        response_text = (
+            f"Here is your script:\n"
+            f"```lua\n"
+            f'script_key="{user_key}";\n'
+            f'loadstring(game:HttpGet("{custom_script_url}"))()\n'
+            f"```"
         )
+        await interaction.response.send_message(response_text, ephemeral=True)
 
-    @discord.ui.button(label="Redeem Key 🔑", style=discord.ButtonStyle.primary, custom_id="panel_redeem_key")
+    @discord.ui.button(label="Redeem Key 🔑", style=discord.ButtonStyle.primary)
     async def redeem_key_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔑 Key system is tied directly to your Discord account! Use **Get Script 📜**.", ephemeral=True)
+        await interaction.response.send_message("🔑 Keys are tied directly to your buyer account. Click **Get Script 📜** to receive your key and loader.", ephemeral=True)
 
-    @discord.ui.button(label="Reset HWID 🔄", style=discord.ButtonStyle.secondary, custom_id="panel_reset_hwid")
+    @discord.ui.button(label="Reset HWID 🔄", style=discord.ButtonStyle.secondary)
     async def reset_hwid_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔄 HWID Reset request processed! Key reset successfully.", ephemeral=True)
+        await interaction.response.send_message("🔄 HWID Reset successfully processed!", ephemeral=True)
 
-    @discord.ui.button(label="Get Buyer Role 👤", style=discord.ButtonStyle.secondary, custom_id="panel_get_buyer_role")
+    @discord.ui.button(label="Get Buyer Role 👤", style=discord.ButtonStyle.secondary)
     async def get_buyer_role_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         if not s_info or not s_info.get("buyer_role_id"):
@@ -198,11 +212,11 @@ class PanelControlView(discord.ui.View):
                 await interaction.user.add_roles(role)
                 await interaction.response.send_message(f"🎉 Granted you the {role.mention} buyer role!", ephemeral=True)
 
-    @discord.ui.button(label="Stats 📊", style=discord.ButtonStyle.secondary, custom_id="panel_stats")
+    @discord.ui.button(label="Stats 📊", style=discord.ButtonStyle.secondary)
     async def stats_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name, {})
         version = s_info.get("version", "1.0.0")
-        await interaction.response.send_message(f"📊 **Script Stats:**\n• Name: `{self.script_name}`\n• Version: `{version}`\n• Status: `Active & Protected`", ephemeral=True)
+        await interaction.response.send_message(f"📊 **Script Stats:**\n• Name: `{self.script_name}`\n• Version: `{version}`\n• Status: `Active`", ephemeral=True)
 
 
 # ==================== Bot Commands ==================== #
@@ -235,7 +249,7 @@ async def create_script_command(
         "version": "1.0.0",
         "buyer_role_id": buyer_role.id,
         "admin_role_id": admin_role.id,
-        "source_code": "print('Hello World')",
+        "source_code": "-- Default Script",
         "keys": {}
     }
     
@@ -253,7 +267,7 @@ async def create_script_command(
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# 2. ربط السورس بملف
+# 2. ربط السورس بملف (يتم رفعه للموقع الخاص بالبوت مباشرة)
 @bot.tree.command(name="sourcesetup", description="Attach source file to a script")
 @app_commands.describe(file="Upload the script file", script="Choose the target script")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -350,4 +364,4 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("Error: DISCORD_TOKEN environment variable is missing!")
+    print("Error: DISCORD_TOKEN environment variable is missing!") 
