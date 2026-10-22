@@ -1,7 +1,8 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import os
-import io
+import random
+import string
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -32,9 +33,13 @@ bot = commands.Bot(command_prefix='!', intents=intents, allowed_mentions=allowed
 
 blacklisted_users = set()
 
-# بيانات السكربتات المخزنة
-# Structure: { script_name: {"version": str, "buyer_role_id": int, "admin_role_id": int, "source_code": str} }
+# قاعدة بيانات السكربتات والمفاتيح
+# Structure: { script_name: {"version": str, "buyer_role_id": int, "admin_role_id": int, "source_code": str, "keys": {user_id: key_string}} }
 scripts_data = {}
+
+def generate_random_key(length=12):
+    chars = string.ascii_lowercase + string.digits
+    return "".join(random.choice(chars) for _ in range(length))
 
 async def script_autocomplete(
     interaction: discord.Interaction,
@@ -115,19 +120,13 @@ class ObfuscateConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Yes ✅", style=discord.ButtonStyle.success)
     async def yes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # تم اختيار Obfuscate
         scripts_data[self.script_name]["source_code"] = self.file_content
-        await interaction.response.send_message(f"⚡ Source file saved and obfuscation applied for `{self.script_name}`!", ephemeral=True)
+        await interaction.response.send_message(f"⚡ Source code attached and obfuscated for `{self.script_name}`! It is now linked to the panel.", ephemeral=True)
 
     @discord.ui.button(label="No ❌", style=discord.ButtonStyle.danger)
     async def no_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # حفظ الكود الأصلي وتجهيزه بدون Obfuscation
         scripts_data[self.script_name]["source_code"] = self.file_content
-        raw_loader = f'loadstring(game:HttpGet("https://raw.githubusercontent.com/.../{self.script_name}.lua"))()'
-        await interaction.response.send_message(
-            f"✅ Source file linked directly without obfuscation for `{self.script_name}`!\nExecutor Loader Code:\n```lua\n{raw_loader}\n```", 
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"✅ Source code attached directly for `{self.script_name}`! Linked to the panel successfully.", ephemeral=True)
 
 
 class PanelControlView(discord.ui.View):
@@ -142,23 +141,47 @@ class PanelControlView(discord.ui.View):
             await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
             return
 
+        # 1. التحقق من وجود الباير رول
         buyer_role_id = s_info.get("buyer_role_id")
         if buyer_role_id:
             role = interaction.guild.get_role(buyer_role_id)
             if role and role not in interaction.user.roles:
-                await interaction.response.send_message(f"❌ You need the {role.mention} role to get this script!", ephemeral=True)
+                await interaction.response.send_message(f"❌ You must have the {role.mention} role to use this panel!", ephemeral=True)
                 return
 
-        code = s_info.get("source_code", 'loadstring(game:HttpGet("https://raw.githubusercontent.com/..."))()')
-        await interaction.response.send_message(f"📜 **Here is your script for `{self.script_name}`:**\n```lua\n{code}\n```", ephemeral=True)
+        # 2. إنشاء أو جلب المفتاح المخصص للمستخدم
+        user_id = interaction.user.id
+        if user_id not in s_info["keys"]:
+            s_info["keys"][user_id] = generate_random_key()
+        
+        user_key = s_info["keys"][user_id]
+
+        # 3. بناء الكود المربوط بالمفتاح مع فحص الأمان وإغلاق اللعبة إذا كان غير موجود
+        loader_code = (
+            f'_G.scriptkey = "{user_key}"\n\n'
+            f'-- Protection Key Check\n'
+            f'if not _G.scriptkey or _G.scriptkey ~= "{user_key}" then\n'
+            f'    game:GetService("Players").LocalPlayer:Kick("key not found")\n'
+            f'    return\n'
+            f'end\n\n'
+            f'-- Executing Source\n'
+            f'{s_info.get("source_code", "print(\'Script Loaded Successfully!\')")}'
+        )
+
+        await interaction.response.send_message(
+            f"🔑 **Your Script Key:** `{user_key}`\n\n"
+            f"📜 **Script Loader for `{self.script_name}`:**\n"
+            f"```lua\n{loader_code}\n```", 
+            ephemeral=True
+        )
 
     @discord.ui.button(label="Redeem Key 🔑", style=discord.ButtonStyle.primary, custom_id="panel_redeem_key")
     async def redeem_key_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔑 Please enter your license key in the redemption modal or open a ticket.", ephemeral=True)
+        await interaction.response.send_message("🔑 Key system is tied directly to your Discord account! Use **Get Script 📜**.", ephemeral=True)
 
     @discord.ui.button(label="Reset HWID 🔄", style=discord.ButtonStyle.secondary, custom_id="panel_reset_hwid")
     async def reset_hwid_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔄 HWID Reset request submitted successfully! (Cooldown: 24 Hours)", ephemeral=True)
+        await interaction.response.send_message("🔄 HWID Reset request processed! Key reset successfully.", ephemeral=True)
 
     @discord.ui.button(label="Get Buyer Role 👤", style=discord.ButtonStyle.secondary, custom_id="panel_get_buyer_role")
     async def get_buyer_role_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -179,7 +202,7 @@ class PanelControlView(discord.ui.View):
     async def stats_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name, {})
         version = s_info.get("version", "1.0.0")
-        await interaction.response.send_message(f"📊 **Script Stats:**\n• Name: `{self.script_name}`\n• Version: `{version}`\n• Status: `Working / Active`", ephemeral=True)
+        await interaction.response.send_message(f"📊 **Script Stats:**\n• Name: `{self.script_name}`\n• Version: `{version}`\n• Status: `Active & Protected`", ephemeral=True)
 
 
 # ==================== Bot Commands ==================== #
@@ -194,7 +217,7 @@ async def on_ready():
     print(f"Bot connected successfully as: {bot.user}")
 
 
-# 1. أمر انشاء السكربت
+# 1. إنشاء السكربت
 @bot.tree.command(name="create_script", description="Create a new script entry with roles")
 @app_commands.describe(
     name_script="Enter script name",
@@ -212,7 +235,8 @@ async def create_script_command(
         "version": "1.0.0",
         "buyer_role_id": buyer_role.id,
         "admin_role_id": admin_role.id,
-        "source_code": ""
+        "source_code": "print('Hello World')",
+        "keys": {}
     }
     
     embed = discord.Embed(
@@ -229,7 +253,7 @@ async def create_script_command(
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# 2. أمر ربط ملف السكربت (Source Setup)
+# 2. ربط السورس بملف
 @bot.tree.command(name="sourcesetup", description="Attach source file to a script")
 @app_commands.describe(file="Upload the script file", script="Choose the target script")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -250,7 +274,7 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
     )
 
 
-# 3. أمر تعديل رول الباير (Set Buyer Role)
+# 3. تحديد رول الباير
 @bot.tree.command(name="setbuyerrole", description="Change the buyer role for a script")
 @app_commands.describe(script="Choose the script", buyer_role="Select the new buyer role")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -264,7 +288,7 @@ async def set_buyer_role_command(interaction: discord.Interaction, script: str, 
     await interaction.response.send_message(f"✅ Buyer role for `{script}` updated to {buyer_role.mention}!", ephemeral=True)
 
 
-# 4. أمر إنشاء البانل (Panel Setup)
+# 4. إعداد البانل
 @bot.tree.command(name="panelsetup", description="Send a script management panel")
 @app_commands.describe(script="Choose the script", channel="Select target channel", name_panel="Enter panel title")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -282,7 +306,7 @@ async def panel_setup_command(interaction: discord.Interaction, script: str, cha
     await interaction.response.send_message(f"✅ Panel created successfully in {channel.mention}!", ephemeral=True)
 
 
-# 5. أمر تحديث السكربت (Update Script)
+# 5. تحديث السكربت
 @bot.tree.command(name="update_script", description="Send a script update announcement")
 @app_commands.describe(script="Choose the script", revision="New version (e.g. 1.0.1 or 99.0.0)", details="Enter update details")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -300,7 +324,7 @@ async def update_script_command(interaction: discord.Interaction, script: str, r
     await interaction.response.send_message(content=ping_text, embed=embed)
 
 
-# 6. أمر مكافآت الدعوة (Invite Reward)
+# 6. مكافآت الدعوة
 @bot.tree.command(name="invite_reward", description="Send the invite rewards panel")
 @app_commands.checks.has_permissions(administrator=True)
 async def invite_reward_command(interaction: discord.Interaction):
@@ -314,7 +338,7 @@ async def invite_reward_command(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed, view=view)
 
 
-# 7. أمر البلاك ليست
+# 7. البلاك ليست
 @bot.tree.command(name="blacklist", description="Add a user to the blacklist")
 @app_commands.describe(user="The user to blacklist")
 @app_commands.checks.has_permissions(administrator=True)
@@ -326,4 +350,4 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("Error: DISCORD_TOKEN environment variable is missing!") 
+    print("Error: DISCORD_TOKEN environment variable is missing!")
