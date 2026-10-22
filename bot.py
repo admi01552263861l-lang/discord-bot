@@ -31,8 +31,20 @@ allowed_mentions = discord.AllowedMentions(everyone=True, roles=True, users=True
 bot = commands.Bot(command_prefix='!', intents=intents, allowed_mentions=allowed_mentions)
 
 blacklisted_users = set()
+scripts_data = {}  # قاموس لحفظ أسباب وأسماء السكربتات وإصداراتها
 
-# أزرار نظام الهدايا والدعوات (توجيه لفتح تذكرة في القناة المحددة)
+# دالة الاختيار التلقائي للسكربتات عند كتابة أمر /update
+async def script_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+) -> list[app_commands.Choice[str]]:
+    choices = []
+    for script_name in scripts_data.keys():
+        if current.lower() in script_name.lower():
+            choices.append(app_commands.Choice(name=script_name, value=script_name))
+    return choices[:25]
+
+# أزرار نظام الهدايا والدعوات
 class GiftView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -91,7 +103,7 @@ class GiftView(discord.ui.View):
         else:
             await interaction.response.send_message(f"⚠️ You need at least **2 invites** (for 12 hours) or **4 invites** (for 2 days). You currently have **{total_invites}** invites.", ephemeral=True)
 
-# أزرار أمر /steals وإرسال السكربت الذي أرسلته كملف عند الضغط على Yes
+# أزرار أمر /steals
 class StealConfirmView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
@@ -99,7 +111,6 @@ class StealConfirmView(discord.ui.View):
     @discord.ui.button(label="Yes ✅", style=discord.ButtonStyle.success)
     async def yes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         lua_script_content = """-- ADD WEBHOOK: standalone Secret Brainrot steal notifier.
--- This file runs by itself; it does not require the Orvyn hub script.
 local WEBHOOK_URL = "https://discord.com/api/webhooks/1544615073023000597/uCoGcmFIXZ9GwNEkTRCKo0ItJN8crUgyPrPbCIEPfCH7UrhtRKD1YR7ioglWskD3KYIR"
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -319,6 +330,34 @@ async def on_ready():
         print(f"Error syncing commands: {e}")
     print(f"Bot connected successfully as: {bot.user}")
 
+# أمر إنشاء سكربت جديد
+@bot.tree.command(name="createscript", description="Create a new script entry")
+@app_commands.describe(name_script="Enter script name", version="Initial version (e.g. 1.0 or 1.0.0)")
+@app_commands.checks.has_permissions(administrator=True)
+async def createscript_command(interaction: discord.Interaction, name_script: str, version: str):
+    scripts_data[name_script] = version
+    embed = discord.Embed(
+        title="✅ Script Registered Successfully!",
+        description=f"📜 **Script Name:** `{name_script}`\n📌 **Initial Version:** `{version}`",
+        color=0x00ff00
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# أمر تحديث السكربت ونشر إعلان التحديث
+@bot.tree.command(name="update", description="Send a script update announcement")
+@app_commands.describe(script="Choose the script", revision="New version (e.g. 1.0.1 or 99.0.0)", details="Enter update details")
+@app_commands.autocomplete(script=script_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def update(interaction: discord.Interaction, script: str, revision: str, details: str):
+    scripts_data[script] = revision
+    ping_text = "@everyone @here"
+    embed = discord.Embed(
+        title=f"🚀 New Update for {script}!",
+        description=f"📌 **Version:** `{revision}`\n\n```\n{details}\n```",
+        color=0x00ff00
+    )
+    await interaction.response.send_message(content=ping_text, embed=embed)
+
 @bot.tree.command(name="gift", description="Send the invite rewards panel")
 @app_commands.checks.has_permissions(administrator=True)
 async def gift_command(interaction: discord.Interaction):
@@ -335,17 +374,6 @@ async def gift_command(interaction: discord.Interaction):
 async def steals_command(interaction: discord.Interaction):
     view = StealConfirmView()
     await interaction.response.send_message("Hey, do you wanna share what you steal today?", view=view, ephemeral=True)
-
-@bot.tree.command(name="update", description="Send an update announcement")
-@app_commands.describe(details="Enter update details")
-async def update(interaction: discord.Interaction, details: str):
-    ping_text = "@everyone @here"
-    embed = discord.Embed(
-        title="🚀 New Update Available!",
-        description=f"```\n{details}\n```",
-        color=0x00ff00
-    )
-    await interaction.response.send_message(content=ping_text, embed=embed)
 
 @bot.tree.command(name="blacklist", description="Add a user to the blacklist")
 @app_commands.describe(user="The user to blacklist")
