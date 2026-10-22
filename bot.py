@@ -5,6 +5,7 @@ import json
 import random
 import string
 import urllib.parse
+import time
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -48,6 +49,46 @@ def save_data():
         print(f"Error saving data: {e}")
 
 scripts_data, blacklisted_users = load_data()
+
+
+# Persistent HWID reset cooldown configuration.
+SECURITY_STATE_FILE = "security_state.json"
+DEFAULT_RESET_HWID_COOLDOWN = 86400  # 24 hours, in seconds
+
+def load_security_state():
+    if os.path.exists(SECURITY_STATE_FILE):
+        try:
+            with open(SECURITY_STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            return {
+                "reset_hwid_cooldown": max(0, int(state.get("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN))),
+                "reset_hwid_last_used": {
+                    str(k): int(v) for k, v in state.get("reset_hwid_last_used", {}).items()
+                },
+            }
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    return {"reset_hwid_cooldown": DEFAULT_RESET_HWID_COOLDOWN, "reset_hwid_last_used": {}}
+
+security_state = load_security_state()
+
+def save_security_state():
+    temp_file = SECURITY_STATE_FILE + ".tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(security_state, f, indent=4)
+    os.replace(temp_file, SECURITY_STATE_FILE)
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if days: parts.append(f"{days}d")
+    if hours: parts.append(f"{hours}h")
+    if minutes: parts.append(f"{minutes}m")
+    if seconds or not parts: parts.append(f"{seconds}s")
+    return " ".join(parts)
 
 class DynamicScriptHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -98,6 +139,13 @@ end
                 self.end_headers()
                 self.wfile.write(secured_wrapper.encode("utf-8"))
                 return
+
+        if len(path_parts) >= 2 and path_parts[0] == "script":
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"Script not found or deleted.")
+            return
 
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -274,10 +322,34 @@ class PanelControlView(discord.ui.View):
         s_info = scripts_data.get(self.script_name)
         user_id = interaction.user.id
         
-        if s_info and user_id in s_info["user_keys"]:
-            await interaction.response.send_message("🔄 HWID and Executor binding reset successfully! You can now launch from your new device/executor.", ephemeral=True)
-        else:
-            await interaction.response.send_message("❌ You don't have an active key/script binding to reset.", ephemeral=True)
+        if not s_info or user_id not in s_info.get("user_keys", {}):
+            await interaction.response.send_message("❌ You don't have an active key for this script.", ephemeral=True)
+            return
+
+        # This enforces and persists the cooldown. Actual device binding must be
+        # stored and checked server-side before claiming the HWID has been reset.
+        cooldown = int(security_state.get("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN))
+        cooldown_key = f"{interaction.guild_id}:{self.script_name}:{user_id}"
+        now = int(time.time())
+        last_used = int(security_state.get("reset_hwid_last_used", {}).get(cooldown_key, 0))
+        remaining = cooldown - (now - last_used)
+
+        if remaining > 0:
+            await interaction.response.send_message(
+                f"⏳ You must wait **{format_duration(remaining)}** before resetting HWID again.\n"
+                "If you changed devices, please wait for the cooldown to expire or contact an admin.",
+                ephemeral=True
+            )
+            return
+
+        security_state.setdefault("reset_hwid_last_used", {})[cooldown_key] = now
+        save_security_state()
+        await interaction.response.send_message(
+            "✅ HWID reset request accepted and cooldown started.\n"
+            "⚠️ The current loader still stores HWID in client-side session memory; "
+            "persistent device enforcement is not active until the loader uses a server-side activation check.",
+            ephemeral=True
+        )
 
     @discord.ui.button(label="Get Buyer Role 👤", style=discord.ButtonStyle.secondary)
     async def get_buyer_role_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -418,6 +490,26 @@ async def create_script_command(
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# Delete a script and disable its hosted route.
+@bot.tree.command(name="delete_script", description="Permanently delete a script entry and disable its URL")
+@app_commands.describe(script="Script to delete")
+@app_commands.autocomplete(script=script_autocomplete)
+async def delete_script_command(interaction: discord.Interaction, script: str):
+    if not is_admin_or_has_role(interaction, script):
+        await interaction.response.send_message("❌ You do not have permission to delete this script.", ephemeral=True)
+        return
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        return
+
+    del scripts_data[script]
+    save_data()
+    await interaction.response.send_message(
+        f"🗑️ Deleted `{script}` from the bot database. Its `/script/{urllib.parse.quote(script)}` route now returns 404.",
+        ephemeral=True
+    )
+
+
 # 4. ربط السورس
 @bot.tree.command(name="sourcesetup", description="Attach source file to a script")
 @app_commands.describe(file="Upload the script file", script="Choose the target script")
@@ -532,6 +624,22 @@ async def invite_reward_command(interaction: discord.Interaction):
     view = InviteRewardView()
     await interaction.response.send_message("Panel created successfully!", ephemeral=True)
     await interaction.channel.send(embed=embed, view=view)
+
+
+# Configure the HWID reset cooldown in seconds.
+@bot.tree.command(name="reset_hwid_coolddown", description="Set the minimum wait between HWID reset requests")
+@app_commands.describe(seconds="Cooldown duration in seconds (0 disables the cooldown)")
+async def reset_hwid_coolddown_command(interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 31536000]):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Only server administrators can change this setting.", ephemeral=True)
+        return
+
+    security_state["reset_hwid_cooldown"] = int(seconds)
+    save_security_state()
+    await interaction.response.send_message(
+        f"✅ HWID reset cooldown set to **{format_duration(seconds)}** ({seconds} seconds).",
+        ephemeral=True
+    )
 
 
 # 10. البلاك ليست
