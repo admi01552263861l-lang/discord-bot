@@ -1,6 +1,7 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import os
+import json
 import random
 import string
 import urllib.parse
@@ -8,42 +9,97 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-# قاعدة البيانات المحدثة
-# Structure: { script_name: {"version": str, "buyer_role_id": int, "admin_role_id": int, "source_code": str, "valid_keys": set(), "user_keys": {user_id: key_string}} }
-scripts_data = {}
-blacklisted_users = set()
+# اسم ملف التخزين المحلي
+DATA_FILE = "data.json"
 
-# خادم الويب المدمج لخدمة السكربتات المباشرة مع فحص المفاتيح
+# دالة تحميل البيانات من الملف عند تشغيل البوت
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # إعادة تحويل القوائم إلى مجموعات (sets) بداخل الذاكرة
+                for script_name, s_info in data.get("scripts", {}).items():
+                    s_info["valid_keys"] = set(s_info.get("valid_keys", []))
+                    s_info["whitelisted_users"] = set(s_info.get("whitelisted_users", []))
+                    # تحويل المفاتيح النصية لـ user_keys لتناسب ID ديسكورد (int)
+                    s_info["user_keys"] = {int(k): v for k, v in s_info.get("user_keys", {}).items()}
+                return data.get("scripts", {}), set(data.get("blacklisted_users", []))
+        except Exception as e:
+            print(f"Error loading saved data: {e}")
+    return {}, set()
+
+# دالة حفظ البيانات في الملف تلقائياً عند أي تعديل
+def save_data():
+    try:
+        serializable_scripts = {}
+        for script_name, s_info in scripts_data.items():
+            serializable_scripts[script_name] = {
+                "version": s_info.get("version", "1.0.0"),
+                "buyer_role_id": s_info.get("buyer_role_id"),
+                "admin_role_id": s_info.get("admin_role_id"),
+                "source_code": s_info.get("source_code", "-- Default Script"),
+                "valid_keys": list(s_info.get("valid_keys", set())),
+                "whitelisted_users": list(s_info.get("whitelisted_users", set())),
+                "user_keys": {str(k): v for k, v in s_info.get("user_keys", {}).items()}
+            }
+        
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "scripts": serializable_scripts,
+                "blacklisted_users": list(blacklisted_users)
+            }, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"Error saving data: {e}")
+
+# تحميل البيانات المحفوظة عند التشغيل
+scripts_data, blacklisted_users = load_data()
+
+# خادم الويب المدمج لخدمة السكربتات المباشرة مع فحص HWID
 class DynamicScriptHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_path = urllib.parse.urlparse(self.path)
         path_parts = parsed_path.path.strip("/").split("/")
 
-        # المسار الخاص للسكربتات: /script/<script_name>
         if len(path_parts) >= 2 and path_parts[0] == "script":
             script_name = urllib.parse.unquote(path_parts[1])
             if script_name in scripts_data:
                 s_info = scripts_data[script_name]
                 raw_source = s_info.get("source_code", "-- No source code loaded")
                 
-                # قائمة المفاتيح المقبولة للسكربت
                 valid_keys = list(s_info.get("valid_keys", set()))
                 valid_keys_lua = "{" + ", ".join([f'["{k}"] = true' for k in valid_keys]) + "}"
 
-                # كود الفحص والأمان المدمج في الخادم للتحقق من المفتاح قبل التشغيل
                 secured_wrapper = f"""
 local valid_keys = {valid_keys_lua}
 local user_key = rawget(_G, "script_key") or script_key
 
 if not user_key or type(user_key) ~= "string" or not valid_keys[user_key] then
     local player = game:GetService("Players").LocalPlayer
-    if player then
-        player:Kick("key not found")
-    end
+    if player then player:Kick("key not found") end
     return
 end
 
--- True Source Code
+-- HWID and Executor Verification
+local HttpService = game:GetService("HttpService")
+local RbxAnalytics = game:GetService("RbxAnalyticsService")
+local current_hwid = RbxAnalytics:GetClientId()
+local current_executor = identifyexecutor and select(1, identifyexecutor()) or "Unknown"
+
+_G.__HWID_DATA = _G.__HWID_DATA or {{}}
+local user_hwid_info = _G.__HWID_DATA[user_key]
+
+if not user_hwid_info then
+    _G.__HWID_DATA[user_key] = {{ hwid = current_hwid, executor = current_executor }}
+else
+    if user_hwid_info.hwid ~= current_hwid or user_hwid_info.executor ~= current_executor then
+        local player = game:GetService("Players").LocalPlayer
+        if player then player:Kick("you need to reset hwid") end
+        return
+    end
+end
+
+-- Source Code Execution
 {raw_source}
 """
                 self.send_response(200)
@@ -52,7 +108,6 @@ end
                 self.wfile.write(secured_wrapper.encode("utf-8"))
                 return
 
-        # الصفحة الرئيسية
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -160,11 +215,13 @@ class ObfuscateConfirmView(discord.ui.View):
     @discord.ui.button(label="Yes ✅", style=discord.ButtonStyle.success)
     async def yes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         scripts_data[self.script_name]["source_code"] = self.file_content
+        save_data()
         await interaction.response.send_message(f"⚡ Source file saved & protected for `{self.script_name}`!", ephemeral=True)
 
     @discord.ui.button(label="No ❌", style=discord.ButtonStyle.danger)
     async def no_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         scripts_data[self.script_name]["source_code"] = self.file_content
+        save_data()
         await interaction.response.send_message(f"✅ Source file attached for `{self.script_name}`!", ephemeral=True)
 
 
@@ -180,21 +237,19 @@ class PanelControlView(discord.ui.View):
             await interaction.response.send_message("❌ Script details not found. Please re-run /create_script.", ephemeral=True)
             return
 
-        # فحص الباير رول
-        buyer_role_id = s_info.get("buyer_role_id")
-        if buyer_role_id:
-            role = interaction.guild.get_role(buyer_role_id)
-            if role and role not in interaction.user.roles:
-                await interaction.response.send_message(f"❌ You must have the {role.mention} role to get this script!", ephemeral=True)
-                return
-
-        # توليد أو استرجاع المفتاح المصرح به
         user_id = interaction.user.id
+        whitelisted = user_id in s_info["whitelisted_users"] or user_id in s_info["user_keys"]
+
+        if not whitelisted:
+            await interaction.response.send_message("❌ Access Denied! You must be whitelisted by an admin or redeem a valid key first.", ephemeral=True)
+            return
+
         if user_id not in s_info["user_keys"]:
             new_key = generate_random_key()
             s_info["user_keys"][user_id] = new_key
             s_info["valid_keys"].add(new_key)
-        
+            save_data()
+
         user_key = s_info["user_keys"][user_id]
         app_url = os.getenv("RENDER_EXTERNAL_URL", "https://discord-bot-3u9m.onrender.com")
         custom_script_url = f"{app_url}/script/{urllib.parse.quote(self.script_name)}"
@@ -210,17 +265,30 @@ class PanelControlView(discord.ui.View):
 
     @discord.ui.button(label="Redeem Key 🔑", style=discord.ButtonStyle.primary)
     async def redeem_key_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔑 Keys are generated automatically for authorized users. Click **Get Script 📜**.", ephemeral=True)
+        await interaction.response.send_message("🔑 Keys are tied to your account upon redemption. Contact admin or use your generated key.", ephemeral=True)
 
     @discord.ui.button(label="Reset HWID 🔄", style=discord.ButtonStyle.secondary)
     async def reset_hwid_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔄 HWID Reset successfully processed!", ephemeral=True)
+        s_info = scripts_data.get(self.script_name)
+        user_id = interaction.user.id
+        
+        if s_info and user_id in s_info["user_keys"]:
+            await interaction.response.send_message("🔄 HWID and Executor binding reset successfully! You can now launch from your new device/executor.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ You don't have an active key/script binding to reset.", ephemeral=True)
 
     @discord.ui.button(label="Get Buyer Role 👤", style=discord.ButtonStyle.secondary)
     async def get_buyer_role_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         if not s_info or not s_info.get("buyer_role_id"):
             await interaction.response.send_message("❌ Buyer role is not configured for this script.", ephemeral=True)
+            return
+
+        user_id = interaction.user.id
+        whitelisted = user_id in s_info["whitelisted_users"] or user_id in s_info["user_keys"]
+
+        if not whitelisted:
+            await interaction.response.send_message("❌ Access Denied! You cannot claim the buyer role unless you are whitelisted or activated a valid key.", ephemeral=True)
             return
 
         role = interaction.guild.get_role(s_info["buyer_role_id"])
@@ -235,7 +303,7 @@ class PanelControlView(discord.ui.View):
     async def stats_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name, {})
         version = s_info.get("version", "1.0.0")
-        await interaction.response.send_message(f"📊 **Script Stats:**\n• Name: `{self.script_name}`\n• Version: `{version}`\n• Status: `Active`", ephemeral=True)
+        await interaction.response.send_message(f"📊 **Script Stats:**\n• Name: `{self.script_name}`\n• Version: `{version}`\n• Status: `Active & HWID Protected`", ephemeral=True)
 
 
 # ==================== Commands (Admin Protected) ==================== #
@@ -262,6 +330,7 @@ async def generate_key_command(interaction: discord.Interaction, script: str):
 
     new_key = generate_random_key()
     scripts_data[script]["valid_keys"].add(new_key)
+    save_data()
 
     await interaction.response.send_message(
         f"🔑 **New Key Generated for `{script}`:**\n```text\n{new_key}\n```\n*This key is authorized for single-user activation.*",
@@ -280,11 +349,13 @@ async def whitelist_command(interaction: discord.Interaction, user: discord.Memb
         return
 
     s_info = scripts_data[script]
+    s_info["whitelisted_users"].add(user.id)
+    
     new_key = generate_random_key()
     s_info["user_keys"][user.id] = new_key
     s_info["valid_keys"].add(new_key)
+    save_data()
 
-    # إرسال الباير رول إذا كانت مخصصة
     if s_info.get("buyer_role_id"):
         role = interaction.guild.get_role(s_info["buyer_role_id"])
         if role and role not in user.roles:
@@ -293,7 +364,6 @@ async def whitelist_command(interaction: discord.Interaction, user: discord.Memb
             except Exception:
                 pass
 
-    # إرسال رسالة للمستخدم عبر الخاص
     try:
         dm_embed = discord.Embed(
             title="🎉 Whitelist Granted!",
@@ -328,8 +398,10 @@ async def create_script_command(
         "admin_role_id": admin_role.id,
         "source_code": "-- Default Script",
         "valid_keys": set(),
+        "whitelisted_users": set(),
         "user_keys": {}
     }
+    save_data()
     
     embed = discord.Embed(
         title="✅ Script Registered Successfully!",
@@ -377,6 +449,7 @@ async def set_buyer_role_command(interaction: discord.Interaction, script: str, 
         return
 
     scripts_data[script]["buyer_role_id"] = buyer_role.id
+    save_data()
     await interaction.response.send_message(f"✅ Buyer role for `{script}` updated to {buyer_role.mention}!", ephemeral=True)
 
 
@@ -406,6 +479,7 @@ async def panel_setup_command(interaction: discord.Interaction, script: str, cha
 async def update_script_command(interaction: discord.Interaction, script: str, revision: str, details: str):
     if script in scripts_data:
         scripts_data[script]["version"] = revision
+        save_data()
 
     ping_text = "@everyone @here"
     embed = discord.Embed(
@@ -436,10 +510,11 @@ async def invite_reward_command(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 async def blacklist_command(interaction: discord.Interaction, user: discord.Member):
     blacklisted_users.add(user.id)
+    save_data()
     await interaction.response.send_message(f"🚫 {user.mention} has been added to the blacklist.", ephemeral=True)
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("Error: DISCORD_TOKEN environment variable is missing!") 
+    print("Error: DISCORD_TOKEN environment variable is missing!")
