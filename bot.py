@@ -119,7 +119,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed_path = urllib.parse.urlparse(self.path)
-        if parsed_path.path != "/hwid/check":
+        if parsed_path.path not in ("/hwid/check", "/script-source"):
             self._send_text(404, "not found")
             return
 
@@ -155,45 +155,47 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 hwid_bindings.pop(binding_key, None)
                 self._send_text(500, "server storage error")
                 return
-            self._send_text(200, "ok: device bound")
-            return
-
-        if existing_hwid != reported_hwid:
+        elif existing_hwid != reported_hwid:
             self._send_text(403, "you need to reset hwid")
             return
 
-        self._send_text(200, "ok")
+        if parsed_path.path == "/script-source":
+            # Deliver source only after key and saved device binding pass.
+            self._send_text(200, s_info.get("source_code", "-- No source code loaded"))
+        else:
+            self._send_text(200, "ok")
 
     def do_GET(self):
         parsed_path = urllib.parse.urlparse(self.path)
         path_parts = parsed_path.path.strip("/").split("/")
 
         if len(path_parts) >= 2 and path_parts[0] == "script":
-            script_name = urllib.parse.unquote(path_parts[1])
-            if script_name in scripts_data:
-                s_info = scripts_data[script_name]
-                raw_source = s_info.get("source_code", "-- No source code loaded")
-                valid_keys = list(s_info.get("valid_keys", set()))
-                valid_keys_lua = "{" + ", ".join(
-                    f'["{k}"] = true' for k in valid_keys
-                ) + "}"
-                app_url = os.getenv("RENDER_EXTERNAL_URL", "https://discord-bot-3u9m.onrender.com").rstrip("/")
-                script_name_lua = json.dumps(script_name)
+            # User-Agent is only a basic browser filter and can be spoofed.
+            # The actual source is separately protected by key + server-side device binding.
+            user_agent = (self.headers.get("User-Agent") or "").lower()
+            allowed_agents = ("roblox", "delta", "real")
+            if not any(agent in user_agent for agent in allowed_agents):
+                self._send_text(403, "⛔ You are not allowed on this page")
+                return
 
-                secured_wrapper = f"""
-local valid_keys = {valid_keys_lua}
+            script_name = urllib.parse.unquote(path_parts[1])
+            if script_name not in scripts_data:
+                self._send_text(404, "Script not found or deleted.")
+                return
+
+            app_url = os.getenv("RENDER_EXTERNAL_URL", "https://discord-bot-3u9m.onrender.com").rstrip("/")
+            script_name_lua = json.dumps(script_name)
+            secured_wrapper = f'''\
 local user_key = rawget(_G, "script_key") or script_key
 local Players = game:GetService("Players")
 local player = Players.LocalPlayer
-
-if not user_key or type(user_key) ~= "string" or not valid_keys[user_key] then
+if type(user_key) ~= "string" or user_key == "" then
     if player then player:Kick("key not found") end
     return
 end
 
-local RbxAnalytics = game:GetService("RbxAnalyticsService")
 local ok_hwid, current_hwid = pcall(function()
-    return RbxAnalytics:GetClientId()
+    return game:GetService("RbxAnalyticsService"):GetClientId()
 end)
 if not ok_hwid or type(current_hwid) ~= "string" or current_hwid == "" then
     if player then player:Kick("HWID check failed. Please retry.") end
@@ -202,14 +204,14 @@ end
 
 local request_fn = (syn and syn.request) or http_request or request
 if type(request_fn) ~= "function" then
-    if player then player:Kick("HWID check unavailable. Use a supported executor.") end
+    if player then player:Kick("HWID check unavailable") end
     return
 end
 
 local HttpService = game:GetService("HttpService")
-local check_ok, response = pcall(function()
+local request_ok, response = pcall(function()
     return request_fn({{
-        Url = "{app_url}/hwid/check",
+        Url = "{app_url}/script-source",
         Method = "POST",
         Headers = {{ ["Content-Type"] = "application/json" }},
         Body = HttpService:JSONEncode({{
@@ -219,9 +221,8 @@ local check_ok, response = pcall(function()
         }})
     }})
 end)
-
-if not check_ok or type(response) ~= "table" then
-    if player then player:Kick("HWID check failed. Please retry.") end
+if not request_ok or type(response) ~= "table" then
+    if player then player:Kick("Script authorization failed") end
     return
 end
 
@@ -231,20 +232,27 @@ if status_code ~= 200 then
     if player then
         if string.find(string.lower(response_body), "you need to reset hwid", 1, true) then
             player:Kick("you need to reset hwid")
+        elseif string.find(string.lower(response_body), "invalid key", 1, true) then
+            player:Kick("key not found")
         else
-            player:Kick("HWID validation failed")
+            player:Kick("Script authorization failed")
         end
     end
     return
 end
 
-{raw_source}
-"""
-                self._send_text(200, secured_wrapper)
-                return
-
-        if len(path_parts) >= 2 and path_parts[0] == "script":
-            self._send_text(404, "Script not found or deleted.")
+local load_ok, load_error = pcall(function()
+    local source_loader = loadstring or load
+    if type(source_loader) ~= "function" then error("loadstring unavailable") end
+    local compiled = source_loader(response_body)
+    if type(compiled) ~= "function" then error("source compile failed") end
+    compiled()
+end)
+if not load_ok and player then
+    player:Kick("Script failed to load")
+end
+'''
+            self._send_text(200, secured_wrapper)
             return
 
         self._send_text(200, "Crystal Hub API & Bot is online and running!")
