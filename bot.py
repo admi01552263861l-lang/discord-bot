@@ -1,5 +1,6 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
+import asyncio
 import os
 import json
 import random
@@ -113,12 +114,79 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         payload = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", os.getenv("SITE_ORIGIN", "*"))
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
 
+    def do_OPTIONS(self):
+        self._send_text(204, "")
+
+    def _notify_site_request(self, route, payload):
+        # Public website submissions are limited in size and sent to the configured owner.
+        owner_id = os.getenv("OWNER_DISCORD_ID", "").strip()
+        if not owner_id.isdigit():
+            self._send_text(503, "owner is not configured")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 1_500_000:
+                self._send_text(400, "invalid request size")
+                return
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                self._send_text(400, "invalid request")
+                return
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self._send_text(400, "invalid request")
+            return
+
+        labels = {
+            "/api/ticket": "Support Ticket",
+            "/api/purchase": "Purchase Request",
+            "/api/project-upload": "Project Submission",
+        }
+        title = labels[route]
+        # Keep messages bounded; never trust website input as Discord mentions.
+        allowed = ("username", "email", "problem", "message", "product", "game", "plan", "contact", "contactMethod", "contactValue", "buyerUsername", "details", "projectName", "projectCode", "fileName", "mode", "safeMode", "discordUrl")
+        lines = []
+        for key in allowed:
+            value = body.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                safe = str(value).replace("@everyone", "@ everyone").replace("@here", "@ here")[:1200]
+                lines.append(f"**{key}:** {safe}")
+        if not lines:
+            self._send_text(400, "missing request details")
+            return
+        message = "\n".join(lines)
+        if route == "/api/project-upload":
+            message += "\n\nNote: the project file is not stored or attached by this endpoint yet; only the submitted details are forwarded."
+        async def deliver():
+            user = bot.get_user(int(owner_id))
+            if user is None:
+                user = await bot.fetch_user(int(owner_id))
+            embed = discord.Embed(title=f"Crystal Hub — {title}", description=message[:4000], color=0x5865F2)
+            await user.send(embed=embed)
+        try:
+            if not bot.is_ready():
+                self._send_text(503, "discord bot is not ready")
+                return
+            future = asyncio.run_coroutine_threadsafe(deliver(), bot.loop)
+            future.result(timeout=12)
+        except Exception as exc:
+            print(f"Website notification failed: {type(exc).__name__}: {exc}")
+            self._send_text(502, "could not deliver message to Discord")
+            return
+        self._send_text(200, json.dumps({"ok": True, "message": "sent to Discord"}))
+
     def do_POST(self):
         parsed_path = urllib.parse.urlparse(self.path)
+        if parsed_path.path in ("/api/ticket", "/api/purchase", "/api/project-upload"):
+            self._notify_site_request(parsed_path.path, {})
+            return
         if parsed_path.path not in ("/hwid/check", "/script-source"):
             self._send_text(404, "not found")
             return
@@ -766,4 +834,4 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("Error: DISCORD_TOKEN environment variable is missing!") 
+    print("Error: DISCORD_TOKEN environment variable is missing!")
