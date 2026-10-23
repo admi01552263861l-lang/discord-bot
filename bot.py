@@ -6,6 +6,11 @@ import json
 import random
 import string
 import urllib.parse
+import urllib.request
+import urllib.error
+import hashlib
+import secrets
+import datetime
 import time
 import discord
 from discord import app_commands
@@ -50,6 +55,50 @@ def save_data():
         print(f"Error saving data: {e}")
 
 scripts_data, blacklisted_users = load_data()
+
+# Website subscription redeem codes are stored as hashes, not plaintext.
+SITE_CODES_FILE = "site_redeem_codes.json"
+SITE_ENTITLEMENTS_FILE = "site_entitlements.json"
+def _load_json_dict(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+def _save_json_dict(path, value):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(value, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+site_redeem_codes = _load_json_dict(SITE_CODES_FILE)
+site_entitlements = _load_json_dict(SITE_ENTITLEMENTS_FILE)
+redeem_attempts = {}
+
+def _hash_redeem_code(code):
+    return hashlib.sha256(code.strip().upper().encode("utf-8")).hexdigest()
+
+def _verify_supabase_access_token(access_token):
+    """Verify identity with Supabase Auth; never trust a user ID sent by the browser."""
+    project_url = os.getenv("SUPABASE_URL", "https://bqucezzkofohbzxnuizq.supabase.co").rstrip("/")
+    publishable_key = os.getenv("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_roBE2qCTV3PVhbSb8PgcGQ_feLcZ74G").strip()
+    if not publishable_key or not access_token:
+        return None
+    req = urllib.request.Request(
+        project_url + "/auth/v1/user",
+        headers={"apikey": publishable_key, "Authorization": "Bearer " + access_token, "Accept": "application/json"},
+        method="GET"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as response:
+            user = json.loads(response.read(65536).decode("utf-8"))
+        if isinstance(user, dict) and user.get("id"):
+            return {"id": str(user["id"]), "email": str(user.get("email", ""))[:254]}
+    except Exception as exc:
+        print(f"Supabase token verification failed: {type(exc).__name__}")
+    return None
 
 
 # Persistent HWID reset cooldown configuration.
@@ -182,8 +231,99 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             return
         self._send_text(200, json.dumps({"ok": True, "message": "sent to Discord"}))
 
+    def _create_admin_site_code(self):
+        # Code creation is performed server-side; the admin code must be configured as a Render secret.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 8192:
+                self._send_text(400, json.dumps({"error": "Invalid request."})); return
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict): raise ValueError("invalid body")
+            supplied = str(payload.get("adminCode", ""))
+            plan = str(payload.get("codeType", ""))
+            label = str(payload.get("codeLabel", ""))[:60]
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self._send_text(400, json.dumps({"error": "Invalid request."})); return
+        expected = os.getenv("ADMIN_ACCESS_CODE", "admi-on-top")
+        if not expected or not secrets.compare_digest(supplied, expected):
+            self._send_text(403, json.dumps({"error": "Admin authorization failed. Set ADMIN_ACCESS_CODE in Render and unlock again."})); return
+        if plan not in ("Premium", "Ultra", "Admin"):
+            self._send_text(400, json.dumps({"error": "Choose Premium, Ultra, or Admin."})); return
+        prefix = {"Premium": "PREM", "Ultra": "ULTRA", "Admin": "ADMIN"}[plan]
+        raw = "CH-" + prefix + "-" + secrets.token_hex(6).upper()
+        days = 30 if plan == "Premium" else 0
+        key = _hash_redeem_code(raw)
+        site_redeem_codes[key] = {"plan": plan, "duration_days": days, "label": label, "created_by": "website-admin", "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "redeemed_by": None, "redeemed_at": None, "revoked": False}
+        try:
+            _save_json_dict(SITE_CODES_FILE, site_redeem_codes)
+        except OSError:
+            site_redeem_codes.pop(key, None)
+            self._send_text(500, json.dumps({"error": "Could not save the code. Check persistent storage on Render."})); return
+        self._send_text(200, json.dumps({"ok": True, "code": raw, "plan": plan, "duration": "30 days" if days else "Lifetime", "label": label}))
+
+    def _redeem_site_code(self):
+        # Basic per-IP throttle; code validation and user identity are checked server-side.
+        ip = self.client_address[0] if self.client_address else "unknown"
+        now = time.time()
+        recent = [t for t in redeem_attempts.get(ip, []) if now - t < 60]
+        if len(recent) >= 12:
+            redeem_attempts[ip] = recent
+            self._send_text(429, json.dumps({"error": "Too many attempts. Wait a minute and try again."}))
+            return
+        recent.append(now); redeem_attempts[ip] = recent
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 8192:
+                self._send_text(400, json.dumps({"error": "Invalid request."})); return
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict): raise ValueError("invalid body")
+            code = str(payload.get("code", "")).strip().upper()[:120]
+            access_token = str(payload.get("accessToken", ""))[:8192]
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self._send_text(400, json.dumps({"error": "Invalid request."})); return
+        if not code or not access_token:
+            self._send_text(400, json.dumps({"error": "Enter a code and sign in first."})); return
+        user = _verify_supabase_access_token(access_token)
+        if not user:
+            self._send_text(401, json.dumps({"error": "Your session could not be verified. Sign in again."})); return
+        key = _hash_redeem_code(code)
+        record = site_redeem_codes.get(key)
+        # Allow the configured admin access code to be redeemed from Subscriptions too.
+        # It is still treated as a one-time code and grants the Admin entitlement.
+        admin_redeem_code = os.getenv("ADMIN_ACCESS_CODE", "admi-on-top")
+        if admin_redeem_code and secrets.compare_digest(code, admin_redeem_code):
+            if record is None:
+                record = {"plan": "Admin", "duration_days": 0, "created_by": "configured-admin-code", "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "redeemed_by": None, "redeemed_at": None, "revoked": False}
+                site_redeem_codes[key] = record
+        if not record or record.get("revoked"):
+            self._send_text(404, json.dumps({"error": "Invalid or expired redeem code."})); return
+        if record.get("redeemed_by"):
+            self._send_text(409, json.dumps({"error": "This code has already been used."})); return
+        plan = record.get("plan", "Premium")
+        days = int(record.get("duration_days", 30))
+        expires_at = None if days <= 0 else (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)).isoformat()
+        entitlement = {"plan": plan, "redeemed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "expires_at": expires_at, "code_hash": key}
+        # Save entitlement and code use together as separate atomic file updates.
+        old_code = dict(record)
+        record["redeemed_by"] = user["id"]
+        record["redeemed_at"] = entitlement["redeemed_at"]
+        site_entitlements[user["id"]] = entitlement
+        try:
+            _save_json_dict(SITE_CODES_FILE, site_redeem_codes)
+            _save_json_dict(SITE_ENTITLEMENTS_FILE, site_entitlements)
+        except OSError:
+            site_redeem_codes[key] = old_code
+            self._send_text(500, json.dumps({"error": "Server could not save redemption. Try again later."})); return
+        self._send_text(200, json.dumps({"ok": True, "plan": plan, "duration": "Lifetime" if days <= 0 else f"{days} days", "expiresAt": expires_at}))
+
     def do_POST(self):
         parsed_path = urllib.parse.urlparse(self.path)
+        if parsed_path.path == "/api/redeem-code":
+            self._redeem_site_code()
+            return
+        if parsed_path.path == "/api/admin/create-code":
+            self._create_admin_site_code()
+            return
         if parsed_path.path in ("/api/ticket", "/api/purchase", "/api/project-upload"):
             self._notify_site_request(parsed_path.path, {})
             return
@@ -819,16 +959,154 @@ async def reset_hwid_coolddown_command(interaction: discord.Interaction, seconds
 
 
 # 10. البلاك ليست
-@bot.tree.command(name="blacklist", description="Add a user to the blacklist")
+def is_bot_owner(user_id: int) -> bool:
+    """Only the configured Discord account owner can use global admin actions."""
+    owner_id = os.getenv("BOT_OWNER_ID", "").strip()
+    return bool(owner_id) and str(user_id) == owner_id
+
+
+@bot.tree.command(name="blacklist", description="Globally block a user from bot features")
 @app_commands.describe(user="The user to blacklist")
 async def blacklist_command(interaction: discord.Interaction, user: discord.Member):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+    if not is_bot_owner(interaction.user.id):
+        await interaction.response.send_message("❌ This action is restricted to the bot owner.", ephemeral=True)
         return
 
     blacklisted_users.add(user.id)
     save_data()
-    await interaction.response.send_message(f"🚫 {user.mention} has been added to the blacklist.", ephemeral=True)
+    await interaction.response.send_message(f"🚫 {user.mention} has been added to the global bot blacklist.", ephemeral=True)
+
+
+@bot.tree.command(name="unblacklist", description="Remove a user from the global bot blacklist")
+@app_commands.describe(user_id="Discord user ID to unblock")
+async def unblacklist_command(interaction: discord.Interaction, user_id: str):
+    if not is_bot_owner(interaction.user.id):
+        await interaction.response.send_message("❌ This action is restricted to the bot owner.", ephemeral=True)
+        return
+    try:
+        target_id = int(user_id.strip())
+    except (TypeError, ValueError):
+        await interaction.response.send_message("❌ Enter a valid numeric Discord user ID.", ephemeral=True)
+        return
+    blacklisted_users.discard(target_id)
+    save_data()
+    await interaction.response.send_message(f"✅ User `{target_id}` removed from the global blacklist.", ephemeral=True)
+
+
+@bot.tree.command(name="list_servers", description="List servers the bot has joined")
+async def list_servers_command(interaction: discord.Interaction):
+    if not is_bot_owner(interaction.user.id):
+        await interaction.response.send_message("❌ This action is restricted to the bot owner.", ephemeral=True)
+        return
+    guilds = sorted(bot.guilds, key=lambda g: g.name.lower())
+    if not guilds:
+        await interaction.response.send_message("The bot is not in any servers.", ephemeral=True)
+        return
+    lines = [f"• **{discord.utils.escape_markdown(g.name)}** — ID: `{g.id}` — members: `{g.member_count or 'unknown'}`" for g in guilds]
+    # Discord message limits; split output safely into multiple ephemeral replies.
+    chunks, current = [], "\n".join(lines[:])
+    while len(current) > 1900:
+        cut = current.rfind("\n", 0, 1900)
+        if cut < 1:
+            cut = 1900
+        chunks.append(current[:cut])
+        current = current[cut:].lstrip("\n")
+    if current:
+        chunks.append(current)
+    await interaction.response.send_message("**Bot servers**\n" + chunks[0], ephemeral=True)
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk, ephemeral=True)
+
+
+@bot.tree.command(name="send_server_message", description="Send a message to a channel in a selected server")
+@app_commands.describe(server_id="Target server ID", channel_id="Target channel ID", message="Message to send")
+async def send_server_message_command(interaction: discord.Interaction, server_id: str, channel_id: str, message: str):
+    if not is_bot_owner(interaction.user.id):
+        await interaction.response.send_message("❌ This action is restricted to the bot owner.", ephemeral=True)
+        return
+    try:
+        guild_id, target_channel_id = int(server_id.strip()), int(channel_id.strip())
+    except (TypeError, ValueError):
+        await interaction.response.send_message("❌ Server ID and channel ID must be numeric.", ephemeral=True)
+        return
+    message = message.strip()
+    if not message or len(message) > 1800:
+        await interaction.response.send_message("❌ Message must be between 1 and 1800 characters.", ephemeral=True)
+        return
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        await interaction.response.send_message("❌ The bot is not in that server.", ephemeral=True)
+        return
+    channel = guild.get_channel(target_channel_id)
+    if channel is None or not hasattr(channel, "send"):
+        await interaction.response.send_message("❌ Could not find a sendable channel in that server.", ephemeral=True)
+        return
+    try:
+        await channel.send(message, allowed_mentions=discord.AllowedMentions.none())
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ The bot lacks permission to send messages in that channel.", ephemeral=True)
+        return
+    except discord.HTTPException:
+        await interaction.response.send_message("❌ Discord could not deliver the message.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"✅ Message sent to **{guild.name}** / {channel.mention}.", ephemeral=True)
+
+@bot.tree.command(name="create_redeem_code", description="Create a one-time Crystal Hub website subscription code")
+@app_commands.describe(plan="Plan granted by the code")
+@app_commands.choices(plan=[app_commands.Choice(name="Premium (30 days)", value="Premium"), app_commands.Choice(name="Ultra (Lifetime)", value="Ultra"), app_commands.Choice(name="Admin (Lifetime)", value="Admin")])
+async def create_redeem_code_command(interaction: discord.Interaction, plan: app_commands.Choice[str]):
+    if not is_bot_owner(interaction.user.id):
+        await interaction.response.send_message("❌ This command is restricted to the configured bot owner.", ephemeral=True)
+        return
+    raw = "CH-" + {"Premium":"PREM", "Ultra":"ULTRA", "Admin":"ADMIN"}[plan.value] + "-" + secrets.token_hex(6).upper()
+    days = 30 if plan.value == "Premium" else 0
+    site_redeem_codes[_hash_redeem_code(raw)] = {"plan": plan.value, "duration_days": days, "created_by": str(interaction.user.id), "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "redeemed_by": None, "redeemed_at": None, "revoked": False}
+    try:
+        _save_json_dict(SITE_CODES_FILE, site_redeem_codes)
+    except OSError:
+        site_redeem_codes.pop(_hash_redeem_code(raw), None)
+        await interaction.response.send_message("❌ Could not save the code. Check server file permissions.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"✅ **{plan.value} redeem code created** (one use only).\nCopy this code now; it will not be shown again:\n```text\n{raw}\n```", ephemeral=True)
+
+@bot.tree.command(name="list_redeem_codes", description="List Crystal Hub website redeem code status")
+async def list_redeem_codes_command(interaction: discord.Interaction):
+    if not is_bot_owner(interaction.user.id):
+        await interaction.response.send_message("❌ This command is restricted to the configured bot owner.", ephemeral=True)
+        return
+    if not site_redeem_codes:
+        await interaction.response.send_message("No website redeem codes have been created yet.", ephemeral=True)
+        return
+    lines = []
+    for i, rec in enumerate(site_redeem_codes.values(), 1):
+        status = "revoked" if rec.get("revoked") else ("used" if rec.get("redeemed_by") else "available")
+        lines.append(f"{i}. **{rec.get('plan','Premium')}** — {status} — created {str(rec.get('created_at',''))[:10]}")
+    chunks, current = [], "\n".join(lines)
+    while len(current) > 1800:
+        cut = current.rfind("\n", 0, 1800)
+        if cut < 1: cut = 1800
+        chunks.append(current[:cut]); current = current[cut:].lstrip("\n")
+    chunks.append(current)
+    await interaction.response.send_message("**Website redeem codes**\n" + chunks[0], ephemeral=True)
+    for chunk in chunks[1:]: await interaction.followup.send(chunk, ephemeral=True)
+
+@bot.tree.command(name="revoke_redeem_code", description="Revoke an unused Crystal Hub website redeem code")
+@app_commands.describe(code="The full code to revoke")
+async def revoke_redeem_code_command(interaction: discord.Interaction, code: str):
+    if not is_bot_owner(interaction.user.id):
+        await interaction.response.send_message("❌ This command is restricted to the configured bot owner.", ephemeral=True)
+        return
+    key = _hash_redeem_code(code)
+    rec = site_redeem_codes.get(key)
+    if not rec:
+        await interaction.response.send_message("❌ Code not found.", ephemeral=True)
+        return
+    if rec.get("redeemed_by"):
+        await interaction.response.send_message("❌ This code has already been redeemed and cannot be revoked with this command.", ephemeral=True)
+        return
+    rec["revoked"] = True
+    _save_json_dict(SITE_CODES_FILE, site_redeem_codes)
+    await interaction.response.send_message("✅ Redeem code revoked.", ephemeral=True)
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
