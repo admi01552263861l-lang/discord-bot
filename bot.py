@@ -12,6 +12,7 @@ import hashlib
 import secrets
 import datetime
 import time
+from typing import Optional
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -157,6 +158,89 @@ def format_duration(seconds: int) -> str:
     if minutes: parts.append(f"{minutes}m")
     if seconds or not parts: parts.append(f"{seconds}s")
     return " ".join(parts)
+
+
+def _script_api_key_valid(query_key: str) -> bool:
+    expected = os.getenv("SCRIPT_API_KEY", "").strip()
+    if not expected:
+        return False
+    return secrets.compare_digest(str(query_key or ""), expected)
+
+def _script_record_payload(script_name: str, s_info: dict) -> dict:
+    return {
+        "ok": True,
+        "script": {
+            "name": script_name,
+            "version": s_info.get("version", "1.0.0"),
+            "source_code": s_info.get("source_code", ""),
+            "buyer_role_id": s_info.get("buyer_role_id"),
+            "admin_role_id": s_info.get("admin_role_id"),
+        }
+    }
+
+def _load_script_from_api_url(api_url: str) -> dict:
+    """Fetch a Crystal Hub script API payload for /create-script."""
+    parsed = urllib.parse.urlparse(api_url.strip())
+    if parsed.scheme not in ("https", "http") or not parsed.netloc:
+        raise ValueError("Invalid API URL.")
+
+    allowed_hosts = []
+    for raw in (
+        os.getenv("SCRIPT_API_HOST", ""),
+        os.getenv("SITE_ORIGIN", ""),
+        os.getenv("RENDER_EXTERNAL_URL", ""),
+    ):
+        raw = raw.strip()
+        if raw:
+            try:
+                allowed_hosts.append(urllib.parse.urlparse(raw).netloc.lower())
+            except Exception:
+                pass
+
+    host = parsed.netloc.lower()
+    if allowed_hosts and host not in allowed_hosts:
+        raise ValueError("This API URL is not an approved Crystal Hub API host.")
+
+    query = urllib.parse.parse_qs(parsed.query)
+    api_key = query.get("key", [""])[0]
+    expected = os.getenv("SCRIPT_API_KEY", "").strip()
+    if expected and not secrets.compare_digest(api_key, expected):
+        raise ValueError("Invalid script API key.")
+
+    req = urllib.request.Request(
+        api_url,
+        headers={"Accept": "application/json", "User-Agent": "CrystalHubBot/1.0"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            raw = response.read(2_000_000)
+    except Exception as exc:
+        raise ValueError(f"Could not fetch script API: {type(exc).__name__}") from exc
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Script API did not return valid JSON.") from exc
+
+    if isinstance(data, dict) and isinstance(data.get("script"), dict):
+        data = data["script"]
+    if not isinstance(data, dict):
+        raise ValueError("Script API response must be a JSON object.")
+
+    name = str(data.get("name") or data.get("script_name") or "").strip()[:100]
+    source = data.get("source_code", data.get("code", data.get("source", "")))
+    if not name:
+        raise ValueError("Script API response is missing the script name.")
+    if not isinstance(source, str):
+        raise ValueError("Script API response is missing source_code.")
+    return {
+        "name": name,
+        "version": str(data.get("version") or "1.0.0")[:32],
+        "source_code": source,
+        "buyer_role_id": data.get("buyer_role_id"),
+        "admin_role_id": data.get("admin_role_id"),
+    }
 
 class DynamicScriptHandler(BaseHTTPRequestHandler):
     def _send_text(self, status, body):
@@ -413,6 +497,24 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_path = urllib.parse.urlparse(self.path)
         path_parts = parsed_path.path.strip("/").split("/")
+
+        if len(path_parts) >= 2 and path_parts[0] == "api" and path_parts[1] == "script-export":
+            query = urllib.parse.parse_qs(parsed_path.query)
+            if not _script_api_key_valid(query.get("key", [""])[0]):
+                self._send_text(401, json.dumps({"error": "Invalid API key."}))
+                return
+            script_name = urllib.parse.unquote("/".join(path_parts[2:])).strip()
+            if not script_name or script_name not in scripts_data:
+                self._send_text(404, json.dumps({"error": "Script not found."}))
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", os.getenv("SITE_ORIGIN", "*"))
+            payload = json.dumps(_script_record_payload(script_name, scripts_data[script_name]), ensure_ascii=False).encode("utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
         if len(path_parts) >= 2 and path_parts[0] == "script":
             # User-Agent is only a basic browser filter and can be spoofed.
@@ -746,7 +848,7 @@ async def on_ready():
 
 
 # 1. إنشاء مفتاح جديد
-@bot.tree.command(name="generate_key", description="Generate a single-use key for a script")
+@bot.tree.command(name="generate-key", description="Generate a single-use key for a script")
 @app_commands.describe(script="Target script")
 @app_commands.autocomplete(script=script_autocomplete)
 async def generate_key_command(interaction: discord.Interaction, script: str):
@@ -812,39 +914,95 @@ async def whitelist_command(interaction: discord.Interaction, user: discord.Memb
 
 
 # 3. إنشاء السكربت
-@bot.tree.command(name="create_script", description="Create a new script entry with roles")
-@app_commands.describe(name_script="Enter script name", buyer_role="Select buyer role", admin_role="Select admin role")
+@bot.tree.command(name="create-script", description="Create a new script entry")
+@app_commands.describe(
+    name_script="Enter script name (optional when API is provided)",
+    buyer_role="Select buyer role (optional when API is provided)",
+    admin_role="Select admin role (optional when API is provided)",
+    api="Optional Crystal Hub script API URL. If supplied, the script is imported automatically."
+)
 async def create_script_command(
-    interaction: discord.Interaction, 
-    name_script: str, 
-    buyer_role: discord.Role, 
-    admin_role: discord.Role
+    interaction: discord.Interaction,
+    name_script: Optional[str] = None,
+    buyer_role: Optional[discord.Role] = None,
+    admin_role: Optional[discord.Role] = None,
+    api: Optional[str] = None,
 ):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You must be an administrator to create scripts.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ You must be an administrator to create scripts.",
+            ephemeral=True
+        )
+        return
+
+    imported = None
+    if api:
+        try:
+            imported = await asyncio.to_thread(_load_script_from_api_url, api)
+        except ValueError as exc:
+            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+        except Exception:
+            await interaction.response.send_message("❌ Could not import the script from that API.", ephemeral=True)
+            return
+
+    if imported:
+        name_script = imported["name"]
+        buyer_role_id = imported.get("buyer_role_id")
+        admin_role_id = imported.get("admin_role_id")
+        if buyer_role is not None:
+            buyer_role_id = buyer_role.id
+        if admin_role is not None:
+            admin_role_id = admin_role.id
+        source_code = imported["source_code"]
+        version = imported["version"]
+    else:
+        name_script = (name_script or "").strip()
+        if not name_script:
+            await interaction.response.send_message("❌ Enter a script name, or provide the API URL.", ephemeral=True)
+            return
+        if buyer_role is None or admin_role is None:
+            await interaction.response.send_message(
+                "❌ Without an API, select both Buyer Role and Admin Role. "
+                "With an API, those fields are optional.",
+                ephemeral=True
+            )
+            return
+        buyer_role_id = buyer_role.id
+        admin_role_id = admin_role.id
+        source_code = "-- Default Script"
+        version = "1.0.0"
+
+    if not name_script:
+        await interaction.response.send_message("❌ Script name is missing.", ephemeral=True)
         return
 
     scripts_data[name_script] = {
-        "version": "1.0.0",
-        "buyer_role_id": buyer_role.id,
-        "admin_role_id": admin_role.id,
-        "source_code": "-- Default Script",
+        "version": version,
+        "buyer_role_id": buyer_role_id,
+        "admin_role_id": admin_role_id,
+        "source_code": source_code,
         "valid_keys": set(),
         "whitelisted_users": set(),
         "user_keys": {}
     }
     save_data()
-    
+
     embed = discord.Embed(
         title="✅ Script Registered Successfully!",
-        description=f"📜 **Script Name:** `{name_script}`\n👤 **Buyer Role:** {buyer_role.mention}\n🛡️ **Admin Role:** {admin_role.mention}",
+        description=(
+            f"📜 **Script Name:** `{name_script}`\n"
+            f"👤 **Buyer Role:** {f'<@&{buyer_role_id}>' if buyer_role_id else 'Not configured'}\n"
+            f"🛡️ **Admin Role:** {f'<@&{admin_role_id}>' if admin_role_id else 'Not configured'}\n"
+            f"🔗 **Source:** {'Imported from API' if imported else 'Created manually'}"
+        ),
         color=0x00ff00
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # Delete a script and disable its hosted route.
-@bot.tree.command(name="delete_script", description="Permanently delete a script entry and disable its URL")
+@bot.tree.command(name="delete-script", description="Permanently delete a script entry and disable its URL")
 @app_commands.describe(script="Script to delete")
 @app_commands.autocomplete(script=script_autocomplete)
 async def delete_script_command(interaction: discord.Interaction, script: str):
@@ -864,7 +1022,7 @@ async def delete_script_command(interaction: discord.Interaction, script: str):
 
 
 # 4. ربط السورس
-@bot.tree.command(name="sourcesetup", description="Attach source file to a script")
+@bot.tree.command(name="source-setup", description="Attach source file to a script")
 @app_commands.describe(file="Upload the script file", script="Choose the target script")
 @app_commands.autocomplete(script=script_autocomplete)
 async def source_setup_command(interaction: discord.Interaction, file: discord.Attachment, script: str):
@@ -884,7 +1042,7 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
 
 
 # 5. تعديل رول الباير
-@bot.tree.command(name="setbuyerrole", description="Change the buyer role for a script")
+@bot.tree.command(name="set-buyer-role", description="Change the buyer role for a script")
 @app_commands.describe(script="Choose the script", buyer_role="Select the new buyer role")
 @app_commands.autocomplete(script=script_autocomplete)
 async def set_buyer_role_command(interaction: discord.Interaction, script: str, buyer_role: discord.Role):
@@ -902,7 +1060,7 @@ async def set_buyer_role_command(interaction: discord.Interaction, script: str, 
 
 
 # 6. تعديل رول الإدارة
-@bot.tree.command(name="setadminrole", description="Change the admin role for a script")
+@bot.tree.command(name="set-admin-role", description="Change the admin role for a script")
 @app_commands.describe(script="Choose the script", admin_role="Select the new admin role")
 @app_commands.autocomplete(script=script_autocomplete)
 async def set_admin_role_command(interaction: discord.Interaction, script: str, admin_role: discord.Role):
@@ -920,7 +1078,7 @@ async def set_admin_role_command(interaction: discord.Interaction, script: str, 
 
 
 # 7. إعداد البانل
-@bot.tree.command(name="panelsetup", description="Send a script management panel")
+@bot.tree.command(name="panel-setup", description="Send a script management panel")
 @app_commands.describe(script="Choose the script", channel="Select target channel", name_panel="Enter panel title")
 @app_commands.autocomplete(script=script_autocomplete)
 async def panel_setup_command(interaction: discord.Interaction, script: str, channel: discord.TextChannel, name_panel: str):
@@ -941,7 +1099,7 @@ async def panel_setup_command(interaction: discord.Interaction, script: str, cha
 
 
 # 8. تحديث السكربت
-@bot.tree.command(name="update_script", description="Send a script update announcement")
+@bot.tree.command(name="update-script", description="Send a script update announcement")
 @app_commands.describe(script="Choose the script", revision="New version (e.g. 1.0.1 or 99.0.0)", details="Enter update details")
 @app_commands.autocomplete(script=script_autocomplete)
 async def update_script_command(interaction: discord.Interaction, script: str, revision: str, details: str):
@@ -963,7 +1121,7 @@ async def update_script_command(interaction: discord.Interaction, script: str, r
 
 
 # 9. مكافآت الدعوة
-@bot.tree.command(name="invite_reward", description="Send the invite rewards panel")
+@bot.tree.command(name="invite-reward", description="Send the invite rewards panel")
 async def invite_reward_command(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
@@ -980,7 +1138,7 @@ async def invite_reward_command(interaction: discord.Interaction):
 
 
 # Configure the HWID reset cooldown in seconds.
-@bot.tree.command(name="reset_hwid_coolddown", description="Set the minimum wait between HWID reset requests")
+@bot.tree.command(name="reset-hwid-cooldown", description="Set the minimum wait between HWID reset requests")
 @app_commands.describe(seconds="Cooldown duration in seconds (0 disables the cooldown)")
 async def reset_hwid_coolddown_command(interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 31536000]):
     if not interaction.user.guild_permissions.administrator:
@@ -1030,7 +1188,7 @@ async def unblacklist_command(interaction: discord.Interaction, user_id: str):
     await interaction.response.send_message(f"✅ User `{target_id}` removed from the global blacklist.", ephemeral=True)
 
 
-@bot.tree.command(name="list_servers", description="List servers the bot has joined")
+@bot.tree.command(name="list-servers", description="List servers the bot has joined")
 async def list_servers_command(interaction: discord.Interaction):
     if not is_bot_owner(interaction.user.id):
         await interaction.response.send_message("❌ This action is restricted to the bot owner.", ephemeral=True)
@@ -1055,7 +1213,7 @@ async def list_servers_command(interaction: discord.Interaction):
         await interaction.followup.send(chunk, ephemeral=True)
 
 
-@bot.tree.command(name="send_server_message", description="Send a message to a channel in a selected server")
+@bot.tree.command(name="send-server-message", description="Send a message to a channel in a selected server")
 @app_commands.describe(server_id="Target server ID", channel_id="Target channel ID", message="Message to send")
 async def send_server_message_command(interaction: discord.Interaction, server_id: str, channel_id: str, message: str):
     if not is_bot_owner(interaction.user.id):
@@ -1088,7 +1246,7 @@ async def send_server_message_command(interaction: discord.Interaction, server_i
         return
     await interaction.response.send_message(f"✅ Message sent to **{guild.name}** / {channel.mention}.", ephemeral=True)
 
-@bot.tree.command(name="create_redeem_code", description="Create a one-time Crystal Hub website subscription code")
+@bot.tree.command(name="create-redeem-code", description="Create a one-time Crystal Hub website subscription code")
 @app_commands.describe(plan="Plan granted by the code")
 @app_commands.choices(plan=[app_commands.Choice(name="Premium (30 days)", value="Premium"), app_commands.Choice(name="Ultra (Lifetime)", value="Ultra"), app_commands.Choice(name="Admin (Lifetime)", value="Admin")])
 async def create_redeem_code_command(interaction: discord.Interaction, plan: app_commands.Choice[str]):
@@ -1106,7 +1264,7 @@ async def create_redeem_code_command(interaction: discord.Interaction, plan: app
         return
     await interaction.response.send_message(f"✅ **{plan.value} redeem code created** (one use only).\nCopy this code now; it will not be shown again:\n```text\n{raw}\n```", ephemeral=True)
 
-@bot.tree.command(name="list_redeem_codes", description="List Crystal Hub website redeem code status")
+@bot.tree.command(name="list-redeem-codes", description="List Crystal Hub website redeem code status")
 async def list_redeem_codes_command(interaction: discord.Interaction):
     if not is_bot_owner(interaction.user.id):
         await interaction.response.send_message("❌ This command is restricted to the configured bot owner.", ephemeral=True)
@@ -1127,7 +1285,7 @@ async def list_redeem_codes_command(interaction: discord.Interaction):
     await interaction.response.send_message("**Website redeem codes**\n" + chunks[0], ephemeral=True)
     for chunk in chunks[1:]: await interaction.followup.send(chunk, ephemeral=True)
 
-@bot.tree.command(name="revoke_redeem_code", description="Revoke an unused Crystal Hub website redeem code")
+@bot.tree.command(name="revoke-redeem-code", description="Revoke an unused Crystal Hub website redeem code")
 @app_commands.describe(code="The full code to revoke")
 async def revoke_redeem_code_command(interaction: discord.Interaction, code: str):
     if not is_bot_owner(interaction.user.id):
@@ -1149,4 +1307,4 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("Error: DISCORD_TOKEN environment variable is missing!") 
+    print("Error: DISCORD_TOKEN environment variable is missing!")  
