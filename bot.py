@@ -253,13 +253,44 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         raw = "CH-" + prefix + "-" + secrets.token_hex(6).upper()
         days = 30 if plan == "Premium" else 0
         key = _hash_redeem_code(raw)
-        site_redeem_codes[key] = {"plan": plan, "duration_days": days, "label": label, "created_by": "website-admin", "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "redeemed_by": None, "redeemed_at": None, "revoked": False}
+        site_redeem_codes[key] = {"plan": plan, "duration_days": days, "label": label, "code": raw, "created_by": "website-admin", "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "redeemed_by": None, "redeemed_at": None, "revoked": False}
         try:
             _save_json_dict(SITE_CODES_FILE, site_redeem_codes)
         except OSError:
             site_redeem_codes.pop(key, None)
             self._send_text(500, json.dumps({"error": "Could not save the code. Check persistent storage on Render."})); return
         self._send_text(200, json.dumps({"ok": True, "code": raw, "plan": plan, "duration": "30 days" if days else "Lifetime", "label": label}))
+
+    def _admin_manage_site_codes(self, action):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 8192:
+                self._send_text(400, json.dumps({"error": "Invalid request."})); return
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict): raise ValueError("invalid body")
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self._send_text(400, json.dumps({"error": "Invalid request."})); return
+        expected = os.getenv("ADMIN_ACCESS_CODE", "admi-on-top")
+        supplied = str(payload.get("adminCode", ""))
+        if not expected or not secrets.compare_digest(supplied, expected):
+            self._send_text(403, json.dumps({"error": "Admin authorization failed."})); return
+        if action == "list":
+            rows = []
+            for key, rec in site_redeem_codes.items():
+                rows.append({"id": key, "code": rec.get("code", ""), "plan": rec.get("plan", "Unknown"), "label": rec.get("label", ""), "redeemed": bool(rec.get("redeemed_by")), "revoked": bool(rec.get("revoked")), "created_at": rec.get("created_at", "")})
+            self._send_text(200, json.dumps({"ok": True, "codes": rows})); return
+        key = str(payload.get("codeHash", ""))
+        rec = site_redeem_codes.get(key)
+        if not rec:
+            self._send_text(404, json.dumps({"error": "Code not found."})); return
+        if rec.get("redeemed_by"):
+            self._send_text(409, json.dumps({"error": "Redeemed codes cannot be deleted."})); return
+        rec["revoked"] = True
+        try: _save_json_dict(SITE_CODES_FILE, site_redeem_codes)
+        except OSError:
+            rec["revoked"] = False
+            self._send_text(500, json.dumps({"error": "Could not save code changes."})); return
+        self._send_text(200, json.dumps({"ok": True}))
 
     def _redeem_site_code(self):
         # Basic per-IP throttle; code validation and user identity are checked server-side.
@@ -323,6 +354,12 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             return
         if parsed_path.path == "/api/admin/create-code":
             self._create_admin_site_code()
+            return
+        if parsed_path.path == "/api/admin/list-codes":
+            self._admin_manage_site_codes("list")
+            return
+        if parsed_path.path == "/api/admin/delete-code":
+            self._admin_manage_site_codes("delete")
             return
         if parsed_path.path in ("/api/ticket", "/api/purchase", "/api/project-upload"):
             self._notify_site_request(parsed_path.path, {})
@@ -1112,5 +1149,4 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("Error: DISCORD_TOKEN environment variable is missing!")
- 
+    print("Error: DISCORD_TOKEN environment variable is missing!") 
