@@ -106,6 +106,105 @@ site_redeem_codes = _load_json_dict(SITE_CODES_FILE)
 site_entitlements = _load_json_dict(SITE_ENTITLEMENTS_FILE)
 redeem_attempts = {}
 
+DISCORD_PLAN_CODES_FILE = "discord_plan_codes.json"
+DISCORD_PLAN_ENTITLEMENTS_FILE = "discord_plan_entitlements.json"
+MONTHLY_USAGE_FILE = "discord_monthly_usage.json"
+discord_plan_codes = _load_json_dict(DISCORD_PLAN_CODES_FILE)
+discord_plan_entitlements = _load_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE)
+monthly_usage = _load_json_dict(MONTHLY_USAGE_FILE)
+FREE_LIMITS = {"scripts": 5, "panels": 5, "sources": 20, "keys": 100, "avatars": 0}
+PREMIUM_LIMITS = {"scripts": 15, "panels": 15, "sources": 100, "keys": None, "avatars": 5}
+
+def _month_key():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
+
+def _discord_plan(user_id):
+    rec = discord_plan_entitlements.get(str(user_id), {})
+    if not isinstance(rec, dict):
+        return "Free"
+    expires = rec.get("expires_at")
+    if expires:
+        try:
+            if datetime.datetime.fromisoformat(expires) <= datetime.datetime.now(datetime.timezone.utc):
+                discord_plan_entitlements.pop(str(user_id), None)
+                _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
+                return "Free"
+        except (ValueError, TypeError):
+            return "Free"
+    return str(rec.get("plan", "Free"))
+
+def _quota_check(user_id, category):
+    plan = _discord_plan(user_id)
+    if plan == "Ultra":
+        return True, None
+    limits = PREMIUM_LIMITS if plan == "Premium" else FREE_LIMITS
+    limit = limits.get(category)
+    if limit is None:
+        return True, None
+
+    # Scripts/panels are active inventory limits. Deleting an item frees a slot.
+    if category == "scripts":
+        owned = sum(1 for item in scripts_data.values()
+                    if str(item.get("created_by", "")) == str(user_id))
+        if owned >= limit:
+            return False, f"{plan} limit reached: {limit} active scripts. Delete one to free a slot."
+        return True, None
+    if category == "panels":
+        owned = sum(1 for item in scripts_data.values()
+                    if str(item.get("panel_created_by", item.get("created_by", ""))) == str(user_id)
+                    and item.get("panel_message_id"))
+        if owned >= limit:
+            return False, f"{plan} limit reached: {limit} active panels. Delete one to free a slot."
+        return True, None
+
+    month = _month_key()
+    rec = monthly_usage.setdefault(str(user_id), {})
+    if rec.get("month") != month:
+        rec.clear()
+        rec["month"] = month
+    if int(rec.get(category, 0)) >= limit:
+        return False, f"{plan} monthly limit reached: {limit} {category}. Your usage resets next month."
+    return True, None
+
+def _quota_increment(user_id, category):
+    month = _month_key()
+    rec = monthly_usage.setdefault(str(user_id), {})
+    if rec.get("month") != month:
+        rec.clear()
+        rec["month"] = month
+    rec[category] = int(rec.get(category, 0)) + 1
+    _save_json_dict(MONTHLY_USAGE_FILE, monthly_usage)
+
+def _quota_status(user_id):
+    plan = _discord_plan(user_id)
+    limits = PREMIUM_LIMITS if plan == "Premium" else FREE_LIMITS
+    if plan == "Ultra":
+        return "Ultra — unlimited"
+    rec = monthly_usage.setdefault(str(user_id), {})
+    if rec.get("month") != _month_key():
+        rec = {"month": _month_key()}
+    names = {"scripts": "active scripts", "panels": "active panels", "sources": "sources this month", "keys": "keys this month", "avatars": "avatar changes this month"}
+    active_scripts = sum(1 for item in scripts_data.values() if str(item.get("created_by", "")) == str(user_id))
+    active_panels = sum(1 for item in scripts_data.values()
+                        if str(item.get("panel_created_by", item.get("created_by", ""))) == str(user_id)
+                        and item.get("panel_message_id"))
+    parts = []
+    for category, limit in limits.items():
+        if limit is not None:
+            used = active_scripts if category == "scripts" else active_panels if category == "panels" else int(rec.get(category, 0))
+            parts.append(f"{names[category]}: {used}/{limit}")
+    return f"{plan} plan — " + " • ".join(parts)
+
+def _make_discord_plan_code(plan, days):
+    raw = "CRYSTAL-" + plan.upper() + "-" + secrets.token_hex(5).upper()
+    discord_plan_codes[_hash_redeem_code(raw)] = {
+        "code": raw, "plan": plan, "duration_days": int(days),
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "redeemed_by": None, "redeemed_at": None
+    }
+    _save_json_dict(DISCORD_PLAN_CODES_FILE, discord_plan_codes)
+    return raw
+
 def _hash_redeem_code(code):
     return hashlib.sha256(code.strip().upper().encode("utf-8")).hexdigest()
 
@@ -746,13 +845,79 @@ class ObfuscateConfirmView(discord.ui.View):
     async def yes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         scripts_data[self.script_name]["source_code"] = self.file_content
         save_data()
+        _quota_increment(interaction.user.id, "sources")
         await interaction.response.send_message(f"⚡ Source file saved & protected for `{self.script_name}`!", ephemeral=True)
 
     @discord.ui.button(label="No ❌", style=discord.ButtonStyle.danger)
     async def no_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         scripts_data[self.script_name]["source_code"] = self.file_content
         save_data()
+        _quota_increment(interaction.user.id, "sources")
         await interaction.response.send_message(f"✅ Source file attached for `{self.script_name}`!", ephemeral=True)
+
+
+class ScriptRedeemModal(discord.ui.Modal, title="Crystal Hub — Redeem a Key"):
+    code = discord.ui.TextInput(
+        label="Enter script key below",
+        placeholder="Paste your Crystal Hub key",
+        required=True,
+        max_length=120
+    )
+
+    def __init__(self, script_name: str):
+        super().__init__(timeout=180)
+        self.script_name = script_name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        supplied = str(self.code.value or "").strip()
+        s_info = scripts_data.get(self.script_name)
+        if not s_info:
+            await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+            return
+
+        if supplied in s_info.get("valid_keys", set()):
+            uid = interaction.user.id
+            owner = next((int(k) for k, v in s_info.get("user_keys", {}).items()
+                          if v == supplied and int(k) != uid), None)
+            if owner is not None:
+                await interaction.response.send_message("❌ This key is already linked to another Discord account.", ephemeral=True)
+                return
+            s_info["whitelisted_users"].add(uid)
+            s_info["user_keys"][uid] = supplied
+            save_data()
+            await interaction.response.send_message(
+                f"✅ Key redeemed successfully for **{self.script_name}** — Crystal Hub.",
+                ephemeral=True
+            )
+            return
+
+        # Premium/Ultra codes are also redeemable through this Crystal Hub modal.
+        code_hash = _hash_redeem_code(supplied)
+        rec = discord_plan_codes.get(code_hash)
+        if not rec or rec.get("redeemed_by"):
+            await interaction.response.send_message("❌ Invalid or already-used Crystal Hub code.", ephemeral=True)
+            return
+        plan = str(rec.get("plan", "Premium"))
+        days = int(rec.get("duration_days", 30))
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expires_at = None if days <= 0 else (now + datetime.timedelta(days=days)).isoformat()
+        old_rec = dict(rec)
+        rec["redeemed_by"] = str(interaction.user.id)
+        rec["redeemed_at"] = now.isoformat()
+        discord_plan_entitlements[str(interaction.user.id)] = {
+            "plan": plan, "redeemed_at": now.isoformat(), "expires_at": expires_at
+        }
+        try:
+            _save_json_dict(DISCORD_PLAN_CODES_FILE, discord_plan_codes)
+            _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
+        except OSError:
+            discord_plan_codes[code_hash] = old_rec
+            await interaction.response.send_message("❌ Could not save the redemption. Try again.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"✅ Crystal Hub **{plan}** activated ({'Lifetime' if days <= 0 else str(days) + ' days'}).",
+            ephemeral=True
+        )
 
 
 class PanelControlView(discord.ui.View):
@@ -795,7 +960,7 @@ class PanelControlView(discord.ui.View):
 
     @discord.ui.button(label="Redeem Key 🔑", style=discord.ButtonStyle.primary)
     async def redeem_key_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔑 Keys are tied to your account upon redemption. Contact admin or use your generated key.", ephemeral=True)
+        await interaction.response.send_modal(ScriptRedeemModal(self.script_name))
 
     @discord.ui.button(label="Reset HWID 🔄", style=discord.ButtonStyle.secondary)
     async def reset_hwid_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -888,9 +1053,14 @@ async def generate_key_command(interaction: discord.Interaction, script: str):
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
         return
 
+    quota_ok, quota_error = _quota_check(interaction.user.id, "keys")
+    if not quota_ok:
+        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+        return
     new_key = generate_random_key()
     scripts_data[script]["valid_keys"].add(new_key)
     save_data()
+    _quota_increment(interaction.user.id, "keys")
 
     await interaction.response.send_message(
         f"🔑 **New Key Generated for `{script}`:**\n```text\n{new_key}\n```",
@@ -911,6 +1081,11 @@ async def whitelist_command(interaction: discord.Interaction, user: discord.Memb
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
         return
 
+    quota_ok, quota_error = _quota_check(interaction.user.id, "keys")
+    if not quota_ok:
+        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+        return
+
     s_info = scripts_data[script]
     s_info["whitelisted_users"].add(user.id)
     
@@ -918,6 +1093,7 @@ async def whitelist_command(interaction: discord.Interaction, user: discord.Memb
     s_info["user_keys"][user.id] = new_key
     s_info["valid_keys"].add(new_key)
     save_data()
+    _quota_increment(interaction.user.id, "keys")
 
     if s_info.get("buyer_role_id"):
         role = interaction.guild.get_role(s_info["buyer_role_id"])
@@ -963,6 +1139,11 @@ async def create_script_command(
         )
         return
 
+    quota_ok, quota_error = _quota_check(interaction.user.id, "scripts")
+    if not quota_ok:
+        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+        return
+
     imported = None
     if api:
         try:
@@ -1005,6 +1186,7 @@ async def create_script_command(
         await interaction.response.send_message("❌ Script name is missing.", ephemeral=True)
         return
 
+    api_key = "CH-" + secrets.token_urlsafe(24)
     scripts_data[name_script] = {
         "version": version,
         "buyer_role_id": buyer_role_id,
@@ -1012,7 +1194,9 @@ async def create_script_command(
         "source_code": source_code,
         "valid_keys": set(),
         "whitelisted_users": set(),
-        "user_keys": {}
+        "user_keys": {},
+        "created_by": str(interaction.user.id),
+        "api_key": api_key
     }
     save_data()
 
@@ -1027,6 +1211,10 @@ async def create_script_command(
         color=0x00ff00
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(
+        f"🔐 **Private API key for {name_script}** — save it securely. It is stored with the script and survives bot restarts/updates:\\n```text\\n{api_key}\\n```",
+        ephemeral=True
+    )
 
 
 # Delete a script and disable its hosted route.
@@ -1060,6 +1248,11 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
 
     if script not in scripts_data:
         await interaction.response.send_message("❌ Selected script does not exist.", ephemeral=True)
+        return
+
+    quota_ok, quota_error = _quota_check(interaction.user.id, "sources")
+    if not quota_ok:
+        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
         return
 
     content_bytes = await file.read()
@@ -1106,6 +1299,75 @@ async def set_admin_role_command(interaction: discord.Interaction, script: str, 
 
 
 # 7. إعداد البانل
+@bot.tree.command(name="my-plan", description="Show your Crystal Hub plan and monthly usage")
+async def my_plan_command(interaction: discord.Interaction):
+    await interaction.response.send_message(_quota_status(interaction.user.id), ephemeral=True)
+
+
+@bot.tree.command(name="avatar-bot", description="Change the bot nickname and avatar")
+@app_commands.describe(
+    avatar_url="Direct URL to a PNG/JPG/GIF image (avatar change affects the bot globally)",
+    nickname="Optional nickname for this server only"
+)
+async def avatar_bot_command(
+    interaction: discord.Interaction,
+    avatar_url: Optional[str] = None,
+    nickname: Optional[str] = None
+):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Only a server administrator can use this command.", ephemeral=True)
+        return
+    if not avatar_url and not nickname:
+        await interaction.response.send_message("❌ Provide an avatar URL, a nickname, or both.", ephemeral=True)
+        return
+
+    quota_ok, quota_error = _quota_check(interaction.user.id, "avatars")
+    if not quota_ok:
+        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+        return
+
+    changes = []
+    if nickname is not None:
+        bot_member = interaction.guild.me
+        if bot_member is None:
+            bot_member = interaction.guild.get_member(bot.user.id)
+        if bot_member is None:
+            await interaction.response.send_message("❌ Could not find the bot member in this server.", ephemeral=True)
+            return
+        try:
+            await bot_member.edit(nick=nickname[:32] if nickname else None, reason="Crystal Hub /avatar-bot command")
+            changes.append("server nickname updated")
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ I need the Change Nickname permission and a suitable role position.", ephemeral=True)
+            return
+
+    if avatar_url:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(avatar_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                    if response.status != 200:
+                        await interaction.response.send_message("❌ Could not download the image URL. Use a direct public image URL.", ephemeral=True)
+                        return
+                    image_bytes = await response.read()
+                    if len(image_bytes) > 8 * 1024 * 1024:
+                        await interaction.response.send_message("❌ Image must be under 8 MB.", ephemeral=True)
+                        return
+            await bot.user.edit(avatar=image_bytes)
+            changes.append("bot avatar updated globally")
+        except Exception as exc:
+            await interaction.response.send_message(
+                "❌ Could not change the bot avatar. Check the direct image URL and try again.",
+                ephemeral=True
+            )
+            return
+
+    _quota_increment(interaction.user.id, "avatars")
+    await interaction.response.send_message(
+        "✅ Crystal Hub: " + ", ".join(changes) + f".\n{_quota_status(interaction.user.id)}",
+        ephemeral=True
+    )
+
+
 @bot.tree.command(name="panel-setup", description="Create or update the single script management panel")
 @app_commands.describe(script="Choose the script", channel="Optional target channel; if empty, use the channel where this command is run", name_panel="Enter panel title")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -1125,12 +1387,19 @@ async def panel_setup_command(interaction: discord.Interaction, script: str, nam
         await interaction.response.send_message("❌ Selected script does not exist.", ephemeral=True)
         return
 
+    panel_was_existing = bool(s_info.get("panel_message_id") and s_info.get("panel_guild_id") == interaction.guild_id)
+    if not panel_was_existing:
+        quota_ok, quota_error = _quota_check(interaction.user.id, "panels")
+        if not quota_ok:
+            await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+            return
+
     embed = discord.Embed(
         title=name_panel,
-        description=f"Best {script.lower()}\n\nFaulmor • Script Management |",
+        description=f"Best {script.lower()}\n\nCrystal Hub • Script Management",
         color=0xd4af37
     )
-    embed.set_author(name="luarmor", icon_url=bot.user.display_avatar.url)
+    embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
     view = PanelControlView(script_name=script)
 
     # Keep exactly one panel per script in a server. If the panel already exists,
@@ -1165,6 +1434,7 @@ async def panel_setup_command(interaction: discord.Interaction, script: str, nam
     s_info["panel_channel_id"] = target_channel.id
     s_info["panel_message_id"] = existing_message.id
     s_info["panel_name"] = name_panel
+    s_info["panel_created_by"] = str(interaction.user.id)
     save_data()
 
     await interaction.response.send_message(
@@ -1237,49 +1507,57 @@ def is_bot_owner(user_id: int) -> bool:
 
 # ==================== Admin Redeem + -massage ==================== #
 
-@bot.tree.command(name="redeem", description="Redeem admin code or any code")
-@app_commands.describe(code="Enter your redeem code")
+@bot.tree.command(name="redeem", description="Redeem a Crystal Hub code")
+@app_commands.describe(code="Enter your Crystal Hub redeem code")
 async def redeem_command(interaction: discord.Interaction, code: str):
     supplied = str(code or "").strip().upper()
-
     if not supplied:
-        await interaction.response.send_message(
-            "❌ Please enter a redeem code.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("❌ Please enter a redeem code.", ephemeral=True)
         return
 
-    if supplied != ADMIN_REDEEM_CODE:
-        await interaction.response.send_message(
-            "❌ Invalid redeem code.",
-            ephemeral=True
-        )
+    # Admin unlock code retained for the legacy -massage feature.
+    if supplied == ADMIN_REDEEM_CODE:
+        user_id = str(interaction.user.id)
+        if user_id in admin_redeemed_users:
+            await interaction.response.send_message("✅ Admin code already redeemed.", ephemeral=True)
+            return
+        admin_redeemed_users.add(user_id)
+        try:
+            save_admin_redeems()
+        except OSError:
+            admin_redeemed_users.discard(user_id)
+            await interaction.response.send_message("❌ Could not save redemption. Try again later.", ephemeral=True)
+            return
+        await interaction.response.send_message("✅ Admin code redeemed. You can now use `-massage`.", ephemeral=True)
         return
 
-    user_id = str(interaction.user.id)
-
-    if user_id in admin_redeemed_users:
-        await interaction.response.send_message(
-            "✅ You already redeemed the admin code. You can use `-massage`.",
-            ephemeral=True
-        )
+    code_hash = _hash_redeem_code(supplied)
+    rec = discord_plan_codes.get(code_hash)
+    if not rec or rec.get("redeemed_by"):
+        await interaction.response.send_message("❌ Invalid or already-used Crystal Hub code.", ephemeral=True)
         return
 
-    admin_redeemed_users.add(user_id)
-
+    plan = str(rec.get("plan", "Premium"))
+    days = int(rec.get("duration_days", 30))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expires_at = None if days <= 0 else (now + datetime.timedelta(days=days)).isoformat()
+    old_rec = dict(rec)
+    rec["redeemed_by"] = str(interaction.user.id)
+    rec["redeemed_at"] = now.isoformat()
+    discord_plan_entitlements[str(interaction.user.id)] = {
+        "plan": plan, "redeemed_at": now.isoformat(), "expires_at": expires_at
+    }
     try:
-        save_admin_redeems()
+        _save_json_dict(DISCORD_PLAN_CODES_FILE, discord_plan_codes)
+        _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
     except OSError:
-        admin_redeemed_users.discard(user_id)
-        await interaction.response.send_message(
-            "❌ Could not save your redeem status. Try again later.",
-            ephemeral=True
-        )
+        discord_plan_codes[code_hash] = old_rec
+        await interaction.response.send_message("❌ Could not save redemption. Try again.", ephemeral=True)
         return
 
     await interaction.response.send_message(
-        "✅ **Admin code redeemed successfully!**\n"
-        "You can now use `-massage` to send messages through the bot.",
+        f"✅ Crystal Hub **{plan}** activated — {'Lifetime' if days <= 0 else str(days) + ' days'}.\n"
+        f"{_quota_status(interaction.user.id)}",
         ephemeral=True
     )
 
@@ -1318,6 +1596,33 @@ async def on_message(message: discord.Message):
         return
 
     content = message.content.strip()
+    if content.lower().startswith("-createcode"):
+        if not message.guild or not message.author.guild_permissions.administrator:
+            await message.reply("❌ Only a server administrator can create Crystal Hub codes.")
+            return
+        parts = content.split()
+        if len(parts) < 2 or parts[1].lower() not in ("premium", "ultra"):
+            await message.reply("Usage: `-createcode premium [days]` or `-createcode ultra [days]`")
+            return
+        plan = parts[1].capitalize()
+        try:
+            days = int(parts[2]) if len(parts) > 2 else (30 if plan == "Premium" else 0)
+            if days < 0 or days > 3650:
+                raise ValueError
+        except ValueError:
+            await message.reply("❌ Days must be between 0 and 3650.")
+            return
+        try:
+            raw = _make_discord_plan_code(plan, days)
+        except OSError:
+            await message.reply("❌ Could not save the code.")
+            return
+        duration = "Lifetime" if days == 0 else f"{days} days"
+        await message.reply(
+            f"✅ Crystal Hub **{plan}** code created ({duration}). Redeem it with the panel's **Redeem Key** button:\n```text\n{raw}\n```",
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        return
 
     if content.lower().startswith("-massage"):
         if not message.guild:
