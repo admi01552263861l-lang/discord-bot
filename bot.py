@@ -47,6 +47,11 @@ def load_data():
                     s_info["valid_keys"] = set(s_info.get("valid_keys", []))
                     s_info["whitelisted_users"] = set(s_info.get("whitelisted_users", []))
                     s_info["user_keys"] = {int(k): v for k, v in s_info.get("user_keys", {}).items()}
+                    # Persistent panel location/message so /panel-setup does not create duplicates.
+                    s_info.setdefault("panel_guild_id", None)
+                    s_info.setdefault("panel_channel_id", None)
+                    s_info.setdefault("panel_message_id", None)
+                    s_info.setdefault("panel_name", None)
                 return data.get("scripts", {}), set(data.get("blacklisted_users", []))
         except Exception as e:
             print(f"Error loading saved data: {e}")
@@ -61,6 +66,10 @@ def save_data():
                 "buyer_role_id": s_info.get("buyer_role_id"),
                 "admin_role_id": s_info.get("admin_role_id"),
                 "source_code": s_info.get("source_code", "-- Default Script"),
+                "panel_guild_id": s_info.get("panel_guild_id"),
+                "panel_channel_id": s_info.get("panel_channel_id"),
+                "panel_message_id": s_info.get("panel_message_id"),
+                "panel_name": s_info.get("panel_name"),
                 "valid_keys": list(s_info.get("valid_keys", set())),
                 "whitelisted_users": list(s_info.get("whitelisted_users", set())),
                 "user_keys": {str(k): v for k, v in s_info.get("user_keys", {}).items()}
@@ -1097,12 +1106,23 @@ async def set_admin_role_command(interaction: discord.Interaction, script: str, 
 
 
 # 7. إعداد البانل
-@bot.tree.command(name="panel-setup", description="Send a script management panel")
-@app_commands.describe(script="Choose the script", channel="Select target channel", name_panel="Enter panel title")
+@bot.tree.command(name="panel-setup", description="Create or update the single script management panel")
+@app_commands.describe(script="Choose the script", channel="Optional target channel; if empty, use the channel where this command is run", name_panel="Enter panel title")
 @app_commands.autocomplete(script=script_autocomplete)
-async def panel_setup_command(interaction: discord.Interaction, script: str, channel: discord.TextChannel, name_panel: str):
+async def panel_setup_command(interaction: discord.Interaction, script: str, name_panel: str, channel: Optional[discord.TextChannel] = None):
     if not is_admin_or_has_role(interaction, script):
         await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        return
+
+    # If no channel was selected, use the channel where /panel-setup was executed.
+    target_channel = channel or interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message("❌ I can only create the panel inside a text channel.", ephemeral=True)
+        return
+
+    s_info = scripts_data.get(script)
+    if not s_info:
+        await interaction.response.send_message("❌ Selected script does not exist.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -1111,10 +1131,46 @@ async def panel_setup_command(interaction: discord.Interaction, script: str, cha
         color=0xd4af37
     )
     embed.set_author(name="luarmor", icon_url=bot.user.display_avatar.url)
-    
     view = PanelControlView(script_name=script)
-    await channel.send(embed=embed, view=view)
-    await interaction.response.send_message(f"✅ Panel created successfully in {channel.mention}!", ephemeral=True)
+
+    # Keep exactly one panel per script in a server. If the panel already exists,
+    # edit it instead of sending another message. The IDs are persisted in data.json.
+    existing_message = None
+    if s_info.get("panel_guild_id") == interaction.guild_id and s_info.get("panel_message_id"):
+        old_channel_id = s_info.get("panel_channel_id")
+        try:
+            old_channel = interaction.guild.get_channel(int(old_channel_id)) if interaction.guild else None
+            if old_channel is None:
+                old_channel = await bot.fetch_channel(int(old_channel_id))
+            existing_message = await old_channel.fetch_message(int(s_info["panel_message_id"]))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+            existing_message = None
+
+    if existing_message is not None:
+        # If the user selected a different channel, move the panel by deleting the old
+        # message and creating the single replacement in the new channel.
+        if existing_message.channel.id != target_channel.id:
+            try:
+                await existing_message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+            existing_message = None
+        else:
+            await existing_message.edit(embed=embed, view=view)
+
+    if existing_message is None:
+        existing_message = await target_channel.send(embed=embed, view=view)
+
+    s_info["panel_guild_id"] = interaction.guild_id
+    s_info["panel_channel_id"] = target_channel.id
+    s_info["panel_message_id"] = existing_message.id
+    s_info["panel_name"] = name_panel
+    save_data()
+
+    await interaction.response.send_message(
+        f"✅ Panel ready in {target_channel.mention}. Only one panel is kept for `{script}`.",
+        ephemeral=True
+    )
 
 
 # 8. تحديث السكربت
