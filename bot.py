@@ -291,7 +291,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         # Allow the configured admin access code to be redeemed from Subscriptions too.
         # It is still treated as a one-time code and grants the Admin entitlement.
         admin_redeem_code = os.getenv("ADMIN_ACCESS_CODE", "admi-on-top")
-        if admin_redeem_code and secrets.compare_digest(code, admin_redeem_code):
+        if admin_redeem_code and secrets.compare_digest(code.upper(), admin_redeem_code.strip().upper()):
             if record is None:
                 record = {"plan": "Admin", "duration_days": 0, "created_by": "configured-admin-code", "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "redeemed_by": None, "redeemed_at": None, "revoked": False}
                 site_redeem_codes[key] = record
@@ -1113,3 +1113,4 @@ if TOKEN:
     bot.run(TOKEN)
 else:
     print("Error: DISCORD_TOKEN environment variable is missing!")
+ 
