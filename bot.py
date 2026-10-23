@@ -4,6 +4,7 @@ import asyncio
 import os
 import json
 import random
+import re
 import string
 import urllib.parse
 import urllib.request
@@ -18,6 +19,24 @@ from discord import app_commands
 from discord.ext import commands
 
 DATA_FILE = "data.json"
+
+# Discord admin redeem access
+ADMIN_REDEEM_FILE = "discord_admin_redeems.json"
+ADMIN_REDEEM_CODE = os.getenv("ADMIN_REDEEM_CODE", "admi-on-top").strip().upper()
+
+def load_admin_redeems():
+    try:
+        with open(ADMIN_REDEEM_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(str(x) for x in data.get("users", []))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return set()
+
+def save_admin_redeems():
+    with open(ADMIN_REDEEM_FILE, "w", encoding="utf-8") as f:
+        json.dump({"users": sorted(admin_redeemed_users)}, f, indent=2)
+
+admin_redeemed_users = load_admin_redeems()
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -1158,6 +1177,174 @@ def is_bot_owner(user_id: int) -> bool:
     """Only the configured Discord account owner can use global admin actions."""
     owner_id = os.getenv("BOT_OWNER_ID", "").strip()
     return bool(owner_id) and str(user_id) == owner_id
+
+
+# ==================== Admin Redeem + -massage ==================== #
+
+@bot.tree.command(name="redeem", description="Redeem admin code or any code")
+@app_commands.describe(code="Enter your redeem code")
+async def redeem_command(interaction: discord.Interaction, code: str):
+    supplied = str(code or "").strip().upper()
+
+    if not supplied:
+        await interaction.response.send_message(
+            "❌ Please enter a redeem code.",
+            ephemeral=True
+        )
+        return
+
+    if supplied != ADMIN_REDEEM_CODE:
+        await interaction.response.send_message(
+            "❌ Invalid redeem code.",
+            ephemeral=True
+        )
+        return
+
+    user_id = str(interaction.user.id)
+
+    if user_id in admin_redeemed_users:
+        await interaction.response.send_message(
+            "✅ You already redeemed the admin code. You can use `-massage`.",
+            ephemeral=True
+        )
+        return
+
+    admin_redeemed_users.add(user_id)
+
+    try:
+        save_admin_redeems()
+    except OSError:
+        admin_redeemed_users.discard(user_id)
+        await interaction.response.send_message(
+            "❌ Could not save your redeem status. Try again later.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        "✅ **Admin code redeemed successfully!**\n"
+        "You can now use `-massage` to send messages through the bot.",
+        ephemeral=True
+    )
+
+
+def _parse_massage_target(guild: discord.Guild, target: str):
+    """Accept #channel mention, Discord channel URL, or channel ID."""
+    target = target.strip()
+
+    # <#123456789>
+    if target.startswith("<#") and target.endswith(">"):
+        channel_id = target[2:-1]
+        if channel_id.isdigit():
+            return guild.get_channel(int(channel_id))
+
+    # https://discord.com/channels/GUILD_ID/CHANNEL_ID
+    match = re.fullmatch(
+        r"https?://(?:discord\.com|discordapp\.com)/channels/(\d+)/(\d+)",
+        target
+    )
+    if match:
+        target_guild_id, channel_id = match.groups()
+        if target_guild_id != str(guild.id):
+            return None
+        return guild.get_channel(int(channel_id))
+
+    # Raw channel ID
+    if target.isdigit():
+        return guild.get_channel(int(target))
+
+    return None
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    content = message.content.strip()
+
+    if content.lower().startswith("-massage"):
+        if not message.guild:
+            return
+
+        if str(message.author.id) not in admin_redeemed_users:
+            await message.reply(
+                "❌ You must redeem the admin code first using `/redeem`."
+            )
+            return
+
+        args = content[len("-massage"):].strip()
+
+        if not args:
+            await message.reply(
+                "❌ Usage: `-massage #channel Your message`\n"
+                "You can also use a Discord channel link."
+            )
+            return
+
+        # Split target from message. Channel mentions/URLs contain no spaces,
+        # so the first whitespace-separated item is the target.
+        parts = args.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.reply(
+                "❌ Usage: `-massage #channel Your message`"
+            )
+            return
+
+        target_text, text_to_send = parts
+        channel = _parse_massage_target(message.guild, target_text)
+
+        if channel is None:
+            await message.reply(
+                "❌ Channel not found. Use a channel mention like `#general`, "
+                "a Discord channel link, or a channel ID."
+            )
+            return
+
+        if not isinstance(channel, discord.TextChannel):
+            await message.reply(
+                "❌ That is not a normal text channel I can message."
+            )
+            return
+
+        permissions = channel.permissions_for(message.guild.me)
+        if not permissions.send_messages:
+            await message.reply(
+                "❌ I don't have permission to send messages in that channel."
+            )
+            return
+
+        text_to_send = text_to_send.strip()
+        if not text_to_send:
+            await message.reply("❌ Message cannot be empty.")
+            return
+
+        if len(text_to_send) > 2000:
+            await message.reply(
+                "❌ The message is too long. Discord allows up to 2000 characters."
+            )
+            return
+
+        try:
+            await channel.send(
+                text_to_send,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            await message.reply(
+                f"✅ Message sent to {channel.mention}."
+            )
+        except discord.Forbidden:
+            await message.reply(
+                "❌ I don't have permission to send messages there."
+            )
+        except discord.HTTPException:
+            await message.reply(
+                "❌ Discord could not send the message."
+            )
+        return
+
+    # Keep any existing prefix commands working.
+    await bot.process_commands(message)
 
 
 @bot.tree.command(name="blacklist", description="Globally block a user from bot features")
