@@ -94,10 +94,24 @@ def save_admin_redeems():
 
 admin_redeemed_users = load_admin_redeems()
 
+# Durable local snapshots. For hosts with ephemeral filesystems, mount a persistent
+# disk at the working directory or configure an external database.
+AUTO_BACKUP_DIR = os.getenv("CRYSTAL_HUB_BACKUP_DIR", "crystal_hub_backups")
+AUTO_BACKUP_LATEST = os.path.join(AUTO_BACKUP_DIR, "latest_data.json")
+USER_BACKUP_DIR = os.path.join(AUTO_BACKUP_DIR, "users")
+
+def _atomic_write_json(path, value):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+
 def load_data():
-    if os.path.exists(DATA_FILE):
+    source_path = DATA_FILE if os.path.exists(DATA_FILE) else AUTO_BACKUP_LATEST
+    if os.path.exists(source_path):
         try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
+            with open(source_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 for script_name, s_info in data.get("scripts", {}).items():
                     s_info["valid_keys"] = set(s_info.get("valid_keys", []))
@@ -109,6 +123,18 @@ def load_data():
                     s_info.setdefault("panel_message_id", None)
                     s_info.setdefault("panel_name", None)
                     s_info.setdefault("panel_description", "")
+                    s_info.setdefault("panel_instances", [])
+                    if not isinstance(s_info.get("panel_instances"), list):
+                        s_info["panel_instances"] = []
+                    if not s_info["panel_instances"] and s_info.get("panel_guild_id") and s_info.get("panel_channel_id"):
+                        s_info["panel_instances"].append({
+                            "guild_id": s_info.get("panel_guild_id"),
+                            "channel_id": s_info.get("panel_channel_id"),
+                            "message_id": s_info.get("panel_message_id"),
+                            "name": s_info.get("panel_name"),
+                            "description": s_info.get("panel_description", ""),
+                            "created_by": s_info.get("panel_created_by"),
+                        })
                     s_info.setdefault("trail_enabled", False)
                     s_info.setdefault("trail_mode", "PERM")
                     s_info.setdefault("trail_expires_at", None)
@@ -146,6 +172,7 @@ def save_data():
                 "panel_message_id": s_info.get("panel_message_id"),
                 "panel_name": s_info.get("panel_name"),
                 "panel_description": s_info.get("panel_description", ""),
+                "panel_instances": s_info.get("panel_instances", []) if isinstance(s_info.get("panel_instances", []), list) else [],
                 "valid_keys": list(s_info.get("valid_keys", set())),
                 "whitelisted_users": list(s_info.get("whitelisted_users", set())),
                 "user_keys": {str(k): v for k, v in s_info.get("user_keys", {}).items()},
@@ -159,11 +186,38 @@ def save_data():
                 "panel_created_by": s_info.get("panel_created_by"),
             }
         
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump({
-                "scripts": serializable_scripts,
-                "blacklisted_users": list(blacklisted_users)
-            }, f, indent=4, ensure_ascii=False)
+        payload = {
+            "scripts": serializable_scripts,
+            "blacklisted_users": list(blacklisted_users),
+        }
+        _atomic_write_json(DATA_FILE, payload)
+        # A second, independent snapshot is used if the primary data file is missing.
+        _atomic_write_json(AUTO_BACKUP_LATEST, payload)
+
+        # One JSON file per known user. Each file contains scripts/panels they created
+        # or own, rather than other users' private script inventory.
+        known_ids = set()
+        try:
+            known_ids.update(str(int(uid)) for uid in KNOWN_USERS if str(uid).isdigit())
+        except (NameError, TypeError):
+            pass
+        for info in serializable_scripts.values():
+            for key in ("created_by", "panel_created_by"):
+                uid = info.get(key)
+                if uid is not None and str(uid).isdigit():
+                    known_ids.add(str(int(uid)))
+        os.makedirs(USER_BACKUP_DIR, exist_ok=True)
+        for uid in known_ids:
+            owned = {name: info for name, info in serializable_scripts.items()
+                     if str(info.get("created_by", "")) == uid
+                     or str(info.get("panel_created_by", "")) == uid}
+            user_payload = {
+                "backup_version": "crystal_hub_user_backup_v1",
+                "user_id": uid,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "scripts": owned,
+            }
+            _atomic_write_json(os.path.join(USER_BACKUP_DIR, f"{uid}.json"), user_payload)
         return True
     except Exception as e:
         print(f"Error saving data: {e}")
@@ -262,9 +316,15 @@ def _quota_check(user_id, category):
             return False, f"{plan} limit reached: {limit} active scripts. Delete one to free a slot."
         return True, None
     if category == "panels":
-        owned = sum(1 for item in scripts_data.values()
-                    if str(item.get("panel_created_by", item.get("created_by", ""))) == str(user_id)
-                    and item.get("panel_message_id"))
+        owned = sum(
+            1 for item in scripts_data.values()
+            for panel in (item.get("panel_instances") or ([{
+                "message_id": item.get("panel_message_id"),
+                "created_by": item.get("panel_created_by", item.get("created_by", "")),
+            }] if item.get("panel_message_id") else []))
+            if str(panel.get("created_by", item.get("panel_created_by", item.get("created_by", "")))) == str(user_id)
+            and panel.get("message_id")
+        )
         if owned >= limit:
             return False, f"{plan} limit reached: {limit} active panels. Delete one to free a slot."
         return True, None
@@ -297,9 +357,15 @@ def _quota_status(user_id):
         rec = {"month": _month_key()}
     names = {"scripts": "active scripts", "panels": "active panels", "sources": "sources this month", "keys": "active keys/whitelists", "avatars": "avatar changes this month"}
     active_scripts = sum(1 for item in scripts_data.values() if str(item.get("created_by", "")) == str(user_id))
-    active_panels = sum(1 for item in scripts_data.values()
-                        if str(item.get("panel_created_by", item.get("created_by", ""))) == str(user_id)
-                        and item.get("panel_message_id"))
+    active_panels = sum(
+        1 for item in scripts_data.values()
+        for panel in (item.get("panel_instances") or ([{
+            "message_id": item.get("panel_message_id"),
+            "created_by": item.get("panel_created_by", item.get("created_by", "")),
+        }] if item.get("panel_message_id") else []))
+        if str(panel.get("created_by", item.get("panel_created_by", item.get("created_by", "")))) == str(user_id)
+        and panel.get("message_id")
+    )
     parts = []
     for category, limit in limits.items():
         if limit is not None:
@@ -1777,6 +1843,78 @@ class PanelControlView(BlacklistAwareView):
 
 # ==================== Commands ==================== #
 
+async def _refresh_saved_panels_after_startup():
+    """Recreate every saved panel instance after a process restart/update."""
+    changed = False
+    for script_name, info in list(scripts_data.items()):
+        instances = info.get("panel_instances")
+        if not isinstance(instances, list):
+            instances = []
+        if not instances and info.get("panel_guild_id") and info.get("panel_channel_id"):
+            instances = [{
+                "guild_id": info.get("panel_guild_id"),
+                "channel_id": info.get("panel_channel_id"),
+                "message_id": info.get("panel_message_id"),
+                "name": info.get("panel_name"),
+                "description": info.get("panel_description", ""),
+                "created_by": info.get("panel_created_by"),
+            }]
+        refreshed = []
+        for panel in instances:
+            guild_id, channel_id = panel.get("guild_id"), panel.get("channel_id")
+            if not guild_id or not channel_id:
+                continue
+            try:
+                guild = bot.get_guild(int(guild_id))
+                if guild is None:
+                    refreshed.append(panel)
+                    continue
+                channel = guild.get_channel(int(channel_id))
+                if channel is None:
+                    channel = await bot.fetch_channel(int(channel_id))
+                if not hasattr(channel, "send"):
+                    refreshed.append(panel)
+                    continue
+                ensure_file_id(script_name, info)
+                title = str(panel.get("name") or info.get("panel_name") or script_name)[:256]
+                description = panel.get("description") or info.get("panel_description") or f"Best {script_name.lower()}\n\nCrystal Hub • Script Management"
+                embed = discord.Embed(title=title, description=str(description)[:4000], color=0xd4af37)
+                if bot.user:
+                    embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
+                view = PanelControlView(script_name=script_name)
+                new_message = await channel.send(embed=embed, view=view)
+                old_id = panel.get("message_id")
+                if old_id and int(old_id) != new_message.id:
+                    try:
+                        old_message = await channel.fetch_message(int(old_id))
+                        await old_message.delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+                        pass
+                refreshed.append({
+                    "guild_id": int(guild_id), "channel_id": int(channel_id),
+                    "message_id": new_message.id, "name": title,
+                    "description": str(description)[:4000],
+                    "created_by": panel.get("created_by", info.get("panel_created_by", info.get("created_by"))),
+                })
+                changed = True
+                print(f"Refreshed Crystal Hub panel for {script_name} in {guild.name} / #{getattr(channel, 'name', channel_id)}")
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError) as exc:
+                print(f"Could not refresh saved panel for {script_name}: {type(exc).__name__}")
+                refreshed.append(panel)
+            except Exception as exc:
+                print(f"Unexpected panel refresh error for {script_name}: {type(exc).__name__}: {exc}")
+                refreshed.append(panel)
+        if refreshed:
+            info["panel_instances"] = refreshed
+            latest = refreshed[-1]
+            info["panel_guild_id"] = latest.get("guild_id")
+            info["panel_channel_id"] = latest.get("channel_id")
+            info["panel_message_id"] = latest.get("message_id")
+            info["panel_name"] = latest.get("name")
+            info["panel_description"] = latest.get("description", "")
+    if changed:
+        save_data()
+
 @bot.event
 async def on_ready():
     if not getattr(bot, "_crystal_admin_view_registered", False):
@@ -1800,6 +1938,9 @@ async def on_ready():
         print(f"Error syncing global slash commands: {type(e).__name__}: {e}")
 
     print(f"Bot connected successfully as: {bot.user}")
+    if not getattr(bot, "_crystal_panels_refreshed_this_process", False):
+        bot._crystal_panels_refreshed_this_process = True
+        await _refresh_saved_panels_after_startup()
 
 
 # 1. Generate key (/generate-key and /key)
@@ -2551,59 +2692,75 @@ async def panel_setup_command(
         await interaction.response.send_message("❌ Selected script does not exist.", ephemeral=True)
         return
 
-    panel_was_existing = bool(s_info.get("panel_message_id") and s_info.get("panel_guild_id") == interaction.guild_id)
-    if not panel_was_existing:
+    instances = s_info.get("panel_instances")
+    if not isinstance(instances, list):
+        instances = []
+        s_info["panel_instances"] = instances
+    # Migrate the legacy single-panel record if needed.
+    if not instances and s_info.get("panel_guild_id") and s_info.get("panel_channel_id"):
+        instances.append({
+            "guild_id": s_info.get("panel_guild_id"),
+            "channel_id": s_info.get("panel_channel_id"),
+            "message_id": s_info.get("panel_message_id"),
+            "name": s_info.get("panel_name"),
+            "description": s_info.get("panel_description", ""),
+            "created_by": s_info.get("panel_created_by", s_info.get("created_by")),
+        })
+    matching = next((p for p in instances
+                     if str(p.get("guild_id")) == str(interaction.guild_id)
+                     and str(p.get("channel_id")) == str(target_channel.id)), None)
+    if matching is None:
         quota_ok, quota_error = _quota_check(interaction.user.id, "panels")
         if not quota_ok:
             await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
             return
 
     ensure_file_id(script, s_info)
-    if description is not None:
-        s_info["panel_description"] = str(description).strip()[:4000]
-    panel_description = s_info.get("panel_description") or f"Best {script.lower()}\n\nCrystal Hub • Script Management"
+    panel_description = (str(description).strip()[:4000] if description is not None
+                         else (matching.get("description") if matching else None)
+                         or s_info.get("panel_description")
+                         or f"Best {script.lower()}\n\nCrystal Hub • Script Management")
     embed = discord.Embed(title=name_panel, description=panel_description, color=0xd4af37)
     embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
     view = PanelControlView(script_name=script)
 
-    # Keep exactly one panel per script in a server. If the panel already exists,
-    # edit it instead of sending another message. The IDs are persisted in data.json.
     existing_message = None
-    if s_info.get("panel_guild_id") == interaction.guild_id and s_info.get("panel_message_id"):
-        old_channel_id = s_info.get("panel_channel_id")
+    if matching and matching.get("message_id"):
         try:
-            old_channel = interaction.guild.get_channel(int(old_channel_id)) if interaction.guild else None
-            if old_channel is None:
-                old_channel = await bot.fetch_channel(int(old_channel_id))
-            existing_message = await old_channel.fetch_message(int(s_info["panel_message_id"]))
+            existing_message = await target_channel.fetch_message(int(matching["message_id"]))
         except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
             existing_message = None
 
     if existing_message is not None:
-        # If the user selected a different channel, move the panel by deleting the old
-        # message and creating the single replacement in the new channel.
-        if existing_message.channel.id != target_channel.id:
-            try:
-                await existing_message.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
-            existing_message = None
-        else:
-            await existing_message.edit(embed=embed, view=view)
+        await existing_message.edit(embed=embed, view=view)
+        panel_message = existing_message
+    else:
+        panel_message = await target_channel.send(embed=embed, view=view)
 
-    if existing_message is None:
-        existing_message = await target_channel.send(embed=embed, view=view)
-
+    new_instance = {
+        "guild_id": int(interaction.guild_id),
+        "channel_id": int(target_channel.id),
+        "message_id": int(panel_message.id),
+        "name": name_panel,
+        "description": panel_description,
+        "created_by": str(interaction.user.id),
+    }
+    if matching is None:
+        instances.append(new_instance)
+    else:
+        matching.update(new_instance)
+    s_info["panel_instances"] = instances
+    # Keep legacy fields pointing at the most recently configured panel.
     s_info["panel_guild_id"] = interaction.guild_id
     s_info["panel_channel_id"] = target_channel.id
-    s_info["panel_message_id"] = existing_message.id
+    s_info["panel_message_id"] = panel_message.id
     s_info["panel_name"] = name_panel
     s_info["panel_description"] = panel_description
     s_info["panel_created_by"] = str(interaction.user.id)
     save_data()
 
     await interaction.response.send_message(
-        f"✅ Panel ready in {target_channel.mention}. Only one panel is kept for `{script}`.",
+        f"✅ Panel ready in {target_channel.mention}. This panel is saved and will be refreshed after the bot restarts/updates.",
         ephemeral=True
     )
 
@@ -2737,6 +2894,7 @@ def _backup_snapshot(backup_type):
             "panel_message_id": info.get("panel_message_id"),
             "panel_name": info.get("panel_name"),
             "panel_description": info.get("panel_description", ""),
+            "panel_instances": info.get("panel_instances", []) if isinstance(info.get("panel_instances", []), list) else [],
             "valid_keys": list(info.get("valid_keys", set())),
             "whitelisted_users": list(info.get("whitelisted_users", set())),
             "user_keys": {str(k): v for k, v in info.get("user_keys", {}).items()},
@@ -3316,6 +3474,18 @@ async def script_backup_or_restore(ctx: commands.Context, action: str = ""):
             info.setdefault("panel_message_id", None)
             info.setdefault("panel_name", None)
             info.setdefault("panel_description", "")
+            info.setdefault("panel_instances", [])
+            if not isinstance(info.get("panel_instances"), list):
+                info["panel_instances"] = []
+            if not info["panel_instances"] and info.get("panel_guild_id") and info.get("panel_channel_id"):
+                info["panel_instances"].append({
+                    "guild_id": info.get("panel_guild_id"),
+                    "channel_id": info.get("panel_channel_id"),
+                    "message_id": info.get("panel_message_id"),
+                    "name": info.get("panel_name"),
+                    "description": info.get("panel_description", ""),
+                    "created_by": info.get("panel_created_by", info.get("created_by")),
+                })
             info.setdefault("trail_enabled", False)
             info.setdefault("trail_mode", "PERM")
             info.setdefault("trail_expires_at", None)
