@@ -52,6 +52,22 @@ def load_data():
                     s_info.setdefault("panel_channel_id", None)
                     s_info.setdefault("panel_message_id", None)
                     s_info.setdefault("panel_name", None)
+                    s_info.setdefault("trail_enabled", False)
+                    s_info.setdefault("trail_mode", "PERM")
+                    s_info.setdefault("trail_expires_at", None)
+                    s_info.setdefault("file_id", None)
+                    s_info.setdefault("key_meta", {})
+                    s_info.setdefault("user_access", {})
+                    # Normalize access maps
+                    if not isinstance(s_info.get("key_meta"), dict):
+                        s_info["key_meta"] = {}
+                    ua = {}
+                    for k, v in (s_info.get("user_access") or {}).items():
+                        try:
+                            ua[int(k)] = v if isinstance(v, dict) else {}
+                        except (TypeError, ValueError):
+                            continue
+                    s_info["user_access"] = ua
                 return data.get("scripts", {}), set(data.get("blacklisted_users", []))
         except Exception as e:
             print(f"Error loading saved data: {e}")
@@ -72,7 +88,15 @@ def save_data():
                 "panel_name": s_info.get("panel_name"),
                 "valid_keys": list(s_info.get("valid_keys", set())),
                 "whitelisted_users": list(s_info.get("whitelisted_users", set())),
-                "user_keys": {str(k): v for k, v in s_info.get("user_keys", {}).items()}
+                "user_keys": {str(k): v for k, v in s_info.get("user_keys", {}).items()},
+                "trail_enabled": bool(s_info.get("trail_enabled", False)),
+                "trail_mode": s_info.get("trail_mode", "PERM"),
+                "trail_expires_at": s_info.get("trail_expires_at"),
+                "file_id": s_info.get("file_id"),
+                "key_meta": s_info.get("key_meta") if isinstance(s_info.get("key_meta"), dict) else {},
+                "user_access": {str(k): v for k, v in (s_info.get("user_access") or {}).items()},
+                "created_by": s_info.get("created_by"),
+                "panel_created_by": s_info.get("panel_created_by"),
             }
         
         with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -195,9 +219,12 @@ def _quota_status(user_id):
             parts.append(f"{names[category]}: {used}/{limit}")
     return f"{plan} plan — " + " • ".join(parts)
 
-def _make_discord_plan_code(plan, days):
-    raw = "CRYSTAL-" + plan.upper() + "-" + secrets.token_hex(5).upper()
-    discord_plan_codes[_hash_redeem_code(raw)] = {
+def _make_discord_plan_code(plan, days, custom_code=None):
+    raw = (str(custom_code).strip().upper() if custom_code else "CRYSTAL-" + plan.upper() + "-" + secrets.token_hex(5).upper())
+    code_hash = _hash_redeem_code(raw)
+    if code_hash in discord_plan_codes:
+        raise ValueError("That code already exists.")
+    discord_plan_codes[code_hash] = {
         "code": raw, "plan": plan, "duration_days": int(days),
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "redeemed_by": None, "redeemed_at": None
@@ -597,8 +624,12 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             return
 
         s_info = scripts_data.get(script_name)
-        if not s_info or user_key not in s_info.get("valid_keys", set()):
+        if not s_info:
             self._send_text(403, "denied: invalid key")
+            return
+        ok_key, reason = key_is_usable(s_info, user_key)
+        if not ok_key:
+            self._send_text(403, "denied: " + reason)
             return
 
         binding_key = f"{script_name}:{user_key}"
@@ -625,6 +656,22 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         parsed_path = urllib.parse.urlparse(self.path)
         path_parts = parsed_path.path.strip("/").split("/")
 
+        # Unique file IDs: /files/v4/lua/<file_id> (same protection model as /script/<name>)
+        if len(path_parts) >= 4 and path_parts[0] == "files" and path_parts[1] == "v4" and path_parts[2] == "lua":
+            file_id = path_parts[3].strip()
+            script_name = None
+            for name, info in scripts_data.items():
+                if str(info.get("file_id") or "") == file_id:
+                    script_name = name
+                    break
+            if not script_name:
+                self._send_text(404, "File not found.")
+                return
+            # Rewrite to legacy /script/<name> handler path shape
+            self.path = "/script/" + urllib.parse.quote(script_name) + (("?" + parsed_path.query) if parsed_path.query else "")
+            parsed_path = urllib.parse.urlparse(self.path)
+            path_parts = parsed_path.path.strip("/").split("/")
+
         if len(path_parts) >= 2 and path_parts[0] == "api" and path_parts[1] == "script-export":
             query = urllib.parse.parse_qs(parsed_path.query)
             if not _script_api_key_valid(query.get("key", [""])[0]):
@@ -649,7 +696,28 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             user_agent = (self.headers.get("User-Agent") or "").lower()
             allowed_agents = ("roblox", "delta", "real")
             if not any(agent in user_agent for agent in allowed_agents):
-                self._send_text(403, "⛔ You are not allowed on this page")
+                # Friendly visual deny page for ordinary browsers. User-Agent checks are
+                # only a basic filter and can be spoofed; actual access is enforced by
+                # server-side script-key and device authorization in /script-source.
+                deny_page = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crystal Hub — Access denied</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}html,body{margin:0;min-height:100%;font-family:Arial,Helvetica,sans-serif}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#777;color:#f10b16;text-align:center;padding:24px}
+main{width:min(1100px,100%);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:28px}
+.symbol{font-size:clamp(72px,14vw,150px);font-weight:900;line-height:1}
+h1{margin:0;font-size:clamp(38px,8vw,100px);line-height:1.04;font-weight:1000;letter-spacing:-.035em;overflow-wrap:anywhere;text-shadow:0 2px 0 rgba(0,0,0,.06)}
+p{margin:0;color:#2b1010;font-size:clamp(15px,2.5vw,22px);font-weight:700}
+</style></head><body><main><div class="symbol" aria-hidden="true">⛔</div>
+<h1>YOU ARE NOT ALLOWED<br>IN THIS PAGE</h1><p>Protected by Crystal Hub</p></main></body></html>"""
+                payload = deny_page.encode("utf-8")
+                self.send_response(403)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(payload)
                 return
 
             script_name = urllib.parse.unquote(path_parts[1])
@@ -753,6 +821,180 @@ def generate_random_key(prefix="MUk5", length=32):
     chars = string.ascii_letters + string.digits
     return prefix + "".join(random.choice(chars) for _ in range(length - len(prefix)))
 
+
+# ---------- Duration / access helpers (PERM + TIME) ----------
+_DURATION_RE = re.compile(r"^(\d+)\s*([mhd])$", re.IGNORECASE)
+
+def parse_duration(text: str) -> int:
+    """Parse duration strings like 1m, 30m, 1h, 12h, 1d, 7d into seconds.
+    1m = 1 minute (not month). Raises ValueError on invalid input.
+    """
+    raw = str(text or "").strip().lower()
+    if not raw:
+        raise ValueError("Duration is required when using TIME.")
+    m = _DURATION_RE.fullmatch(raw)
+    if not m:
+        raise ValueError("Invalid duration. Use formats like 1m, 30m, 1h, 12h, 1d, 7d.")
+    amount = int(m.group(1))
+    unit = m.group(2).lower()
+    if amount < 1:
+        raise ValueError("Duration amount must be at least 1.")
+    if unit == "m":
+        seconds = amount * 60
+    elif unit == "h":
+        seconds = amount * 3600
+    else:
+        seconds = amount * 86400
+    if seconds > 3650 * 86400:
+        raise ValueError("Duration is too long (max ~3650 days).")
+    return seconds
+
+
+def _utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _iso_now():
+    return _utcnow().isoformat()
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except (TypeError, ValueError):
+        return None
+
+
+def is_expired(expires_at) -> bool:
+    dt = _parse_iso(expires_at)
+    if dt is None:
+        return False
+    return dt <= _utcnow()
+
+
+def format_remaining(expires_at) -> str:
+    dt = _parse_iso(expires_at)
+    if dt is None:
+        return "permanent"
+    remaining = int((dt - _utcnow()).total_seconds())
+    if remaining <= 0:
+        return "expired"
+    return format_duration(remaining)
+
+
+def resolve_expires(mode: str, duration_text: Optional[str]):
+    mode = (mode or "PERM").upper()
+    if mode == "PERM":
+        return "PERM", None
+    if mode != "TIME":
+        raise ValueError("Mode must be PERM or TIME.")
+    seconds = parse_duration(duration_text)
+    expires = (_utcnow() + datetime.timedelta(seconds=seconds)).isoformat()
+    return "TIME", expires
+
+
+def ensure_file_id(script_name: str, s_info: dict) -> str:
+    fid = s_info.get("file_id")
+    if isinstance(fid, str) and len(fid) >= 16:
+        return fid
+    used = {str(v.get("file_id") or "") for v in scripts_data.values()}
+    for _ in range(40):
+        candidate = secrets.token_hex(16)
+        if candidate not in used:
+            s_info["file_id"] = candidate
+            return candidate
+    # Extremely unlikely fallback
+    s_info["file_id"] = secrets.token_hex(24)
+    return s_info["file_id"]
+
+
+def file_public_url(file_id: str) -> str:
+    base = os.getenv("FILE_BASE_URL", "https://Crystal.com/files/v4/lua").rstrip("/")
+    return f"{base}/{file_id}"
+
+
+def trail_is_active(s_info: dict) -> bool:
+    if not s_info.get("trail_enabled"):
+        return False
+    if (s_info.get("trail_mode") or "PERM").upper() == "TIME":
+        if is_expired(s_info.get("trail_expires_at")):
+            s_info["trail_enabled"] = False
+            return False
+    return True
+
+
+def key_is_usable(s_info: dict, key: str) -> tuple:
+    """Return (ok, reason). Rejects disabled or expired keys."""
+    key = str(key or "")
+    if not key:
+        return False, "Key is empty."
+    meta = (s_info.get("key_meta") or {}).get(key, {})
+    if meta.get("disabled"):
+        return False, "This key has been disabled."
+    if key not in s_info.get("valid_keys", set()) and key not in set((s_info.get("user_keys") or {}).values()):
+        return False, "Key is not valid for this script."
+    if (meta.get("mode") or "PERM").upper() == "TIME" and is_expired(meta.get("expires_at")):
+        return False, "This key has expired."
+    return True, ""
+
+
+def user_access_ok(s_info: dict, user_id: int) -> tuple:
+    """Check whitelist / key access including TIME expiry. Returns (ok, reason, key)."""
+    uid = int(user_id)
+    access = (s_info.get("user_access") or {}).get(uid)
+    key = (s_info.get("user_keys") or {}).get(uid)
+    if access and isinstance(access, dict):
+        if (access.get("mode") or "PERM").upper() == "TIME" and is_expired(access.get("expires_at")):
+            # Drop expired access
+            s_info.get("whitelisted_users", set()).discard(uid)
+            s_info.get("user_access", {}).pop(uid, None)
+            if key:
+                s_info.get("user_keys", {}).pop(uid, None)
+            return False, "Your access has expired. Redeem a key or ask an admin.", None
+        key = access.get("key") or key
+        if key:
+            ok, reason = key_is_usable(s_info, key)
+            if not ok:
+                return False, reason, key
+        return True, "", key
+    if uid in s_info.get("whitelisted_users", set()) or uid in s_info.get("user_keys", {}):
+        if key:
+            ok, reason = key_is_usable(s_info, key)
+            if not ok:
+                return False, reason, key
+        return True, "", key
+    return False, "Access Denied! You must be whitelisted by an admin or redeem a valid key first.", None
+
+
+def register_key(s_info: dict, key: str, mode: str = "PERM", expires_at: Optional[str] = None):
+    s_info.setdefault("valid_keys", set()).add(key)
+    meta = s_info.setdefault("key_meta", {})
+    meta[key] = {
+        "mode": mode,
+        "expires_at": expires_at,
+        "disabled": False,
+        "created_at": _iso_now(),
+    }
+
+
+def grant_user_access(s_info: dict, user_id: int, key: str, mode: str = "PERM", expires_at: Optional[str] = None):
+    uid = int(user_id)
+    s_info.setdefault("whitelisted_users", set()).add(uid)
+    s_info.setdefault("user_keys", {})[uid] = key
+    s_info.setdefault("user_access", {})[uid] = {
+        "key": key,
+        "mode": mode,
+        "expires_at": expires_at,
+        "granted_at": _iso_now(),
+    }
+    register_key(s_info, key, mode, expires_at)
+
+
 async def script_autocomplete(
     interaction: discord.Interaction,
     current: str
@@ -773,6 +1015,23 @@ def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = No
             if role and role in interaction.user.roles:
                 return True
     return False
+
+# Prevent blacklisted users from invoking any slash command, including if they own a server.
+async def _global_blacklist_interaction_check(interaction: discord.Interaction) -> bool:
+    if interaction.user and interaction.user.id in blacklisted_users:
+        message = "🚫 You are globally blacklisted from using this bot."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            pass
+        return False
+    return True
+
+bot.tree.interaction_check = _global_blacklist_interaction_check
+
 
 # ==================== Views & Buttons ==================== #
 
@@ -856,6 +1115,49 @@ class ObfuscateConfirmView(discord.ui.View):
         await interaction.response.send_message(f"✅ Source file attached for `{self.script_name}`!", ephemeral=True)
 
 
+class AddSourceModal(discord.ui.Modal, title="Crystal Hub — Add Source"):
+    source = discord.ui.TextInput(
+        label="Paste source code",
+        placeholder="Paste the script source here",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=4000
+    )
+
+    def __init__(self, script_name: str, owner_id: int):
+        super().__init__(timeout=300)
+        self.script_name = script_name
+        self.owner_id = owner_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Only the person who created this script can add its source from this button.", ephemeral=True)
+            return
+        if self.script_name not in scripts_data:
+            await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+            return
+        scripts_data[self.script_name]["source_code"] = str(self.source.value)
+        save_data()
+        await interaction.response.send_message(f"✅ Source added to `{self.script_name}`.", ephemeral=True)
+
+
+class CreateScriptActionsView(discord.ui.View):
+    def __init__(self, script_name: str, owner_id: int):
+        super().__init__(timeout=300)
+        self.script_name = script_name
+        self.owner_id = owner_id
+
+    @discord.ui.button(label="Add Source (Optional)", style=discord.ButtonStyle.primary, emoji="📄")
+    async def add_source(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Only the script creator can use this button.", ephemeral=True)
+            return
+        if self.script_name not in scripts_data:
+            await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AddSourceModal(self.script_name, self.owner_id))
+
+
 class ScriptRedeemModal(discord.ui.Modal, title="Crystal Hub — Redeem a Key"):
     code = discord.ui.TextInput(
         label="Enter script key below",
@@ -875,18 +1177,29 @@ class ScriptRedeemModal(discord.ui.Modal, title="Crystal Hub — Redeem a Key"):
             await interaction.response.send_message("❌ Script not found.", ephemeral=True)
             return
 
-        if supplied in s_info.get("valid_keys", set()):
+        if supplied in s_info.get("valid_keys", set()) or supplied in set((s_info.get("user_keys") or {}).values()):
             uid = interaction.user.id
+            ok, reason = key_is_usable(s_info, supplied)
+            if not ok:
+                await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
+                return
             owner = next((int(k) for k, v in s_info.get("user_keys", {}).items()
                           if v == supplied and int(k) != uid), None)
             if owner is not None:
                 await interaction.response.send_message("❌ This key is already linked to another Discord account.", ephemeral=True)
                 return
-            s_info["whitelisted_users"].add(uid)
-            s_info["user_keys"][uid] = supplied
+            meta = (s_info.get("key_meta") or {}).get(supplied, {})
+            mode = (meta.get("mode") or "PERM").upper()
+            expires_at = meta.get("expires_at")
+            grant_user_access(s_info, uid, supplied, mode, expires_at)
             save_data()
+            extra = ""
+            if mode == "TIME":
+                extra = f"\nAccess: TIME — remaining {format_remaining(expires_at)}"
+            else:
+                extra = "\nAccess: PERM"
             await interaction.response.send_message(
-                f"✅ Key redeemed successfully for **{self.script_name}** — Crystal Hub.",
+                f"✅ Key redeemed successfully for **{self.script_name}** — Crystal Hub.{extra}",
                 ephemeral=True
             )
             return
@@ -925,6 +1238,56 @@ class PanelControlView(discord.ui.View):
         super().__init__(timeout=None)
         self.script_name = script_name
 
+    def _script_messages(self, s_info: dict, user_key: str):
+        """Build Get Script (code block) and View Mobile (plain text) messages."""
+        file_id = ensure_file_id(self.script_name, s_info)
+        file_url = file_public_url(file_id)
+        app_url = os.getenv("RENDER_EXTERNAL_URL", "https://discord-bot-3u9m.onrender.com").rstrip("/")
+        legacy_url = f"{app_url}/script/{urllib.parse.quote(self.script_name)}"
+        trail = trail_is_active(s_info)
+        if trail:
+            trail_mode = (s_info.get("trail_mode") or "PERM").upper()
+            trail_bits = [f"Trail: ON", f"Access: {trail_mode}"]
+            if trail_mode == "TIME":
+                trail_bits.append(f"Remaining: {format_remaining(s_info.get('trail_expires_at'))}")
+            trail_line = " | ".join(trail_bits)
+            code = (
+                "Here is your script:\n"
+                "```lua\n"
+                f"-- Crystal Hub Trail\n"
+                f"-- {trail_line}\n"
+                f'script_key="{user_key}";\n'
+                f'loadstring(game:HttpGet("{file_url}"))()\n'
+                "```"
+            )
+            mobile = (
+                "Here is your script:\n\n"
+                "Type: Trail\n"
+                f"{trail_line}\n"
+                f"Key: {user_key}\n"
+                f"Link: {file_url}\n\n"
+                f'script_key="{user_key}";\n'
+                f'loadstring(game:HttpGet("{file_url}"))()'
+            )
+        else:
+            code = (
+                "Here is your script:\n"
+                "```lua\n"
+                f'script_key="{user_key}";\n'
+                f'loadstring(game:HttpGet("{file_url}"))()\n'
+                f"-- legacy route: {legacy_url}\n"
+                "```"
+            )
+            mobile = (
+                "Here is your script:\n\n"
+                "Type: Standard\n"
+                f"Key: {user_key}\n"
+                f"Link: {file_url}\n\n"
+                f'script_key="{user_key}";\n'
+                f'loadstring(game:HttpGet("{file_url}"))()'
+            )
+        return code, mobile
+
     @discord.ui.button(label="Get Script 📜", style=discord.ButtonStyle.success)
     async def get_script_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
@@ -932,31 +1295,43 @@ class PanelControlView(discord.ui.View):
             await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
             return
 
-        user_id = interaction.user.id
-        whitelisted = user_id in s_info["whitelisted_users"] or user_id in s_info["user_keys"]
-
-        if not whitelisted:
-            await interaction.response.send_message("❌ Access Denied! You must be whitelisted by an admin or redeem a valid key first.", ephemeral=True)
+        ok, reason, user_key = user_access_ok(s_info, interaction.user.id)
+        if not ok:
+            save_data()
+            await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
             return
 
-        if user_id not in s_info["user_keys"]:
-            new_key = generate_random_key()
-            s_info["user_keys"][user_id] = new_key
-            s_info["valid_keys"].add(new_key)
+        if not user_key:
+            user_key = generate_random_key()
+            grant_user_access(s_info, interaction.user.id, user_key, "PERM", None)
+
+        ensure_file_id(self.script_name, s_info)
+        save_data()
+        code, _ = self._script_messages(s_info, user_key)
+        await interaction.response.send_message(code, ephemeral=True)
+
+    @discord.ui.button(label="View Mobile 📱", style=discord.ButtonStyle.secondary)
+    async def view_mobile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s_info = scripts_data.get(self.script_name)
+        if not s_info:
+            await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
+            return
+
+        ok, reason, user_key = user_access_ok(s_info, interaction.user.id)
+        if not ok:
             save_data()
+            await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
+            return
 
-        user_key = s_info["user_keys"][user_id]
-        app_url = os.getenv("RENDER_EXTERNAL_URL", "https://discord-bot-3u9m.onrender.com")
-        custom_script_url = f"{app_url}/script/{urllib.parse.quote(self.script_name)}"
+        if not user_key:
+            user_key = generate_random_key()
+            grant_user_access(s_info, interaction.user.id, user_key, "PERM", None)
 
-        response_text = (
-            f"Here is your script:\n"
-            f"```lua\n"
-            f'script_key="{user_key}";\n'
-            f'loadstring(game:HttpGet("{custom_script_url}"))()\n'
-            f"```"
-        )
-        await interaction.response.send_message(response_text, ephemeral=True)
+        ensure_file_id(self.script_name, s_info)
+        save_data()
+        _, mobile = self._script_messages(s_info, user_key)
+        # Plain text for easy mobile copy (no code fences)
+        await interaction.response.send_message(mobile, ephemeral=True)
 
     @discord.ui.button(label="Redeem Key 🔑", style=discord.ButtonStyle.primary)
     async def redeem_key_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1006,11 +1381,10 @@ class PanelControlView(discord.ui.View):
             await interaction.response.send_message("❌ Buyer role is not configured for this script.", ephemeral=True)
             return
 
-        user_id = interaction.user.id
-        whitelisted = user_id in s_info["whitelisted_users"] or user_id in s_info["user_keys"]
-
-        if not whitelisted:
-            await interaction.response.send_message("❌ Access Denied! You cannot claim the buyer role unless you are whitelisted or activated a valid key.", ephemeral=True)
+        ok, reason, _key = user_access_ok(s_info, interaction.user.id)
+        if not ok:
+            save_data()
+            await interaction.response.send_message(f"❌ Access Denied! {reason}", ephemeral=True)
             return
 
         role = interaction.guild.get_role(s_info["buyer_role_id"])
@@ -1040,61 +1414,132 @@ async def on_ready():
     print(f"Bot connected successfully as: {bot.user}")
 
 
-# 1. إنشاء مفتاح جديد
+# 1. Generate key (/generate-key and /key)
 @bot.tree.command(name="generate-key", description="Generate a single-use key for a script")
-@app_commands.describe(script="Target script")
+@app_commands.describe(script="Target script", duration_type="PERM = permanent, TIME = timed", duration="Required for TIME (e.g. 1m, 1h, 1d)")
 @app_commands.autocomplete(script=script_autocomplete)
-async def generate_key_command(interaction: discord.Interaction, script: str):
+@app_commands.choices(duration_type=[
+    app_commands.Choice(name="PERM (permanent)", value="PERM"),
+    app_commands.Choice(name="TIME (timed)", value="TIME"),
+])
+async def generate_key_command(
+    interaction: discord.Interaction,
+    script: str,
+    duration_type: app_commands.Choice[str] = None,
+    duration: str = None,
+):
+    if interaction.user.name != "Admi2853":
+        await interaction.response.send_message("❌ Only the authorized Discord account Admi2853 can generate keys.", ephemeral=True)
+        return
     if not is_admin_or_has_role(interaction, script):
         await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
         return
-
     if script not in scripts_data:
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
         return
-
+    mode = (duration_type.value if duration_type else "PERM").upper()
+    try:
+        mode, expires_at = resolve_expires(mode, duration)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
     quota_ok, quota_error = _quota_check(interaction.user.id, "keys")
     if not quota_ok:
         await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
         return
     new_key = generate_random_key()
-    scripts_data[script]["valid_keys"].add(new_key)
+    register_key(scripts_data[script], new_key, mode, expires_at)
     save_data()
     _quota_increment(interaction.user.id, "keys")
-
+    when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
     await interaction.response.send_message(
-        f"🔑 **New Key Generated for `{script}`:**\n```text\n{new_key}\n```",
+        f"🔑 **New Key Generated for `{script}`** ({mode} — {when}):\n```text\n{new_key}\n```",
         ephemeral=True
     )
 
 
-# 2. وايت ليست مستخدم
-@bot.tree.command(name="whitelist", description="Whitelist a user for a script and notify them via DM")
-@app_commands.describe(user="The member to whitelist", script="Target script")
+@bot.tree.command(name="key", description="Generate a script key (PERM or TIME)")
+@app_commands.describe(script="Target script", duration_type="PERM = permanent, TIME = timed", duration="Required for TIME (e.g. 1m, 30m, 1h, 1d)")
 @app_commands.autocomplete(script=script_autocomplete)
-async def whitelist_command(interaction: discord.Interaction, user: discord.Member, script: str):
+@app_commands.choices(duration_type=[
+    app_commands.Choice(name="PERM (permanent)", value="PERM"),
+    app_commands.Choice(name="TIME (timed)", value="TIME"),
+])
+async def key_command(
+    interaction: discord.Interaction,
+    script: str,
+    duration_type: app_commands.Choice[str],
+    duration: str = None,
+):
+    if interaction.user.name != "Admi2853":
+        await interaction.response.send_message("❌ Only the authorized Discord account Admi2853 can generate keys.", ephemeral=True)
+        return
     if not is_admin_or_has_role(interaction, script):
         await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
         return
-
     if script not in scripts_data:
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
         return
-
+    mode = duration_type.value.upper()
+    try:
+        mode, expires_at = resolve_expires(mode, duration)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
     quota_ok, quota_error = _quota_check(interaction.user.id, "keys")
     if not quota_ok:
         await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
         return
-
-    s_info = scripts_data[script]
-    s_info["whitelisted_users"].add(user.id)
-    
     new_key = generate_random_key()
-    s_info["user_keys"][user.id] = new_key
-    s_info["valid_keys"].add(new_key)
+    register_key(scripts_data[script], new_key, mode, expires_at)
     save_data()
     _quota_increment(interaction.user.id, "keys")
+    when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
+    await interaction.response.send_message(
+        f"🔑 **New Key Generated for `{script}`** ({mode} — {when}):\n```text\n{new_key}\n```",
+        ephemeral=True
+    )
 
+
+# 2. Whitelist (/whitelist and /whilst)
+@bot.tree.command(name="whitelist", description="Whitelist a user for a script and notify them via DM")
+@app_commands.describe(user="The member to whitelist", script="Target script", duration_type="PERM = permanent, TIME = timed", duration="Required for TIME (e.g. 1m, 1h, 1d)")
+@app_commands.autocomplete(script=script_autocomplete)
+@app_commands.choices(duration_type=[
+    app_commands.Choice(name="PERM (permanent)", value="PERM"),
+    app_commands.Choice(name="TIME (timed)", value="TIME"),
+])
+async def whitelist_command(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    script: str,
+    duration_type: app_commands.Choice[str] = None,
+    duration: str = None,
+):
+    if interaction.user.name != "Admi2853":
+        await interaction.response.send_message("❌ Only the authorized Discord account Admi2853 can create whitelist keys.", ephemeral=True)
+        return
+    if not is_admin_or_has_role(interaction, script):
+        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        return
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        return
+    mode = (duration_type.value if duration_type else "PERM").upper()
+    try:
+        mode, expires_at = resolve_expires(mode, duration)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+    quota_ok, quota_error = _quota_check(interaction.user.id, "keys")
+    if not quota_ok:
+        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+        return
+    s_info = scripts_data[script]
+    new_key = generate_random_key()
+    grant_user_access(s_info, user.id, new_key, mode, expires_at)
+    save_data()
+    _quota_increment(interaction.user.id, "keys")
     if s_info.get("buyer_role_id"):
         role = interaction.guild.get_role(s_info["buyer_role_id"])
         if role and role not in user.roles:
@@ -1102,19 +1547,129 @@ async def whitelist_command(interaction: discord.Interaction, user: discord.Memb
                 await user.add_roles(role)
             except Exception:
                 pass
-
+    when = "permanent" if mode == "PERM" else f"TIME — {format_remaining(expires_at)} remaining"
     try:
         dm_embed = discord.Embed(
             title="🎉 Whitelist Granted!",
-            description=f"You have been whitelisted in **{interaction.guild.name}** for script: **{script}**!\n\nYour Key: `{new_key}`",
+            description=f"You have been whitelisted in **{interaction.guild.name}** for script: **{script}**!\n\nYour Key: `{new_key}`\nAccess: {when}",
             color=0x00ff00
         )
         await user.send(embed=dm_embed)
         dm_status = "DM sent successfully."
     except Exception:
         dm_status = "Could not send DM (user DMs closed)."
+    await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}` ({when})! ({dm_status})", ephemeral=True)
 
-    await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}`! ({dm_status})", ephemeral=True)
+
+@bot.tree.command(name="whilst", description="Whitelist a user with PERM or TIME access")
+@app_commands.describe(user="The member to whitelist", script="Target script", duration_type="PERM = permanent, TIME = timed", duration="Required for TIME (e.g. 1m, 30m, 1h, 7d)")
+@app_commands.autocomplete(script=script_autocomplete)
+@app_commands.choices(duration_type=[
+    app_commands.Choice(name="PERM (permanent)", value="PERM"),
+    app_commands.Choice(name="TIME (timed)", value="TIME"),
+])
+async def whilst_command(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    script: str,
+    duration_type: app_commands.Choice[str],
+    duration: str = None,
+):
+    if interaction.user.name != "Admi2853":
+        await interaction.response.send_message("❌ Only the authorized Discord account Admi2853 can create whitelist keys.", ephemeral=True)
+        return
+    if not is_admin_or_has_role(interaction, script):
+        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        return
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        return
+    mode = duration_type.value.upper()
+    try:
+        mode, expires_at = resolve_expires(mode, duration)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+    quota_ok, quota_error = _quota_check(interaction.user.id, "keys")
+    if not quota_ok:
+        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+        return
+    s_info = scripts_data[script]
+    new_key_val = generate_random_key()
+    grant_user_access(s_info, user.id, new_key_val, mode, expires_at)
+    save_data()
+    _quota_increment(interaction.user.id, "keys")
+    if s_info.get("buyer_role_id"):
+        role = interaction.guild.get_role(s_info["buyer_role_id"])
+        if role and role not in user.roles:
+            try:
+                await user.add_roles(role)
+            except Exception:
+                pass
+    when = "permanent" if mode == "PERM" else f"TIME — {format_remaining(expires_at)} remaining"
+    try:
+        dm_embed = discord.Embed(
+            title="🎉 Whitelist Granted!",
+            description=f"You have been whitelisted in **{interaction.guild.name}** for script: **{script}**!\n\nYour Key: `{new_key_val}`\nAccess: {when}",
+            color=0x00ff00
+        )
+        await user.send(embed=dm_embed)
+        dm_status = "DM sent successfully."
+    except Exception:
+        dm_status = "Could not send DM (user DMs closed)."
+    await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}` ({when})! ({dm_status})", ephemeral=True)
+
+
+@bot.tree.command(name="trail", description="Enable or disable free Trail access for a script")
+@app_commands.describe(script="Target script", state="ON or OFF", duration_type="PERM or TIME (used when enabling)", duration="Required for TIME (e.g. 1m, 1h, 1d)")
+@app_commands.autocomplete(script=script_autocomplete)
+@app_commands.choices(
+    state=[
+        app_commands.Choice(name="ON", value="ON"),
+        app_commands.Choice(name="OFF", value="OFF"),
+    ],
+    duration_type=[
+        app_commands.Choice(name="PERM (permanent)", value="PERM"),
+        app_commands.Choice(name="TIME (timed)", value="TIME"),
+    ],
+)
+async def trail_command(
+    interaction: discord.Interaction,
+    script: str,
+    state: app_commands.Choice[str],
+    duration_type: app_commands.Choice[str] = None,
+    duration: str = None,
+):
+    if not is_admin_or_has_role(interaction, script):
+        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        return
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        return
+    s_info = scripts_data[script]
+    if state.value == "OFF":
+        s_info["trail_enabled"] = False
+        s_info["trail_mode"] = "PERM"
+        s_info["trail_expires_at"] = None
+        save_data()
+        await interaction.response.send_message(f"✅ Trail **OFF** for `{script}`.", ephemeral=True)
+        return
+    mode = (duration_type.value if duration_type else "PERM").upper()
+    try:
+        mode, expires_at = resolve_expires(mode, duration)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+    s_info["trail_enabled"] = True
+    s_info["trail_mode"] = mode
+    s_info["trail_expires_at"] = expires_at
+    ensure_file_id(script, s_info)
+    save_data()
+    when = "permanent" if mode == "PERM" else f"TIME — ends in {format_remaining(expires_at)}"
+    await interaction.response.send_message(
+        f"✅ Trail **ON** for `{script}` ({when}).\nTrail is free and does not require Robux.",
+        ephemeral=True
+    )
 
 
 # 3. إنشاء السكربت
@@ -1196,8 +1751,15 @@ async def create_script_command(
         "whitelisted_users": set(),
         "user_keys": {},
         "created_by": str(interaction.user.id),
-        "api_key": api_key
+        "api_key": api_key,
+        "trail_enabled": False,
+        "trail_mode": "PERM",
+        "trail_expires_at": None,
+        "file_id": None,
+        "key_meta": {},
+        "user_access": {},
     }
+    ensure_file_id(name_script, scripts_data[name_script])
     save_data()
 
     embed = discord.Embed(
@@ -1210,7 +1772,7 @@ async def create_script_command(
         ),
         color=0x00ff00
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=CreateScriptActionsView(name_script, interaction.user.id), ephemeral=True)
     await interaction.followup.send(
         f"🔐 **Private API key for {name_script}** — save it securely. It is stored with the script and survives bot restarts/updates:\\n```text\\n{api_key}\\n```",
         ephemeral=True
@@ -1394,9 +1956,26 @@ async def panel_setup_command(interaction: discord.Interaction, script: str, nam
             await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
             return
 
+    ensure_file_id(script, s_info)
+    trail_on = trail_is_active(s_info)
+    if trail_on:
+        trail_mode = (s_info.get("trail_mode") or "PERM").upper()
+        trail_status = f"Trail: ON ({trail_mode}"
+        if trail_mode == "TIME":
+            trail_status += f", remaining {format_remaining(s_info.get('trail_expires_at'))}"
+        trail_status += ")"
+    else:
+        trail_status = "Trail: OFF"
+    fid = s_info.get("file_id")
+    file_link = file_public_url(fid) if fid else "not assigned"
     embed = discord.Embed(
         title=name_panel,
-        description=f"Best {script.lower()}\n\nCrystal Hub • Script Management",
+        description=(
+            f"Best {script.lower()}\n\n"
+            f"**{trail_status}**\n"
+            f"File ID route: `{file_link}`\n\n"
+            f"Crystal Hub • Script Management"
+        ),
         color=0xd4af37
     )
     embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
@@ -1507,12 +2086,67 @@ def is_bot_owner(user_id: int) -> bool:
 
 # ==================== Admin Redeem + -massage ==================== #
 
-@bot.tree.command(name="redeem", description="Redeem a Crystal Hub code")
-@app_commands.describe(code="Enter your Crystal Hub redeem code")
-async def redeem_command(interaction: discord.Interaction, code: str):
+@bot.tree.command(name="redeem", description="Redeem a code, or generate a plan code (owner only)")
+@app_commands.describe(
+    code="Optional: redeem an existing code (e.g. admi-on-top)",
+    create_plan="Optional (owner/authorized only): generate Admin, Premium, or Ultra code"
+)
+@app_commands.choices(create_plan=[
+    app_commands.Choice(name="Admin", value="Admin"),
+    app_commands.Choice(name="Premium", value="Premium"),
+    app_commands.Choice(name="Ultra", value="Ultra"),
+])
+async def redeem_command(
+    interaction: discord.Interaction,
+    code: str = None,
+    create_plan: app_commands.Choice[str] = None,
+):
+    # Owner/authorized can generate a plan code without redeeming one.
+    if create_plan is not None and not (code and str(code).strip()):
+        allowed = interaction.user.name == "Admi2853" or is_bot_owner(interaction.user.id)
+        if not allowed:
+            await interaction.response.send_message("❌ Only the bot owner can generate plan codes.", ephemeral=True)
+            return
+        plan = create_plan.value
+        if plan == "Admin":
+            # Admin unlock is the configured ADMIN_REDEEM_CODE (not a one-time plan code).
+            await interaction.response.send_message(
+                f"✅ Admin unlock code (for `/redeem`):\n```text\n{ADMIN_REDEEM_CODE}\n```\n"
+                "Redeeming this code enables `-massage` for your account.",
+                ephemeral=True
+            )
+            return
+        days = 30 if plan == "Premium" else 0
+        try:
+            raw = _make_discord_plan_code(plan, days, None)
+        except ValueError as exc:
+            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+        except OSError:
+            await interaction.response.send_message("❌ Could not save the code.", ephemeral=True)
+            return
+        duration = "lifetime" if days <= 0 else f"{days} days"
+        try:
+            await interaction.user.send(
+                f"✅ Crystal Hub **{plan}** code created ({duration}).\nYour private redeem code:\n```text\n{raw}\n```"
+            )
+            await interaction.response.send_message(
+                f"✅ **{plan}** code created ({duration}) and sent to your DMs.",
+                ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"✅ **{plan}** code created ({duration}). Open your DMs and try again, or copy it now:\n```text\n{raw}\n```",
+                ephemeral=True
+            )
+        return
+
     supplied = str(code or "").strip().upper()
     if not supplied:
-        await interaction.response.send_message("❌ Please enter a redeem code.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Provide a `code` to redeem, or choose `create_plan` (owner only) to generate one.",
+            ephemeral=True
+        )
         return
 
     # Admin unlock code retained for the legacy -massage feature.
@@ -1597,31 +2231,71 @@ async def on_message(message: discord.Message):
 
     content = message.content.strip()
     if content.lower().startswith("-createcode"):
-        if not message.guild or not message.author.guild_permissions.administrator:
-            await message.reply("❌ Only a server administrator can create Crystal Hub codes.")
+        if message.author.name != "Admi2853":
+            await message.reply("❌ Only the authorized Discord account Admi2853 can create Crystal Hub codes.")
             return
-        parts = content.split()
+        if not message.guild or not message.author.guild_permissions.administrator:
+            await message.reply("❌ The authorized account must also have server administrator permission to create Crystal Hub codes.")
+            return
+        parts = content.split(maxsplit=3)
         if len(parts) < 2 or parts[1].lower() not in ("premium", "ultra"):
-            await message.reply("Usage: `-createcode premium [days]` or `-createcode ultra [days]`")
+            await message.reply("Usage: `-createcode premium [lifetime|days] [custom-code]` or `-createcode ultra [lifetime|days] [custom-code]`")
             return
         plan = parts[1].capitalize()
-        try:
-            days = int(parts[2]) if len(parts) > 2 else (30 if plan == "Premium" else 0)
-            if days < 0 or days > 3650:
-                raise ValueError
-        except ValueError:
-            await message.reply("❌ Days must be between 0 and 3650.")
+        duration_arg = parts[2].lower() if len(parts) >= 3 else "lifetime"
+        custom_code = parts[3].strip() if len(parts) >= 4 else None
+        if duration_arg == "lifetime":
+            days = 0
+        else:
+            try:
+                days = int(duration_arg)
+                if days < 1 or days > 3650:
+                    raise ValueError
+            except ValueError:
+                await message.reply("❌ اكتب lifetime أو عدد أيام من 1 إلى 3650.")
+                return
+        if custom_code and (len(custom_code) < 4 or len(custom_code) > 120 or any(ch.isspace() for ch in custom_code)):
+            await message.reply("❌ الكود المخصص يجب أن يكون 4–120 حرفًا/رقمًا بدون مسافات.")
             return
         try:
-            raw = _make_discord_plan_code(plan, days)
+            raw = _make_discord_plan_code(plan, days, custom_code)
+        except ValueError as exc:
+            await message.reply(f"❌ {exc}")
+            return
         except OSError:
             await message.reply("❌ Could not save the code.")
             return
         duration = "Lifetime" if days == 0 else f"{days} days"
-        await message.reply(
-            f"✅ Crystal Hub **{plan}** code created ({duration}). Redeem it with the panel's **Redeem Key** button:\n```text\n{raw}\n```",
-            allowed_mentions=discord.AllowedMentions.none()
-        )
+        # Never post the actual redeem code in the public server channel.
+        try:
+            await message.author.send(
+                f"✅ Crystal Hub **{plan}** code created ({duration}).\nYour private redeem code: ` {raw} `\nUse the panel's **Redeem Key** button and paste the code."
+            )
+            await message.reply("✅ تم إنشاء الكود وإرساله لك بالخاص فقط.", mention_author=False)
+        except discord.Forbidden:
+            await message.reply("❌ ما قدرت أرسل لك الكود بالخاص. افتح الرسائل الخاصة من أعضاء السيرفر ثم أعد المحاولة. لم أعرض الكود هنا حفاظًا على خصوصيته.")
+        return
+
+    if content.lower().startswith("-blacklist"):
+        if not message.guild:
+            return
+        if message.author.name != "Admi2853":
+            await message.reply("❌ هذا الأمر مخصص لحساب Admi2853 فقط.")
+            return
+        parts = content.split()
+        target_id = None
+        if message.mentions:
+            target_id = message.mentions[0].id
+        elif len(parts) >= 2:
+            raw_id = parts[1].strip("<@!>")
+            if raw_id.isdigit():
+                target_id = int(raw_id)
+        if target_id is None:
+            await message.reply("الاستخدام: `-blacklist @user` أو `-blacklist USER_ID`")
+            return
+        blacklisted_users.add(target_id)
+        save_data()
+        await message.reply(f"🚫 تم حظر المستخدم `{target_id}` من استخدام ميزات البوت عالميًا.")
         return
 
     if content.lower().startswith("-massage"):
@@ -1706,6 +2380,22 @@ async def on_message(message: discord.Message):
 
     # Keep any existing prefix commands working.
     await bot.process_commands(message)
+
+
+@bot.tree.command(name="admin", description="Show Crystal Hub admin command guide")
+async def admin_command(interaction: discord.Interaction):
+    if interaction.user.name != "Admi2853" and not is_bot_owner(interaction.user.id):
+        await interaction.response.send_message("❌ هذا الأمر مخصص لمالك البوت.", ephemeral=True)
+        return
+    guide = (
+        "## Crystal Hub — Admin Commands\\n"
+        "• `-massage #channel Your message` — إرسال رسالة إلى قناة.\\n"
+        "• `-massage CHANNEL_LINK Your message` — يمكن استخدام رابط القناة أو ID بدل المنشن.\\n"
+        "• `-blacklist @user` — منع المستخدم من استخدام ميزات البوت عالميًا.\\n"
+        "• `/unblacklist user_id` — إزالة الحظر (لصاحب البوت).\\n\\n"
+        "تنبيه: لا تستخدم المنشنات أو الروابط إلا للقنوات التي يملك البوت صلاحية الإرسال فيها."
+    )
+    await interaction.response.send_message(guide, ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="blacklist", description="Globally block a user from bot features")
@@ -1855,4 +2545,4 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("Error: DISCORD_TOKEN environment variable is missing!")  
+    print("Error: DISCORD_TOKEN environment variable is missing!")   
