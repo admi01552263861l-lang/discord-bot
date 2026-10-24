@@ -2994,7 +2994,7 @@ def _admin_role_setup_message(ctx: commands.Context) -> str:
     return "This command requires the configured admin role or Discord Administrator permission."
 
 
-@bot.command(name="Ai", aliases=["ai"])
+@bot.command(name="Ai")
 async def ai_backup_or_restore(ctx: commands.Context, action: str = ""):
     """-Ai file exports the FAQ; attach that JSON to -Ai to restore it."""
     if not _is_server_admin(ctx):
