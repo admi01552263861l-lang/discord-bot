@@ -1299,17 +1299,53 @@ class ScriptRedeemModal(discord.ui.Modal, title="Crystal Hub — Redeem a Key"):
         )
 
 
+class ViewMobileResponseView(discord.ui.View):
+    """Shown under the normal script message; Mobile is available only from this message."""
+    def __init__(self, script_name: str, user_key: str):
+        super().__init__(timeout=300)
+        self.script_name = script_name
+        self.user_key = user_key
+
+    @discord.ui.button(label="View Mobile 📱", style=discord.ButtonStyle.secondary)
+    async def view_mobile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s_info = scripts_data.get(self.script_name)
+        if not s_info:
+            await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
+            return
+
+        ok, reason, current_key = user_access_ok(s_info, interaction.user.id)
+        if not ok or not current_key:
+            await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
+            return
+
+        # Keep the same script URL/key format, but expose it as the mobile option.
+        file_id = ensure_file_id(self.script_name, s_info)
+        file_url = file_public_url(file_id)
+        mobile = (
+            f'Here is your mobile script:\n'
+            f'```lua\n'
+            f'script_key="{current_key}";\n'
+            f'loadstring(game:HttpGet("{file_url}"))()\n'
+            f'```'
+        )
+        await interaction.response.send_message(mobile, ephemeral=True)
+
+
 class PanelControlView(discord.ui.View):
     def __init__(self, script_name: str):
         super().__init__(timeout=None)
         self.script_name = script_name
 
-    def _script_messages(self, s_info: dict, user_key: str):
+    def _script_message(self, s_info: dict, user_key: str):
         file_id = ensure_file_id(self.script_name, s_info)
         file_url = file_public_url(file_id)
-        code = f'Here is your script:\n```lua\nscript_key="{user_key}";\nloadstring(game:HttpGet("{file_url}"))()\n```'
-        mobile = f'Here is the mobile script:\n```lua\nscript_key="{user_key}";\nloadstring(game:HttpGet("{file_url}"))()\n```'
-        return code, mobile
+        return (
+            f'Here is your script:\n'
+            f'```lua\n'
+            f'script_key="{user_key}";\n'
+            f'loadstring(game:HttpGet("{file_url}"))()\n'
+            f'```'
+        )
 
     def _get_user_key(self, s_info: dict, user_id: int):
         ok, reason, user_key = user_access_ok(s_info, user_id)
@@ -1326,37 +1362,41 @@ class PanelControlView(discord.ui.View):
     async def view_script_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         if not s_info:
-            await interaction.response.send_message("❌ Script details not found.", ephemeral=True); return
+            await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
+            return
+
         user_key, reason = self._get_user_key(s_info, interaction.user.id)
         if not user_key:
-            await interaction.response.send_message(f"❌ {reason}", ephemeral=True); return
-        code, _ = self._script_messages(s_info, user_key)
-        await interaction.response.send_message(code, ephemeral=True)
+            await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
+            return
 
-    @discord.ui.button(label="View Mobile 📱", style=discord.ButtonStyle.secondary, row=0)
-    async def view_mobile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        code = self._script_message(s_info, user_key)
+        # The Mobile button is attached to THIS script message, not the main panel.
+        await interaction.response.send_message(
+            code,
+            view=ViewMobileResponseView(self.script_name, user_key),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Stats 📊", style=discord.ButtonStyle.secondary, row=0)
+    async def stats_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Stats is the original button, now updated to show the user's current state.
         s_info = scripts_data.get(self.script_name)
         if not s_info:
-            await interaction.response.send_message("❌ Script details not found.", ephemeral=True); return
-        user_key, reason = self._get_user_key(s_info, interaction.user.id)
-        if not user_key:
-            await interaction.response.send_message(f"❌ {reason}", ephemeral=True); return
-        _, mobile = self._script_messages(s_info, user_key)
-        await interaction.response.send_message(mobile, ephemeral=True)
+            await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
+            return
 
-    @discord.ui.button(label="State 📋", style=discord.ButtonStyle.primary, row=1)
-    async def state_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        s_info = scripts_data.get(self.script_name)
-        if not s_info:
-            await interaction.response.send_message("❌ Script details not found.", ephemeral=True); return
         ok, reason, user_key = user_access_ok(s_info, interaction.user.id)
         if not ok or not user_key:
-            await interaction.response.send_message(f"❌ {reason}", ephemeral=True); return
+            await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
+            return
+
         meta = (s_info.get("key_meta") or {}).get(user_key, {})
         access = (s_info.get("user_access") or {}).get(interaction.user.id, {})
         mode = str(access.get("mode") or meta.get("mode") or "PERM").upper()
         expires_at = access.get("expires_at") or meta.get("expires_at")
         duration = format_remaining(expires_at) if mode == "TIME" else "Lifetime"
+
         binding = hwid_bindings.get(f"{self.script_name}:{user_key}")
         if isinstance(binding, dict):
             device = str(binding.get("device") or "Unknown")
@@ -1364,14 +1404,25 @@ class PanelControlView(discord.ui.View):
         else:
             device = "Unknown" if binding is None else "PC"
             last_seen = None
+
         last_seen_text = "Never"
         if last_seen:
             dt = _parse_iso(last_seen)
             if dt:
                 last_seen_text = dt.strftime("%Y-%m-%d %H:%M UTC")
-        embed = discord.Embed(title="📋 Script State",
-            description=f"**Script:** `{self.script_name}`\n**Key:** `{user_key}`\n**Access:** `{mode}`\n**Duration:** `{duration}`\n**Last Device:** `{device}`\n**Last Login:** `{last_seen_text}`",
-            color=0xd4af37)
+
+        embed = discord.Embed(
+            title="📊 Script Stats",
+            description=(
+                f"**Script:** `{self.script_name}`\n"
+                f"**Key:** `{user_key}`\n"
+                f"**Access:** `{mode}`\n"
+                f"**Duration:** `{duration}`\n"
+                f"**Last Device:** `{device}`\n"
+                f"**Last Login:** `{last_seen_text}`"
+            ),
+            color=0xd4af37
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="Reset HWID 🔄", style=discord.ButtonStyle.secondary, row=1)
@@ -1379,14 +1430,19 @@ class PanelControlView(discord.ui.View):
         s_info = scripts_data.get(self.script_name)
         user_id = interaction.user.id
         if not s_info or user_id not in s_info.get("user_keys", {}):
-            await interaction.response.send_message("❌ You don't have an active key for this script.", ephemeral=True); return
+            await interaction.response.send_message("❌ You don't have an active key for this script.", ephemeral=True)
+            return
         cooldown = int(security_state.get("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN))
         cooldown_key = f"{interaction.guild_id}:{self.script_name}:{user_id}"
         now = int(time.time())
         last_used = int(security_state.get("reset_hwid_last_used", {}).get(cooldown_key, 0))
         remaining = cooldown - (now - last_used)
         if remaining > 0:
-            await interaction.response.send_message(f"⏳ You must wait **{format_duration(remaining)}** before resetting HWID again.", ephemeral=True); return
+            await interaction.response.send_message(
+                f"⏳ You must wait **{format_duration(remaining)}** before resetting HWID again.",
+                ephemeral=True
+            )
+            return
         user_key = s_info["user_keys"][user_id]
         hwid_bindings.pop(f"{self.script_name}:{user_key}", None)
         save_hwid_bindings()
@@ -1402,10 +1458,12 @@ class PanelControlView(discord.ui.View):
     async def get_buyer_role_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         if not s_info or not s_info.get("buyer_role_id"):
-            await interaction.response.send_message("❌ Buyer role is not configured for this script.", ephemeral=True); return
+            await interaction.response.send_message("❌ Buyer role is not configured for this script.", ephemeral=True)
+            return
         ok, reason, _key = user_access_ok(s_info, interaction.user.id)
         if not ok:
-            await interaction.response.send_message(f"❌ Access Denied! {reason}", ephemeral=True); return
+            await interaction.response.send_message(f"❌ Access Denied! {reason}", ephemeral=True)
+            return
         role = interaction.guild.get_role(s_info["buyer_role_id"])
         if role:
             if role in interaction.user.roles:
@@ -1413,12 +1471,6 @@ class PanelControlView(discord.ui.View):
             else:
                 await interaction.user.add_roles(role)
                 await interaction.response.send_message(f"🎉 Granted you the {role.mention} buyer role!", ephemeral=True)
-
-    @discord.ui.button(label="Stats 📊", style=discord.ButtonStyle.secondary, row=2)
-    async def stats_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        s_info = scripts_data.get(self.script_name, {})
-        version = s_info.get("version", "1.0.0")
-        await interaction.response.send_message(f"📊 **Script Stats:**\n• Name: `{self.script_name}`\n• Version: `{version}`\n• Status: `Active & HWID Protected`", ephemeral=True)
 
 
 # ==================== Commands ==================== #
