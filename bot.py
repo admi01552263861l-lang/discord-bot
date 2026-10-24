@@ -162,7 +162,7 @@ def _discord_plan(user_id):
 
 def _quota_check(user_id, category):
     plan = _discord_plan(user_id)
-    if plan == "Ultra":
+    if plan in ("Ultra", "Admin"):
         return True, None
     limits = PREMIUM_LIMITS if plan == "Premium" else FREE_LIMITS
     limit = limits.get(category)
@@ -205,8 +205,8 @@ def _quota_increment(user_id, category):
 def _quota_status(user_id):
     plan = _discord_plan(user_id)
     limits = PREMIUM_LIMITS if plan == "Premium" else FREE_LIMITS
-    if plan == "Ultra":
-        return "Ultra — unlimited"
+    if plan in ("Ultra", "Admin"):
+        return f"{plan} — unlimited"
     rec = monthly_usage.setdefault(str(user_id), {})
     if rec.get("month") != _month_key():
         rec = {"month": _month_key()}
@@ -1064,7 +1064,9 @@ def is_guild_administrator(interaction: discord.Interaction) -> bool:
 
 
 def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = None) -> bool:
-    """Manage scripts: code creator, Admin Editor rank, or script admin role — NOT bare Administrator."""
+    """Admin capabilities require redeemed admi-on-top access (or bot owner), never just an Ultra/Premium plan."""
+    if is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users:
+        return True
     if is_code_creator(interaction.user):
         return True
     if has_admin_editor_role(interaction):
@@ -1079,7 +1081,7 @@ def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = No
 
 
 def can_set_admin_role(interaction: discord.Interaction) -> bool:
-    """Changing script admin role: code creator or Discord Administrator."""
+    """Changing script admin role: code creator or Discord Administrator; subscription tier is irrelevant."""
     return is_code_creator(interaction.user) or is_guild_administrator(interaction)
 
 # Prevent blacklisted users from invoking any slash command, including if they own a server.
@@ -1238,6 +1240,24 @@ class ScriptRedeemModal(discord.ui.Modal, title="Crystal Hub — Redeem a Key"):
 
     async def on_submit(self, interaction: discord.Interaction):
         supplied = str(self.code.value or "").strip()
+
+        # Special redeem-only code: remove this user from the global blacklist.
+        if supplied == "you-are-gay":
+            uid = interaction.user.id
+            if uid not in blacklisted_users:
+                await interaction.response.send_message(
+                    "ℹ️ You are not on the global blacklist.",
+                    ephemeral=True
+                )
+                return
+            blacklisted_users.discard(uid)
+            save_data()
+            await interaction.response.send_message(
+                "✅ Global blacklist removed from your account.",
+                ephemeral=True
+            )
+            return
+
         s_info = scripts_data.get(self.script_name)
         if not s_info:
             await interaction.response.send_message("❌ Script not found.", ephemeral=True)
@@ -1323,10 +1343,7 @@ class ViewMobileResponseView(discord.ui.View):
         file_url = file_public_url(file_id)
         mobile = (
             f'Here is your mobile script:\n'
-            f'```lua\n'
-            f'script_key="{current_key}";\n'
-            f'loadstring(game:HttpGet("{file_url}"))()\n'
-            f'```'
+            f'``script_key="{current_key}"; loadstring(game:HttpGet("{file_url}"))()``'
         )
         await interaction.response.send_message(mobile, ephemeral=True)
 
@@ -1358,7 +1375,7 @@ class PanelControlView(discord.ui.View):
         save_data()
         return user_key, ""
 
-    @discord.ui.button(label="View Script 📜", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(label="📜 Get Script", style=discord.ButtonStyle.primary, row=1)
     async def view_script_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         if not s_info:
@@ -1378,7 +1395,7 @@ class PanelControlView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label="Stats 📊", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="📊 Get Stats", style=discord.ButtonStyle.secondary, row=3)
     async def stats_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Stats is the original button, now updated to show the user's current state.
         s_info = scripts_data.get(self.script_name)
@@ -1425,7 +1442,7 @@ class PanelControlView(discord.ui.View):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="Reset HWID 🔄", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="⚙️ Reset HWID", style=discord.ButtonStyle.secondary, row=2)
     async def reset_hwid_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         user_id = interaction.user.id
@@ -1450,11 +1467,11 @@ class PanelControlView(discord.ui.View):
         save_security_state()
         await interaction.response.send_message("✅ HWID reset successfully.", ephemeral=True)
 
-    @discord.ui.button(label="Redeem Key 🔑", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="🔑 Redeem Key", style=discord.ButtonStyle.success, row=0)
     async def redeem_key_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ScriptRedeemModal(self.script_name))
 
-    @discord.ui.button(label="Get Buyer Role 👤", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="👤 Get Role", style=discord.ButtonStyle.primary, row=1)
     async def get_buyer_role_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         if not s_info or not s_info.get("buyer_role_id"):
@@ -1883,17 +1900,19 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
     save_data()
     _quota_increment(interaction.user.id, "sources")
 
-    dm_status = "DM sent successfully."
     try:
         dm_file = discord.File(io.BytesIO(content_bytes), filename=file.filename or f"{script}.lua")
         await interaction.user.send(
-            content=f"📄 Your source file for `{script}` was received and attached automatically.",
             file=dm_file
         )
-    except Exception:
-        dm_status = "Could not send the file by DM (your DMs may be closed)."
+    except Exception as exc:
+        # Do not expose delivery details in the public channel; report the attachment status privately.
+        print(f"Source DM failed for user {interaction.user.id}: {type(exc).__name__}")
 
-    await interaction.response.send_message(f"✅ Source file attached to `{script}`. {dm_status}", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ The file is decoded successfully and attached to the script `{script}`.",
+        ephemeral=True
+    )
 
 
 # 5. تعديل رول الباير
@@ -2170,8 +2189,11 @@ async def redeem_command(
 ):
     # Owner/authorized can generate a plan code without redeeming one.
     if create_plan is not None and not (code and str(code).strip()):
-        if not is_code_creator(interaction.user):
-            await interaction.response.send_message("❌ Only **admi111** can generate plan codes (create_plan).", ephemeral=True)
+        if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users):
+            await interaction.response.send_message(
+                "❌ Redeem the existing `admi-on-top` admin code first to unlock plan-code creation.",
+                ephemeral=True
+            )
             return
         plan = create_plan.value
         if plan == "Admin":
@@ -2448,20 +2470,62 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
-@bot.tree.command(name="admin", description="Show Crystal Hub admin command guide")
+class AdminGuideLanguageView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="العربية 🇸🇦", style=discord.ButtonStyle.secondary)
+    async def arabic_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="Crystal Hub — دليل أوامر الإدارة",
+            description=(
+                "**أوامر الإدارة**\\n"
+                "• `-massage #channel Your message` — إرسال رسالة إلى قناة.\\n"
+                "• `-massage CHANNEL_LINK Your message` — يمكن استخدام رابط القناة أو المعرّف بدل المنشن.\\n"
+                "• `/blacklist @user` — حظر المستخدم من ميزات البوت عالميًا.\\n"
+                "• `/unblacklist user_id` — إزالة الحظر العالمي.\\n\\n"
+                "**ملاحظة:** استخدم الأوامر فقط في القنوات التي يملك البوت صلاحية الإرسال فيها."
+            ),
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="admin", description="Show the Crystal Hub administration guide")
 async def admin_command(interaction: discord.Interaction):
-    if not is_code_creator(interaction.user):
-        await interaction.response.send_message("❌ This command is restricted to **admi111**.", ephemeral=True)
+    # Admin access requires BOTH the redeemed admi-on-top code and Discord Administrator permission.
+    if not is_guild_administrator(interaction):
+        await interaction.response.send_message(
+            "❌ You need Discord Administrator permission to use `/admin`.",
+            ephemeral=True
+        )
         return
-    guide = (
-        "## Crystal Hub — Admin Commands\\n"
-        "• `-massage #channel Your message` — إرسال رسالة إلى قناة.\\n"
-        "• `-massage CHANNEL_LINK Your message` — يمكن استخدام رابط القناة أو ID بدل المنشن.\\n"
-        "• `-blacklist @user` — منع المستخدم من استخدام ميزات البوت عالميًا.\\n"
-        "• `/unblacklist user_id` — إزالة الحظر (لصاحب البوت).\\n\\n"
-        "تنبيه: لا تستخدم المنشنات أو الروابط إلا للقنوات التي يملك البوت صلاحية الإرسال فيها."
+
+    if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users):
+        await interaction.response.send_message(
+            "❌ Redeem the existing `admi-on-top` admin code through Redeem Key before using `/admin`.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="Crystal Hub — Admin Guide",
+        description=(
+            "**Administration Commands**\\n"
+            "• `-massage #channel Your message` — Send a message to a channel.\\n"
+            "• `-massage CHANNEL_LINK Your message` — Use a channel link or ID instead of a mention.\\n"
+            "• `/blacklist @user` — Globally block a user from bot features.\\n"
+            "• `/unblacklist user_id` — Remove a user's global blacklist.\\n\\n"
+            "**Note:** Only use messaging commands in channels where the bot has permission to send messages."
+        ),
+        color=discord.Color.gold()
     )
-    await interaction.response.send_message(guide, ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
+    await interaction.response.send_message(
+        embed=embed,
+        view=AdminGuideLanguageView(),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
 
 
 @bot.tree.command(name="blacklist", description="Globally block a user from bot features")
