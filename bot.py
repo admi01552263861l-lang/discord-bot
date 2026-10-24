@@ -13,6 +13,7 @@ import hashlib
 import secrets
 import datetime
 import time
+import io
 from typing import Optional
 import discord
 from discord import app_commands
@@ -52,6 +53,7 @@ def load_data():
                     s_info.setdefault("panel_channel_id", None)
                     s_info.setdefault("panel_message_id", None)
                     s_info.setdefault("panel_name", None)
+                    s_info.setdefault("panel_description", "")
                     s_info.setdefault("trail_enabled", False)
                     s_info.setdefault("trail_mode", "PERM")
                     s_info.setdefault("trail_expires_at", None)
@@ -86,6 +88,7 @@ def save_data():
                 "panel_channel_id": s_info.get("panel_channel_id"),
                 "panel_message_id": s_info.get("panel_message_id"),
                 "panel_name": s_info.get("panel_name"),
+                "panel_description": s_info.get("panel_description", ""),
                 "valid_keys": list(s_info.get("valid_keys", set())),
                 "whitelisted_users": list(s_info.get("whitelisted_users", set())),
                 "user_keys": {str(k): v for k, v in s_info.get("user_keys", {}).items()},
@@ -615,6 +618,9 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             script_name = str(payload.get("script_name", ""))[:200]
             user_key = str(payload.get("key", ""))[:200]
             reported_hwid = str(payload.get("hwid", ""))[:300]
+            reported_device = str(payload.get("device", "PC")).strip()[:20] or "PC"
+            if reported_device.lower() not in ("mobile", "pc"):
+                reported_device = "PC"
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             self._send_text(400, "invalid request")
             return
@@ -633,9 +639,10 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             return
 
         binding_key = f"{script_name}:{user_key}"
-        existing_hwid = hwid_bindings.get(binding_key)
+        existing_binding = hwid_bindings.get(binding_key)
+        existing_hwid = existing_binding.get("hwid") if isinstance(existing_binding, dict) else existing_binding
         if existing_hwid is None:
-            hwid_bindings[binding_key] = reported_hwid
+            hwid_bindings[binding_key] = {"hwid": reported_hwid, "device": reported_device, "last_seen": _iso_now()}
             try:
                 save_hwid_bindings()
             except OSError:
@@ -645,6 +652,12 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         elif existing_hwid != reported_hwid:
             self._send_text(403, "you need to reset hwid")
             return
+        else:
+            hwid_bindings[binding_key] = {"hwid": existing_hwid, "device": reported_device, "last_seen": _iso_now()}
+            try:
+                save_hwid_bindings()
+            except OSError:
+                pass
 
         if parsed_path.path == "/script-source":
             # Deliver source only after key and saved device binding pass.
@@ -751,6 +764,8 @@ if type(request_fn) ~= "function" then
 end
 
 local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local device_type = UserInputService.TouchEnabled and "Mobile" or "PC"
 local request_ok, response = pcall(function()
     return request_fn({{
         Url = "{app_url}/script-source",
@@ -759,7 +774,8 @@ local request_ok, response = pcall(function()
         Body = HttpService:JSONEncode({{
             script_name = {script_name_lua},
             key = user_key,
-            hwid = current_hwid
+            hwid = current_hwid,
+            device = device_type
         }})
     }})
 end)
@@ -914,7 +930,7 @@ def ensure_file_id(script_name: str, s_info: dict) -> str:
 
 
 def file_public_url(file_id: str) -> str:
-    base = os.getenv("FILE_BASE_URL", "https://Crystal.com/files/v4/lua").rstrip("/")
+    base = os.getenv("FILE_BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "https://discord-bot-3u9m.onrender.com").rstrip("/") + "/files/v4/lua").rstrip("/")
     return f"{base}/{file_id}"
 
 
@@ -1289,154 +1305,107 @@ class PanelControlView(discord.ui.View):
         self.script_name = script_name
 
     def _script_messages(self, s_info: dict, user_key: str):
-        """Build Get Script (code block) and View Mobile (plain text) messages."""
         file_id = ensure_file_id(self.script_name, s_info)
         file_url = file_public_url(file_id)
-        app_url = os.getenv("RENDER_EXTERNAL_URL", "https://discord-bot-3u9m.onrender.com").rstrip("/")
-        legacy_url = f"{app_url}/script/{urllib.parse.quote(self.script_name)}"
-        trail = trail_is_active(s_info)
-        if trail:
-            trail_mode = (s_info.get("trail_mode") or "PERM").upper()
-            trail_bits = [f"Trail: ON", f"Access: {trail_mode}"]
-            if trail_mode == "TIME":
-                trail_bits.append(f"Remaining: {format_remaining(s_info.get('trail_expires_at'))}")
-            trail_line = " | ".join(trail_bits)
-            code = (
-                "Here is your script:\n"
-                "```lua\n"
-                f"-- Crystal Hub Trail\n"
-                f"-- {trail_line}\n"
-                f'script_key="{user_key}";\n'
-                f'loadstring(game:HttpGet("{file_url}"))()\n'
-                "```"
-            )
-            mobile = (
-                "Here is your script:\n\n"
-                "Type: Trail\n"
-                f"{trail_line}\n"
-                f"Key: {user_key}\n"
-                f"Link: {file_url}\n\n"
-                f'script_key="{user_key}";\n'
-                f'loadstring(game:HttpGet("{file_url}"))()'
-            )
-        else:
-            code = (
-                "Here is your script:\n"
-                "```lua\n"
-                f'script_key="{user_key}";\n'
-                f'loadstring(game:HttpGet("{file_url}"))()\n'
-                f"-- legacy route: {legacy_url}\n"
-                "```"
-            )
-            mobile = (
-                "Here is your script:\n\n"
-                "Type: Standard\n"
-                f"Key: {user_key}\n"
-                f"Link: {file_url}\n\n"
-                f'script_key="{user_key}";\n'
-                f'loadstring(game:HttpGet("{file_url}"))()'
-            )
+        code = f'Here is your script:\n```lua\nscript_key="{user_key}";\nloadstring(game:HttpGet("{file_url}"))()\n```'
+        mobile = f'Here is the mobile script:\n```lua\nscript_key="{user_key}";\nloadstring(game:HttpGet("{file_url}"))()\n```'
         return code, mobile
 
-    @discord.ui.button(label="Get Script 📜", style=discord.ButtonStyle.success)
-    async def get_script_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        s_info = scripts_data.get(self.script_name)
-        if not s_info:
-            await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
-            return
-
-        ok, reason, user_key = user_access_ok(s_info, interaction.user.id)
+    def _get_user_key(self, s_info: dict, user_id: int):
+        ok, reason, user_key = user_access_ok(s_info, user_id)
         if not ok:
-            save_data()
-            await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
-            return
-
+            return None, reason
         if not user_key:
             user_key = generate_random_key()
-            grant_user_access(s_info, interaction.user.id, user_key, "PERM", None)
-
+            grant_user_access(s_info, user_id, user_key, "PERM", None)
         ensure_file_id(self.script_name, s_info)
         save_data()
+        return user_key, ""
+
+    @discord.ui.button(label="View Script 📜", style=discord.ButtonStyle.success, row=0)
+    async def view_script_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s_info = scripts_data.get(self.script_name)
+        if not s_info:
+            await interaction.response.send_message("❌ Script details not found.", ephemeral=True); return
+        user_key, reason = self._get_user_key(s_info, interaction.user.id)
+        if not user_key:
+            await interaction.response.send_message(f"❌ {reason}", ephemeral=True); return
         code, _ = self._script_messages(s_info, user_key)
         await interaction.response.send_message(code, ephemeral=True)
 
-    @discord.ui.button(label="View Mobile 📱", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="View Mobile 📱", style=discord.ButtonStyle.secondary, row=0)
     async def view_mobile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         if not s_info:
-            await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
-            return
-
-        ok, reason, user_key = user_access_ok(s_info, interaction.user.id)
-        if not ok:
-            save_data()
-            await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
-            return
-
+            await interaction.response.send_message("❌ Script details not found.", ephemeral=True); return
+        user_key, reason = self._get_user_key(s_info, interaction.user.id)
         if not user_key:
-            user_key = generate_random_key()
-            grant_user_access(s_info, interaction.user.id, user_key, "PERM", None)
-
-        ensure_file_id(self.script_name, s_info)
-        save_data()
+            await interaction.response.send_message(f"❌ {reason}", ephemeral=True); return
         _, mobile = self._script_messages(s_info, user_key)
-        # Plain text for easy mobile copy (no code fences)
         await interaction.response.send_message(mobile, ephemeral=True)
 
-    @discord.ui.button(label="Redeem Key 🔑", style=discord.ButtonStyle.primary)
-    async def redeem_key_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ScriptRedeemModal(self.script_name))
+    @discord.ui.button(label="State 📋", style=discord.ButtonStyle.primary, row=1)
+    async def state_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s_info = scripts_data.get(self.script_name)
+        if not s_info:
+            await interaction.response.send_message("❌ Script details not found.", ephemeral=True); return
+        ok, reason, user_key = user_access_ok(s_info, interaction.user.id)
+        if not ok or not user_key:
+            await interaction.response.send_message(f"❌ {reason}", ephemeral=True); return
+        meta = (s_info.get("key_meta") or {}).get(user_key, {})
+        access = (s_info.get("user_access") or {}).get(interaction.user.id, {})
+        mode = str(access.get("mode") or meta.get("mode") or "PERM").upper()
+        expires_at = access.get("expires_at") or meta.get("expires_at")
+        duration = format_remaining(expires_at) if mode == "TIME" else "Lifetime"
+        binding = hwid_bindings.get(f"{self.script_name}:{user_key}")
+        if isinstance(binding, dict):
+            device = str(binding.get("device") or "Unknown")
+            last_seen = binding.get("last_seen")
+        else:
+            device = "Unknown" if binding is None else "PC"
+            last_seen = None
+        last_seen_text = "Never"
+        if last_seen:
+            dt = _parse_iso(last_seen)
+            if dt:
+                last_seen_text = dt.strftime("%Y-%m-%d %H:%M UTC")
+        embed = discord.Embed(title="📋 Script State",
+            description=f"**Script:** `{self.script_name}`\n**Key:** `{user_key}`\n**Access:** `{mode}`\n**Duration:** `{duration}`\n**Last Device:** `{device}`\n**Last Login:** `{last_seen_text}`",
+            color=0xd4af37)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="Reset HWID 🔄", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Reset HWID 🔄", style=discord.ButtonStyle.secondary, row=1)
     async def reset_hwid_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         user_id = interaction.user.id
-        
         if not s_info or user_id not in s_info.get("user_keys", {}):
-            await interaction.response.send_message("❌ You don't have an active key for this script.", ephemeral=True)
-            return
-
-        # This enforces and persists the cooldown. Actual device binding must be
-        # stored and checked server-side before claiming the HWID has been reset.
+            await interaction.response.send_message("❌ You don't have an active key for this script.", ephemeral=True); return
         cooldown = int(security_state.get("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN))
         cooldown_key = f"{interaction.guild_id}:{self.script_name}:{user_id}"
         now = int(time.time())
         last_used = int(security_state.get("reset_hwid_last_used", {}).get(cooldown_key, 0))
         remaining = cooldown - (now - last_used)
-
         if remaining > 0:
-            await interaction.response.send_message(
-                f"⏳ You must wait **{format_duration(remaining)}** before resetting HWID again.\n"
-                "If you changed devices, please wait for the cooldown to expire or contact an admin.",
-                ephemeral=True
-            )
-            return
-
+            await interaction.response.send_message(f"⏳ You must wait **{format_duration(remaining)}** before resetting HWID again.", ephemeral=True); return
         user_key = s_info["user_keys"][user_id]
-        binding_key = f"{self.script_name}:{user_key}"
-        hwid_bindings.pop(binding_key, None)
+        hwid_bindings.pop(f"{self.script_name}:{user_key}", None)
         save_hwid_bindings()
         security_state.setdefault("reset_hwid_last_used", {})[cooldown_key] = now
         save_security_state()
-        await interaction.response.send_message(
-            "✅ HWID reset successfully. The key can now bind to the next device that launches the script. "
-            f"Cooldown started: **{format_duration(cooldown)}**.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("✅ HWID reset successfully.", ephemeral=True)
 
-    @discord.ui.button(label="Get Buyer Role 👤", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Redeem Key 🔑", style=discord.ButtonStyle.primary, row=2)
+    async def redeem_key_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ScriptRedeemModal(self.script_name))
+
+    @discord.ui.button(label="Get Buyer Role 👤", style=discord.ButtonStyle.secondary, row=2)
     async def get_buyer_role_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         if not s_info or not s_info.get("buyer_role_id"):
-            await interaction.response.send_message("❌ Buyer role is not configured for this script.", ephemeral=True)
-            return
-
+            await interaction.response.send_message("❌ Buyer role is not configured for this script.", ephemeral=True); return
         ok, reason, _key = user_access_ok(s_info, interaction.user.id)
         if not ok:
-            save_data()
-            await interaction.response.send_message(f"❌ Access Denied! {reason}", ephemeral=True)
-            return
-
+            await interaction.response.send_message(f"❌ Access Denied! {reason}", ephemeral=True); return
         role = interaction.guild.get_role(s_info["buyer_role_id"])
         if role:
             if role in interaction.user.roles:
@@ -1445,7 +1414,7 @@ class PanelControlView(discord.ui.View):
                 await interaction.user.add_roles(role)
                 await interaction.response.send_message(f"🎉 Granted you the {role.mention} buyer role!", ephemeral=True)
 
-    @discord.ui.button(label="Stats 📊", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Stats 📊", style=discord.ButtonStyle.secondary, row=2)
     async def stats_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name, {})
         version = s_info.get("version", "1.0.0")
@@ -1857,9 +1826,22 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
 
     content_bytes = await file.read()
     file_content = content_bytes.decode('utf-8', errors='ignore')
+    scripts_data[script]["source_code"] = file_content
+    ensure_file_id(script, scripts_data[script])
+    save_data()
+    _quota_increment(interaction.user.id, "sources")
 
-    view = ObfuscateConfirmView(script_name=script, file_content=file_content)
-    await interaction.response.send_message(f"📄 Source file for `{script}` received!\n\n**Do you want to obfuscate script?**", view=view, ephemeral=True)
+    dm_status = "DM sent successfully."
+    try:
+        dm_file = discord.File(io.BytesIO(content_bytes), filename=file.filename or f"{script}.lua")
+        await interaction.user.send(
+            content=f"📄 Your source file for `{script}` was received and attached automatically.",
+            file=dm_file
+        )
+    except Exception:
+        dm_status = "Could not send the file by DM (your DMs may be closed)."
+
+    await interaction.response.send_message(f"✅ Source file attached to `{script}`. {dm_status}", ephemeral=True)
 
 
 # 5. تعديل رول الباير
@@ -1969,9 +1951,20 @@ async def avatar_bot_command(
 
 
 @bot.tree.command(name="panel-setup", description="Create or update the single script management panel")
-@app_commands.describe(script="Choose the script", channel="Optional target channel; if empty, use the channel where this command is run", name_panel="Enter panel title")
+@app_commands.describe(
+    script="Choose the script",
+    channel="Optional target channel; if empty, use the channel where this command is run",
+    name_panel="Enter panel title",
+    description="Optional panel description"
+)
 @app_commands.autocomplete(script=script_autocomplete)
-async def panel_setup_command(interaction: discord.Interaction, script: str, name_panel: str, channel: Optional[discord.TextChannel] = None):
+async def panel_setup_command(
+    interaction: discord.Interaction,
+    script: str,
+    name_panel: str,
+    channel: Optional[discord.TextChannel] = None,
+    description: Optional[str] = None
+):
     if not is_admin_or_has_role(interaction, script):
         await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
         return
@@ -1995,27 +1988,10 @@ async def panel_setup_command(interaction: discord.Interaction, script: str, nam
             return
 
     ensure_file_id(script, s_info)
-    trail_on = trail_is_active(s_info)
-    if trail_on:
-        trail_mode = (s_info.get("trail_mode") or "PERM").upper()
-        trail_status = f"Trail: ON ({trail_mode}"
-        if trail_mode == "TIME":
-            trail_status += f", remaining {format_remaining(s_info.get('trail_expires_at'))}"
-        trail_status += ")"
-    else:
-        trail_status = "Trail: OFF"
-    fid = s_info.get("file_id")
-    file_link = file_public_url(fid) if fid else "not assigned"
-    embed = discord.Embed(
-        title=name_panel,
-        description=(
-            f"Best {script.lower()}\n\n"
-            f"**{trail_status}**\n"
-            f"File ID route: `{file_link}`\n\n"
-            f"Crystal Hub • Script Management"
-        ),
-        color=0xd4af37
-    )
+    if description is not None:
+        s_info["panel_description"] = str(description).strip()[:4000]
+    panel_description = s_info.get("panel_description") or f"Best {script.lower()}\n\nCrystal Hub • Script Management"
+    embed = discord.Embed(title=name_panel, description=panel_description, color=0xd4af37)
     embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
     view = PanelControlView(script_name=script)
 
@@ -2051,6 +2027,7 @@ async def panel_setup_command(interaction: discord.Interaction, script: str, nam
     s_info["panel_channel_id"] = target_channel.id
     s_info["panel_message_id"] = existing_message.id
     s_info["panel_name"] = name_panel
+    s_info["panel_description"] = panel_description
     s_info["panel_created_by"] = str(interaction.user.id)
     save_data()
 
