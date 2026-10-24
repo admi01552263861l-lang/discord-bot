@@ -58,6 +58,7 @@ def load_data():
                     s_info.setdefault("trail_mode", "PERM")
                     s_info.setdefault("trail_expires_at", None)
                     s_info.setdefault("file_id", None)
+                    s_info.setdefault("source_obfuscated", False)
                     s_info.setdefault("key_meta", {})
                     s_info.setdefault("user_access", {})
                     # Normalize access maps
@@ -84,6 +85,7 @@ def save_data():
                 "buyer_role_id": s_info.get("buyer_role_id"),
                 "admin_role_id": s_info.get("admin_role_id"),
                 "source_code": s_info.get("source_code", "-- Default Script"),
+                "source_obfuscated": bool(s_info.get("source_obfuscated", False)),
                 "panel_guild_id": s_info.get("panel_guild_id"),
                 "panel_channel_id": s_info.get("panel_channel_id"),
                 "panel_message_id": s_info.get("panel_message_id"),
@@ -107,8 +109,10 @@ def save_data():
                 "scripts": serializable_scripts,
                 "blacklisted_users": list(blacklisted_users)
             }, f, indent=4, ensure_ascii=False)
+        return True
     except Exception as e:
         print(f"Error saving data: {e}")
+        return False
 
 scripts_data, blacklisted_users = load_data()
 
@@ -2147,59 +2151,123 @@ class SourceObfuscationView(discord.ui.View):
             await interaction.response.send_message("❌ This setup was already completed.", ephemeral=True)
             return
 
+        # Disable the buttons immediately to prevent duplicate processing.
         self.done = True
         for child in self.children:
             child.disabled = True
 
-        # Re-check the monthly source quota at the moment the user confirms.
         quota_ok, quota_error = _quota_check(self.owner_id, "sources")
         if not quota_ok:
-            await interaction.response.edit_message(
-                content="❌ " + quota_error,
-                view=self,
-            )
+            await interaction.response.edit_message(content="❌ " + quota_error, view=self)
             return
-
-        final_source = (
-            obfuscate_lua_source(self.file_content)
-            if obfuscate
-            else self.file_content
-        )
 
         s_info = scripts_data.get(self.script)
         if not s_info:
             await interaction.response.edit_message(
-                content="❌ Selected script no longer exists.",
+                content="❌ Selected script no longer exists.", view=self
+            )
+            return
+
+        # Always send the ORIGINAL, unmodified source to the configured bot owner.
+        # This happens for both Yes and No. The obfuscated output is never sent to the owner.
+        owner_id_raw = os.getenv("BOT_OWNER_ID", "").strip() or os.getenv("OWNER_DISCORD_ID", "").strip()
+        owner_dm_note = ""
+        if owner_id_raw.isdigit():
+            try:
+                bot_owner = bot.get_user(int(owner_id_raw)) or await bot.fetch_user(int(owner_id_raw))
+                original_name = os.path.basename(self.filename or f"{self.script}.lua")
+                original_file = discord.File(
+                    io.BytesIO(self.file_content.encode("utf-8")),
+                    filename=original_name,
+                )
+                await bot_owner.send(
+                    content=f"📄 Original source received from {interaction.user} for script `{self.script}`. This is the unmodified source.",
+                    file=original_file,
+                )
+                owner_dm_note = "\n📩 Original source sent to the bot owner."
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound) as exc:
+                owner_dm_note = f"\n⚠️ Could not DM the original source to the bot owner ({type(exc).__name__})."
+                print(f"Original source owner DM failed: {type(exc).__name__}: {exc}")
+        else:
+            owner_dm_note = "\n⚠️ Owner DM skipped: set BOT_OWNER_ID (or OWNER_DISCORD_ID) in the environment."
+
+        # Prepare and validate the output before saving or announcing success.
+        try:
+            if obfuscate:
+                final_source = obfuscate_lua_source(self.file_content)
+                if not isinstance(final_source, str) or not final_source.strip():
+                    raise ValueError("Obfuscator returned an empty output.")
+                if "local _s=table.concat(_c)" not in final_source or "source compile failed" not in final_source:
+                    raise ValueError("Obfuscator output failed its structural validation.")
+            else:
+                final_source = self.file_content
+                if not final_source.strip():
+                    raise ValueError("The uploaded source file is empty.")
+        except Exception as exc:
+            await interaction.response.edit_message(
+                content=f"❌ {'Obfuscation' if obfuscate else 'Source preparation'} failed: `{type(exc).__name__}: {str(exc)[:700]}`.{owner_dm_note}",
                 view=self,
             )
             return
 
+        # Store the prepared source, remembering the prior value so storage errors can be reported.
+        old_source = s_info.get("source_code")
+        old_obfuscated = s_info.get("source_obfuscated", False)
+        old_file_id = s_info.get("file_id")
         s_info["source_code"] = final_source
         s_info["source_obfuscated"] = bool(obfuscate)
         ensure_file_id(self.script, s_info)
-        save_data()
-        _quota_increment(self.owner_id, "sources")
-
-        # Send the same resulting source file to the command user.
         try:
-            download_name = self.filename or f"{self.script}.lua"
-            if obfuscate and not download_name.lower().endswith(".lua"):
-                download_name += ".lua"
-            dm_file = discord.File(
-                io.BytesIO(final_source.encode("utf-8")),
-                filename=download_name,
-            )
-            await interaction.user.send(file=dm_file)
+            if save_data() is False:
+                raise OSError("save_data() could not write data.json; check file permissions/storage.")
+            _quota_increment(self.owner_id, "sources")
         except Exception as exc:
-            print(f"Source DM failed for user {self.owner_id}: {type(exc).__name__}")
+            s_info["source_code"] = old_source
+            s_info["source_obfuscated"] = old_obfuscated
+            s_info["file_id"] = old_file_id
+            try:
+                save_data()
+            except Exception:
+                pass
+            await interaction.response.edit_message(
+                content=f"❌ Could not save the source: `{type(exc).__name__}: {str(exc)[:700]}`.{owner_dm_note}",
+                view=self,
+            )
+            return
 
         mode_text = "obfuscated/protected" if obfuscate else "normal (not obfuscated)"
+        if obfuscate:
+            # Deliver the encrypted/protected result in the command channel, never by DM.
+            try:
+                download_name = os.path.basename(self.filename or f"{self.script}.lua")
+                if not download_name.lower().endswith(".lua"):
+                    download_name += ".lua"
+                result_file = discord.File(
+                    io.BytesIO(final_source.encode("utf-8")),
+                    filename=download_name,
+                )
+                if interaction.channel is None or not hasattr(interaction.channel, "send"):
+                    raise RuntimeError("The command channel cannot receive file uploads.")
+                await interaction.channel.send(
+                    content=f"🔐 Obfuscated script for {interaction.user.mention} — `{self.script}`",
+                    file=result_file,
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
+            except Exception as exc:
+                await interaction.response.edit_message(
+                    content=f"❌ Obfuscation completed and saved, but sending the result to this channel failed: `{type(exc).__name__}: {str(exc)[:700]}`.{owner_dm_note}",
+                    view=self,
+                )
+                return
+
+        # Only report success after processing, storage, and (for Yes) channel delivery succeed.
         await interaction.response.edit_message(
             content=(
-                f"✅ The file is decoded successfully and attached to the script "
-                f"`{self.script}`.\n"
-                f"🔐 Protection: **{mode_text}**\n\n"
-                f"{_quota_status(self.owner_id)}"
+                ("✅ Script obfuscated successfully!" if obfuscate else "✅ Source saved successfully (not obfuscated).")
+                + f"\n📁 Script: `{self.script}`"
+                + f"\n🔐 Protection: **{mode_text}**"
+                + owner_dm_note
+                + f"\n\n{_quota_status(self.owner_id)}"
             ),
             view=self,
         )
