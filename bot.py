@@ -12,6 +12,7 @@ import urllib.error
 import hashlib
 import secrets
 import datetime
+import difflib
 import time
 import io
 from typing import Optional
@@ -20,6 +21,55 @@ from discord import app_commands
 from discord.ext import commands
 
 DATA_FILE = "data.json"
+
+# One server-wide admin role controls bot management actions across all scripts.
+ADMIN_ROLE_CONFIG_FILE = "crystal_hub_admin_roles.json"
+
+def _load_global_admin_roles():
+    try:
+        with open(ADMIN_ROLE_CONFIG_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        roles = raw.get("guild_roles", {}) if isinstance(raw, dict) else {}
+        return {str(guild_id): int(role_id) for guild_id, role_id in roles.items()
+                if str(guild_id).isdigit() and str(role_id).isdigit()}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+GLOBAL_ADMIN_ROLE_IDS = _load_global_admin_roles()
+
+def _save_global_admin_roles():
+    try:
+        with open(ADMIN_ROLE_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"guild_roles": GLOBAL_ADMIN_ROLE_IDS}, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError as exc:
+        print(f"Could not save global admin roles: {exc}")
+        return False
+
+def _global_admin_role_id(guild_id):
+    return GLOBAL_ADMIN_ROLE_IDS.get(str(guild_id)) if guild_id else None
+
+def _has_global_admin_access(interaction):
+    """Only members with the configured server-wide admin role can manage bot features.
+    Discord Administrator permission is required to SET this role, but does not replace it
+    for day-to-day bot management. This role never grants subscription benefits.
+    """
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return False
+    role_id = _global_admin_role_id(interaction.guild.id)
+    if not role_id:
+        return False
+    role = interaction.guild.get_role(role_id)
+    return bool(role and role in interaction.user.roles)
+
+def _global_admin_status(interaction):
+    if not interaction.guild:
+        return False, "This command can only be used inside a server."
+    if not _global_admin_role_id(interaction.guild.id):
+        return False, "❌ Set the server-wide admin role first with `/set-admin-role`."
+    if _has_global_admin_access(interaction):
+        return True, ""
+    return False, "❌ You need the configured admin role or Discord Administrator permission."
 
 # Discord admin redeem access
 ADMIN_REDEEM_FILE = "discord_admin_redeems.json"
@@ -861,7 +911,7 @@ intents.members = True
 intents.invites = True
 
 allowed_mentions = discord.AllowedMentions(everyone=True, roles=True, users=True)
-bot = commands.Bot(command_prefix='!', intents=intents, allowed_mentions=allowed_mentions)
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("!", "-"), intents=intents, allowed_mentions=allowed_mentions, case_insensitive=True)
 
 def generate_random_key(prefix="MUk5", length=32):
     chars = string.ascii_letters + string.digits
@@ -1269,25 +1319,8 @@ def is_guild_administrator(interaction: discord.Interaction) -> bool:
 
 
 def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = None) -> bool:
-    """Admin capabilities require redeemed admi-on-top access (or bot owner), never just an Ultra/Premium plan."""
-    if is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users:
-        return True
-    if is_code_creator(interaction.user):
-        return True
-    if has_admin_editor_role(interaction):
-        return True
-    if script_name and script_name in scripts_data and interaction.guild:
-        admin_role_id = scripts_data[script_name].get("admin_role_id")
-        if admin_role_id:
-            role = interaction.guild.get_role(admin_role_id)
-            if role and isinstance(interaction.user, discord.Member) and role in interaction.user.roles:
-                return True
-    return False
-
-
-def can_set_admin_role(interaction: discord.Interaction) -> bool:
-    """Changing script admin role: code creator or Discord Administrator; subscription tier is irrelevant."""
-    return is_code_creator(interaction.user) or is_guild_administrator(interaction)
+    """All script management uses the server-wide admin role or Discord Administrator."""
+    return _has_global_admin_access(interaction)
 
 # Prevent blacklisted users from invoking any slash command, including if they own a server.
 async def _global_blacklist_interaction_check(interaction: discord.Interaction) -> bool:
@@ -1301,6 +1334,29 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
         except discord.HTTPException:
             pass
         return False
+
+    # Gate bot-management slash commands with the server-wide role. Keep user-facing
+    # commands (such as /my-plan and /redeem) available; quota checks remain in place.
+    command_name = getattr(getattr(interaction, "command", None), "name", "")
+    management_commands = {
+        "generate-key", "key", "whitelist", "whilst", "see-keys", "delete-key",
+        "unwhitelist", "trail", "create-script", "delete-script", "source-setup",
+        "set-buyer-role", "panel-setup", "update-script", "reset-hwid-cooldown",
+        "ai-question-channel", "ai-add-qa", "ai-qa-list", "ai-bot",
+        "blacklist", "unblacklist", "list-servers", "send-server-message",
+        "create-redeem-code", "list-redeem-codes", "revoke-redeem-code",
+    }
+    if command_name in management_commands:
+        allowed, message = _global_admin_status(interaction)
+        if not allowed or not _has_global_admin_access(interaction):
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(message or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
+                else:
+                    await interaction.response.send_message(message or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return False
     return True
 
 bot.tree.interaction_check = _global_blacklist_interaction_check
@@ -1699,11 +1755,22 @@ class PanelControlView(discord.ui.View):
 
 @bot.event
 async def on_ready():
+    # Global slash-command updates can take a while to appear in Discord.
+    # Also sync the command tree to each joined guild so new commands show up quickly.
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands successfully.")
+        global_synced = await bot.tree.sync()
+        print(f"Synced {len(global_synced)} global slash commands successfully.")
     except Exception as e:
-        print(f"Error syncing commands: {e}")
+        print(f"Error syncing global slash commands: {type(e).__name__}: {e}")
+
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            guild_synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(guild_synced)} slash commands to guild {guild.id} ({guild.name}).")
+        except Exception as e:
+            print(f"Error syncing slash commands to guild {guild.id} ({guild.name}): {type(e).__name__}: {e}")
+
     print(f"Bot connected successfully as: {bot.user}")
 
 
@@ -2124,23 +2191,20 @@ async def trail_command(
 @app_commands.describe(
     name_script="Enter script name (optional when API is provided)",
     buyer_role="Select buyer role (optional when API is provided)",
-    admin_role="Select admin role (optional when API is provided)",
     api="Optional Crystal Hub script API URL. If supplied, the script is imported automatically."
 )
 async def create_script_command(
     interaction: discord.Interaction,
     name_script: Optional[str] = None,
     buyer_role: Optional[discord.Role] = None,
-    admin_role: Optional[discord.Role] = None,
     api: Optional[str] = None,
 ):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            "❌ You must be an administrator to create scripts.",
-            ephemeral=True
-        )
+    allowed, admin_error = _global_admin_status(interaction)
+    if not allowed:
+        await interaction.response.send_message(admin_error, ephemeral=True)
         return
 
+    # Admin role is permission only; plan quotas still apply and can only be expanded by the existing plan/code system.
     quota_ok, quota_error = _quota_check(interaction.user.id, "scripts")
     if not quota_ok:
         await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
@@ -2160,11 +2224,9 @@ async def create_script_command(
     if imported:
         name_script = imported["name"]
         buyer_role_id = imported.get("buyer_role_id")
-        admin_role_id = imported.get("admin_role_id")
+        admin_role_id = _global_admin_role_id(interaction.guild.id if interaction.guild else None)
         if buyer_role is not None:
             buyer_role_id = buyer_role.id
-        if admin_role is not None:
-            admin_role_id = admin_role.id
         source_code = imported["source_code"]
         version = imported["version"]
     else:
@@ -2172,15 +2234,14 @@ async def create_script_command(
         if not name_script:
             await interaction.response.send_message("❌ Enter a script name, or provide the API URL.", ephemeral=True)
             return
-        if buyer_role is None or admin_role is None:
+        if buyer_role is None:
             await interaction.response.send_message(
-                "❌ Without an API, select both Buyer Role and Admin Role. "
-                "With an API, those fields are optional.",
+                "❌ Without an API, select the Buyer Role. With an API, this field is optional.",
                 ephemeral=True
             )
             return
         buyer_role_id = buyer_role.id
-        admin_role_id = admin_role.id
+        admin_role_id = _global_admin_role_id(interaction.guild.id if interaction.guild else None)
         source_code = "-- Default Script"
         version = "1.0.0"
 
@@ -2232,7 +2293,8 @@ async def create_script_command(
 @app_commands.autocomplete(script=script_autocomplete)
 async def delete_script_command(interaction: discord.Interaction, script: str):
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You do not have permission to delete this script.", ephemeral=True)
+        _, admin_error = _global_admin_status(interaction)
+        await interaction.response.send_message(admin_error or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
         return
     if script not in scripts_data:
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
@@ -2410,7 +2472,8 @@ class SourceObfuscationView(discord.ui.View):
 @app_commands.autocomplete(script=script_autocomplete)
 async def source_setup_command(interaction: discord.Interaction, file: discord.Attachment, script: str):
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        _, admin_error = _global_admin_status(interaction)
+        await interaction.response.send_message(admin_error or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
         return
 
     if script not in scripts_data:
@@ -2448,7 +2511,8 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
 @app_commands.autocomplete(script=script_autocomplete)
 async def set_buyer_role_command(interaction: discord.Interaction, script: str, buyer_role: discord.Role):
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        _, admin_error = _global_admin_status(interaction)
+        await interaction.response.send_message(admin_error or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
         return
 
     if script not in scripts_data:
@@ -2460,22 +2524,31 @@ async def set_buyer_role_command(interaction: discord.Interaction, script: str, 
     await interaction.response.send_message(f"✅ Buyer role for `{script}` updated to {buyer_role.mention}!", ephemeral=True)
 
 
-# 6. تعديل رول الإدارة
-@bot.tree.command(name="set-admin-role", description="Change the admin role for a script")
-@app_commands.describe(script="Choose the script", admin_role="Select the new admin role")
-@app_commands.autocomplete(script=script_autocomplete)
-async def set_admin_role_command(interaction: discord.Interaction, script: str, admin_role: discord.Role):
-    if not can_set_admin_role(interaction):
-        await interaction.response.send_message("❌ You need **Administrator** permission (or be the bot code owner) to change admin roles.", ephemeral=True)
+# Server-wide admin role — applies to bot management actions, not to subscription quotas.
+@bot.tree.command(name="set-admin-role", description="Set the server-wide role allowed to manage Crystal Hub")
+@app_commands.describe(admin_role="The role allowed to manage scripts and bot settings")
+async def set_admin_role_command(interaction: discord.Interaction, admin_role: discord.Role):
+    if not interaction.guild or not is_guild_administrator(interaction):
+        await interaction.response.send_message(
+            "❌ Only a Discord server Administrator can configure the global admin role.",
+            ephemeral=True,
+        )
         return
 
-    if script not in scripts_data:
-        await interaction.response.send_message("❌ Selected script does not exist.", ephemeral=True)
+    GLOBAL_ADMIN_ROLE_IDS[str(interaction.guild.id)] = admin_role.id
+    if not _save_global_admin_roles():
+        GLOBAL_ADMIN_ROLE_IDS.pop(str(interaction.guild.id), None)
+        await interaction.response.send_message(
+            "❌ Could not save the admin role setting. Check the bot's storage and logs.",
+            ephemeral=True,
+        )
         return
 
-    scripts_data[script]["admin_role_id"] = admin_role.id
-    save_data()
-    await interaction.response.send_message(f"✅ Admin role for `{script}` updated to {admin_role.mention}!", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Server-wide admin role set to {admin_role.mention}. This role can manage bot features across all scripts. "
+        "It does **not** bypass Free/Premium/Ultra quotas or redeem-code requirements.",
+        ephemeral=True,
+    )
 
 
 # 7. إعداد البانل
@@ -2861,7 +2934,254 @@ def _save_ai_chat_channels():
     except OSError as exc:
         print(f"Could not save AI channel config: {exc}")
 
+
 AI_CHAT_CHANNELS = _load_ai_chat_channels()
+
+# Knowledge base: saved questions/answers and the staff channel for unanswered questions.
+AI_KNOWLEDGE_FILE = "crystal_ai_knowledge.json"
+AI_KNOWLEDGE_CHANNEL_FILE = "crystal_ai_question_channel.json"
+
+def _load_ai_knowledge():
+    try:
+        with open(AI_KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        rows = raw.get("items", [])
+        return [x for x in rows if isinstance(x, dict) and x.get("question") and x.get("answer")]
+    except (OSError, ValueError, TypeError):
+        return []
+
+def _save_ai_knowledge():
+    try:
+        with open(AI_KNOWLEDGE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"items": AI_KNOWLEDGE}, f, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        print(f"Could not save AI knowledge: {exc}")
+
+def _load_ai_question_channel():
+    try:
+        with open(AI_KNOWLEDGE_CHANNEL_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return int(raw.get("channel_id")) if raw.get("channel_id") else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+def _save_ai_question_channel():
+    try:
+        with open(AI_KNOWLEDGE_CHANNEL_FILE, "w", encoding="utf-8") as f:
+            json.dump({"channel_id": AI_QUESTION_CHANNEL_ID}, f, indent=2)
+    except OSError as exc:
+        print(f"Could not save AI question channel: {exc}")
+
+AI_KNOWLEDGE = _load_ai_knowledge()
+AI_QUESTION_CHANNEL_ID = _load_ai_question_channel()
+
+
+# ---------- Admin-only portable backups/imports ----------
+def _is_server_admin(ctx: commands.Context) -> bool:
+    """Backup/import commands require the configured role, not merely Discord Administrator."""
+    if not ctx.guild or not _global_admin_role_id(ctx.guild.id):
+        return False
+    if not isinstance(ctx.author, discord.Member):
+        return False
+    role_id = _global_admin_role_id(ctx.guild.id)
+    role = ctx.guild.get_role(role_id) if role_id else None
+    return bool(role and role in ctx.author.roles)
+
+
+def _admin_role_setup_message(ctx: commands.Context) -> str:
+    if ctx.guild and not _global_admin_role_id(ctx.guild.id):
+        return "Set the server-wide admin role first using `/set-admin-role`, then try again."
+    return "This command requires the configured admin role or Discord Administrator permission."
+
+
+@bot.command(name="Ai", aliases=["ai"])
+async def ai_backup_or_restore(ctx: commands.Context, action: str = ""):
+    """-Ai file exports the FAQ; attach that JSON to -Ai to restore it."""
+    if not _is_server_admin(ctx):
+        await ctx.reply(_admin_role_setup_message(ctx), mention_author=False)
+        return
+
+    if action.strip().lower() == "file":
+        payload = json.dumps({"format": "crystal_hub_ai_knowledge_v1", "items": AI_KNOWLEDGE},
+                             ensure_ascii=False, indent=2).encode("utf-8")
+        await ctx.reply(
+            content=f"AI questions and answers backup — **{len(AI_KNOWLEDGE)}** entries. Save this file before updating the bot.",
+            file=discord.File(io.BytesIO(payload), filename="crystal_hub_ai_knowledge.json"),
+            mention_author=False,
+        )
+        return
+
+    attachment = ctx.message.attachments[0] if ctx.message.attachments else None
+    if not attachment:
+        await ctx.reply(
+            "To export: `-Ai file`\\nTo import: attach the saved JSON file to a message containing `-Ai`.",
+            mention_author=False,
+        )
+        return
+
+    try:
+        if attachment.size and attachment.size > 8 * 1024 * 1024:
+            raise ValueError("File is larger than 8 MB.")
+        raw = await attachment.read()
+        backup = json.loads(raw.decode("utf-8-sig"))
+        rows = backup.get("items") if isinstance(backup, dict) else backup
+        if not isinstance(rows, list):
+            raise ValueError("This file does not contain an AI questions/answers list.")
+        clean_rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            question = str(row.get("question", "")).strip()
+            answer = str(row.get("answer", "")).strip()
+            aliases = row.get("aliases", [])
+            if question and answer:
+                if not isinstance(aliases, list):
+                    aliases = []
+                clean_rows.append({"question": question[:1000], "answer": answer[:4000],
+                                   "aliases": [str(x)[:1000] for x in aliases[:30] if str(x).strip()]})
+        if not clean_rows:
+            raise ValueError("No valid question/answer entries were found.")
+        AI_KNOWLEDGE[:] = clean_rows
+        _save_ai_knowledge()
+        await ctx.reply(f"Imported **{len(clean_rows)}** AI questions and answers successfully.", mention_author=False)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        await ctx.reply(f"Could not import that file: {exc}", mention_author=False)
+    except Exception as exc:
+        print(f"AI knowledge import failed: {type(exc).__name__}: {exc}")
+        await ctx.reply("Import failed. Check the bot logs and make sure the attached file is a valid backup.", mention_author=False)
+
+
+@bot.command(name="script")
+async def script_backup_or_restore(ctx: commands.Context, action: str = ""):
+    """-script file exports all script source/config; attach that JSON to -script to restore/merge."""
+    if not _is_server_admin(ctx):
+        await ctx.reply(_admin_role_setup_message(ctx), mention_author=False)
+        return
+
+    if action.strip().lower() == "file":
+        # Use the bot's existing serializer so the backup matches its data format.
+        if not save_data():
+            await ctx.reply("Could not create the script backup. Check the bot logs.", mention_author=False)
+            return
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as backup_file:
+                backup_payload = json.load(backup_file)
+            backup_payload["global_admin_roles"] = GLOBAL_ADMIN_ROLE_IDS
+            data = json.dumps(backup_payload, ensure_ascii=False, indent=2).encode("utf-8")
+            await ctx.reply(
+                content=f"Script/settings backup containing **{len(scripts_data)}** scripts. Keep this file before updating the bot. It includes script source and configuration, so store it privately.",
+                file=discord.File(io.BytesIO(data), filename="crystal_hub_scripts_backup.json"),
+                mention_author=False,
+            )
+        except OSError as exc:
+            print(f"Script backup failed: {exc}")
+            await ctx.reply("Could not read the script data file. Check the bot logs.", mention_author=False)
+        return
+
+    attachment = ctx.message.attachments[0] if ctx.message.attachments else None
+    if not attachment:
+        await ctx.reply(
+            "To export: `-script file`\\nTo restore: attach the saved script backup JSON to a message containing `-script`. Imported scripts will replace scripts with matching names and keep other existing scripts.",
+            mention_author=False,
+        )
+        return
+
+    try:
+        if attachment.size and attachment.size > 8 * 1024 * 1024:
+            raise ValueError("File is larger than 8 MB.")
+        raw = await attachment.read()
+        backup = json.loads(raw.decode("utf-8-sig"))
+        incoming = backup.get("scripts") if isinstance(backup, dict) else None
+        if not isinstance(incoming, dict) or not incoming:
+            raise ValueError("This file does not contain a scripts dictionary backup.")
+
+        imported = {}
+        incoming_admin_roles = backup.get("global_admin_roles", {}) if isinstance(backup, dict) else {}
+        for name, original in incoming.items():
+            if not isinstance(original, dict) or not str(name).strip():
+                continue
+            info = dict(original)
+            info["valid_keys"] = set(info.get("valid_keys", []))
+            info["whitelisted_users"] = set(info.get("whitelisted_users", []))
+            info["user_keys"] = {int(k): v for k, v in (info.get("user_keys") or {}).items()}
+            info.setdefault("panel_guild_id", None)
+            info.setdefault("panel_channel_id", None)
+            info.setdefault("panel_message_id", None)
+            info.setdefault("panel_name", None)
+            info.setdefault("panel_description", "")
+            info.setdefault("trail_enabled", False)
+            info.setdefault("trail_mode", "PERM")
+            info.setdefault("trail_expires_at", None)
+            info.setdefault("file_id", None)
+            info.setdefault("source_obfuscated", False)
+            info.setdefault("key_meta", {})
+            info.setdefault("user_access", {})
+            if not isinstance(info["key_meta"], dict):
+                info["key_meta"] = {}
+            if not isinstance(info["user_access"], dict):
+                info["user_access"] = {}
+            normalized_access = {}
+            for user_id, access in info["user_access"].items():
+                try:
+                    normalized_access[int(user_id)] = access if isinstance(access, dict) else {}
+                except (TypeError, ValueError):
+                    continue
+            info["user_access"] = normalized_access
+            imported[str(name)] = info
+
+        if not imported:
+            raise ValueError("No valid scripts were found in the backup.")
+        scripts_data.update(imported)
+        save_data()
+        restored_role_note = ""
+        if isinstance(incoming_admin_roles, dict):
+            # Restore the role for this server only if this guild was present in the backup.
+            saved_role_id = incoming_admin_roles.get(str(ctx.guild.id)) if ctx.guild else None
+            if saved_role_id and str(saved_role_id).isdigit():
+                GLOBAL_ADMIN_ROLE_IDS[str(ctx.guild.id)] = int(saved_role_id)
+                if _save_global_admin_roles():
+                    restored_role_note = " The saved server-wide admin role was also restored."
+        await ctx.reply(
+            f"Restored **{len(imported)}** scripts. Existing scripts with the same names were replaced; other scripts were kept.{restored_role_note}",
+            mention_author=False,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, KeyError) as exc:
+        await ctx.reply(f"Could not import that file: {exc}", mention_author=False)
+    except Exception as exc:
+        print(f"Script import failed: {type(exc).__name__}: {exc}")
+        await ctx.reply("Import failed. Check the bot logs and make sure this is a valid script backup.", mention_author=False)
+
+
+def _normalize_qa_text(text: str) -> str:
+    text = (text or "").lower().strip()
+    # Normalize common Arabic letter variants and remove diacritics/punctuation.
+    text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
+    text = text.translate(str.maketrans({"أ":"ا", "إ":"ا", "آ":"ا", "ى":"ي", "ة":"ه", "ؤ":"و", "ئ":"ي"}))
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def _qa_similarity(a: str, b: str) -> float:
+    a_norm, b_norm = _normalize_qa_text(a), _normalize_qa_text(b)
+    if not a_norm or not b_norm:
+        return 0.0
+    sequence_score = difflib.SequenceMatcher(None, a_norm, b_norm).ratio()
+    a_words, b_words = set(a_norm.split()), set(b_norm.split())
+    union = a_words | b_words
+    word_score = len(a_words & b_words) / len(union) if union else 0.0
+    # Blend character and word overlap to tolerate minor phrasing changes.
+    return max(sequence_score, 0.65 * sequence_score + 0.35 * word_score)
+
+def _find_saved_answer(question: str):
+    best_item, best_score = None, 0.0
+    for item in AI_KNOWLEDGE:
+        candidates = [item.get("question", "")] + list(item.get("aliases", []))
+        score = max((_qa_similarity(question, candidate) for candidate in candidates), default=0.0)
+        if score > best_score:
+            best_item, best_score = item, score
+    # Without an AI model, similarity is approximate, not true semantic understanding.
+    return (best_item, best_score) if best_score >= 0.52 else (None, best_score)
+
 
 # AI FAQ support (Gemini primary, OpenAI fallback). Set API keys as host environment variables.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -3138,6 +3458,110 @@ def _crystal_faq_embed(kind: str):
     return None
 
 
+
+class AIAnswerModal(discord.ui.Modal, title="Save Crystal Hub answer"):
+    question = discord.ui.TextInput(label="Question", placeholder="The question the member asked", max_length=300)
+    answer = discord.ui.TextInput(label="Correct answer", style=discord.TextStyle.paragraph, placeholder="Write the approved answer here", max_length=1800)
+
+    def __init__(self, original_question: str):
+        super().__init__()
+        self.question.default = original_question[:300]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("You need Manage Server permission to save answers.", ephemeral=True)
+            return
+        q = str(self.question.value).strip()
+        a = str(self.answer.value).strip()
+        if not q or not a:
+            await interaction.response.send_message("Please provide both a question and an answer.", ephemeral=True)
+            return
+        existing, score = _find_saved_answer(q)
+        if existing and score >= 0.88:
+            existing["answer"] = a
+            existing["question"] = q
+        else:
+            AI_KNOWLEDGE.append({"question": q, "answer": a, "aliases": []})
+        _save_ai_knowledge()
+        await interaction.response.send_message(f"Saved. The bot now has **{len(AI_KNOWLEDGE)}** knowledge entries and will match similar wording.", ephemeral=True)
+
+
+class AIQuestionReviewView(discord.ui.View):
+    def __init__(self, original_question: str):
+        super().__init__(timeout=86400)
+        self.original_question = original_question
+
+    @discord.ui.button(label="Add answer / حفظ الإجابة", style=discord.ButtonStyle.primary)
+    async def add_answer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("Only staff with Manage Server permission can add answers.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AIAnswerModal(self.original_question))
+
+
+@bot.tree.command(name="ai-question-channel", description="Choose where unanswered AI questions are sent")
+@app_commands.describe(channel="Channel where the bot will ask staff to provide an answer")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ai_question_channel_command(interaction: discord.Interaction, channel: discord.TextChannel):
+    global AI_QUESTION_CHANNEL_ID
+    AI_QUESTION_CHANNEL_ID = channel.id
+    _save_ai_question_channel()
+    await interaction.response.send_message(
+        f"Unanswered questions will be sent to {channel.mention}. Staff can press **Add answer** to save the correct answer.",
+        ephemeral=True,
+    )
+
+
+@ai_question_channel_command.error
+async def ai_question_channel_command_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        msg = "You need **Manage Server** permission to configure the AI question channel."
+    else:
+        print(f"/ai-question-channel error: {type(error).__name__}: {error}")
+        msg = "Could not configure the question channel. Check bot permissions and logs."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="ai-add-qa", description="Add a question and answer to the AI knowledge base")
+@app_commands.describe(question="Question or phrasing to recognize", answer="Correct answer to send")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ai_add_qa_command(interaction: discord.Interaction, question: str, answer: str):
+    existing, score = _find_saved_answer(question)
+    if existing and score >= 0.88:
+        existing["question"] = question.strip()
+        existing["answer"] = answer.strip()
+    else:
+        AI_KNOWLEDGE.append({"question": question.strip(), "answer": answer.strip(), "aliases": []})
+    _save_ai_knowledge()
+    await interaction.response.send_message(
+        f"Saved question and answer. Knowledge base now contains **{len(AI_KNOWLEDGE)}** entries. Similar wording will be matched approximately.",
+        ephemeral=True,
+    )
+
+
+@ai_add_qa_command.error
+async def ai_add_qa_command_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        msg = "You need **Manage Server** permission to add saved answers."
+    else:
+        print(f"/ai-add-qa error: {type(error).__name__}: {error}")
+        msg = "Could not save the question and answer."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="ai-qa-list", description="Show how many saved AI questions and answers exist")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ai_qa_list_command(interaction: discord.Interaction):
+    preview = "\\n".join(f"• {x['question'][:100]}" for x in AI_KNOWLEDGE[:15]) or "No saved questions yet."
+    await interaction.response.send_message(f"Saved Q&A entries: **{len(AI_KNOWLEDGE)}**\\n{preview}", ephemeral=True)
+
+
 @bot.tree.command(name="ai-bot", description="Turn AI chat on or off in this channel")
 @app_commands.describe(mode="Turn AI chat on or off in the channel where you run this command")
 @app_commands.choices(mode=[app_commands.Choice(name="On", value="on"), app_commands.Choice(name="Off", value="off")])
@@ -3181,6 +3605,8 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # The bot has a custom on_message handler, so explicitly dispatch prefix commands.
+    await bot.process_commands(message)
     content = message.content.strip()
 
     # AI replies only in channels explicitly enabled with /ai-bot On.
@@ -3196,7 +3622,11 @@ async def on_message(message: discord.Message):
             if _crystal_purchase_intent(content):
                 answer = _crystal_purchase_reply(is_arabic)
             else:
-                answer = await _crystal_ai_answer(content, history)
+                saved_item, saved_score = _find_saved_answer(content)
+                if saved_item:
+                    answer = str(saved_item.get("answer", "")).strip()
+                else:
+                    answer = await _crystal_ai_answer(content, history)
                 if not answer:
                     faq_kind = _crystal_faq_kind(content)
                     if faq_kind:
@@ -3205,6 +3635,21 @@ async def on_message(message: discord.Message):
                         if faq_embed is not None:
                             await message.reply(embed=faq_embed, mention_author=False)
                             return
+                    # If no saved answer/AI answer is available, ask staff in the configured channel.
+                    if AI_QUESTION_CHANNEL_ID:
+                        target = message.guild.get_channel(AI_QUESTION_CHANNEL_ID) if message.guild else None
+                        if isinstance(target, discord.TextChannel):
+                            try:
+                                await target.send(
+                                    f"❓ **Question needs an answer**\\n"
+                                    f"**Asked by:** {message.author.mention} in {message.channel.mention}\\n"
+                                    f"**Question:** {content[:1000]}",
+                                    view=AIQuestionReviewView(content),
+                                )
+                            except discord.Forbidden:
+                                print("Missing permission to send unanswered question to configured channel.")
+                    answer = ("ما عندي إجابة مؤكدة للحين، سألت فريق الدعم يضيف الإجابة." if is_arabic
+                              else "I don't have a confirmed answer yet; I've asked staff to add one.")
             if answer:
                 await message.reply(answer, mention_author=False)
                 history.append({"role": "assistant", "content": answer[:1000]})
