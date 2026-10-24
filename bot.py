@@ -10,14 +10,18 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import hashlib
+import hmac
 import secrets
 import datetime
 import difflib
 import time
 import io
+import base64
 from typing import Optional
+import aiohttp
 import discord
 from discord import app_commands
+from discord.http import Route
 from discord.ext import commands
 
 DATA_FILE = "data.json"
@@ -50,10 +54,9 @@ def _global_admin_role_id(guild_id):
     return GLOBAL_ADMIN_ROLE_IDS.get(str(guild_id)) if guild_id else None
 
 def _has_global_admin_access(interaction):
-    """Only members with the configured server-wide admin role can manage bot features.
-    Discord Administrator permission is required to SET this role, but does not replace it
-    for day-to-day bot management. This role never grants subscription benefits.
-    """
+    """Configured server admins and the configured bot owner can manage bot features."""
+    if is_bot_owner(getattr(interaction.user, "id", 0)):
+        return True
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return False
     role_id = _global_admin_role_id(interaction.guild.id)
@@ -63,6 +66,8 @@ def _has_global_admin_access(interaction):
     return bool(role and role in interaction.user.roles)
 
 def _global_admin_status(interaction):
+    if is_bot_owner(getattr(interaction.user, "id", 0)):
+        return True, ""
     if not interaction.guild:
         return False, "This command can only be used inside a server."
     if not _global_admin_role_id(interaction.guild.id):
@@ -121,7 +126,7 @@ def load_data():
                         except (TypeError, ValueError):
                             continue
                     s_info["user_access"] = ua
-                return data.get("scripts", {}), set(data.get("blacklisted_users", []))
+                return data.get("scripts", {}), {int(x) for x in data.get("blacklisted_users", []) if str(x).isdigit()}
         except Exception as e:
             print(f"Error loading saved data: {e}")
     return {}, set()
@@ -1339,14 +1344,24 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
     # commands (such as /my-plan and /redeem) available; quota checks remain in place.
     command_name = getattr(getattr(interaction, "command", None), "name", "")
     management_commands = {
-        "generate-key", "key", "whitelist", "whilst", "see-keys", "delete-key",
+        "generate-key", "key", "whitelist", "see-keys", "delete-key",
         "unwhitelist", "trail", "create-script", "delete-script", "source-setup",
         "set-buyer-role", "panel-setup", "update-script", "reset-hwid-cooldown",
         "ai-question-channel", "ai-add-qa", "ai-qa-list", "ai-bot",
-        "blacklist", "unblacklist", "list-servers", "send-server-message",
+        "list-servers", "send-server-message",
         "create-redeem-code", "list-redeem-codes", "revoke-redeem-code",
     }
     if command_name in management_commands:
+        if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users):
+            message = "❌ Redeem the Admin code first using `/redeem` before using administration commands."
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(message, ephemeral=True)
+                else:
+                    await interaction.response.send_message(message, ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return False
         allowed, message = _global_admin_status(interaction)
         if not allowed or not _has_global_admin_access(interaction):
             try:
@@ -1364,7 +1379,33 @@ bot.tree.interaction_check = _global_blacklist_interaction_check
 
 # ==================== Views & Buttons ==================== #
 
-class InviteRewardView(discord.ui.View):
+async def _deny_blacklisted_interaction(interaction: discord.Interaction) -> bool:
+    if interaction.user and interaction.user.id in blacklisted_users:
+        message = "🚫 You are globally blacklisted from using this bot."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            pass
+        return False
+    return True
+
+
+class BlacklistAwareView(discord.ui.View):
+    """Block globally blacklisted users from all button/select interactions."""
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _deny_blacklisted_interaction(interaction)
+
+
+class BlacklistAwareModal(discord.ui.Modal):
+    """Block globally blacklisted users from submitting an already-open modal."""
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _deny_blacklisted_interaction(interaction)
+
+
+class InviteRewardView(BlacklistAwareView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -1423,7 +1464,7 @@ class InviteRewardView(discord.ui.View):
             await interaction.response.send_message(f"⚠️ You need at least **2 invites** (for 12 hours) or **4 invites** (for 2 days). You currently have **{total_invites}** invites.", ephemeral=True)
 
 
-class ObfuscateConfirmView(discord.ui.View):
+class ObfuscateConfirmView(BlacklistAwareView):
     def __init__(self, script_name: str, file_content: str):
         super().__init__(timeout=60)
         self.script_name = script_name
@@ -1444,7 +1485,7 @@ class ObfuscateConfirmView(discord.ui.View):
         await interaction.response.send_message(f"✅ Source file attached for `{self.script_name}`!", ephemeral=True)
 
 
-class AddSourceModal(discord.ui.Modal, title="Crystal Hub — Add Source"):
+class AddSourceModal(BlacklistAwareModal, title="Crystal Hub — Add Source"):
     source = discord.ui.TextInput(
         label="Paste source code",
         placeholder="Paste the script source here",
@@ -1470,7 +1511,7 @@ class AddSourceModal(discord.ui.Modal, title="Crystal Hub — Add Source"):
         await interaction.response.send_message(f"✅ Source added to `{self.script_name}`.", ephemeral=True)
 
 
-class CreateScriptActionsView(discord.ui.View):
+class CreateScriptActionsView(BlacklistAwareView):
     def __init__(self, script_name: str, owner_id: int):
         super().__init__(timeout=300)
         self.script_name = script_name
@@ -1487,7 +1528,7 @@ class CreateScriptActionsView(discord.ui.View):
         await interaction.response.send_modal(AddSourceModal(self.script_name, self.owner_id))
 
 
-class ScriptRedeemModal(discord.ui.Modal, title="Crystal Hub — Redeem a Key"):
+class ScriptRedeemModal(BlacklistAwareModal, title="Crystal Hub — Redeem a Key"):
     code = discord.ui.TextInput(
         label="Enter script key below",
         placeholder="Paste your Crystal Hub key",
@@ -1501,23 +1542,6 @@ class ScriptRedeemModal(discord.ui.Modal, title="Crystal Hub — Redeem a Key"):
 
     async def on_submit(self, interaction: discord.Interaction):
         supplied = str(self.code.value or "").strip()
-
-        # Special redeem-only code: remove this user from the global blacklist.
-        if supplied == "you-are-gay":
-            uid = interaction.user.id
-            if uid not in blacklisted_users:
-                await interaction.response.send_message(
-                    "ℹ️ You are not on the global blacklist.",
-                    ephemeral=True
-                )
-                return
-            blacklisted_users.discard(uid)
-            save_data()
-            await interaction.response.send_message(
-                "✅ Global blacklist removed from your account.",
-                ephemeral=True
-            )
-            return
 
         s_info = scripts_data.get(self.script_name)
         if not s_info:
@@ -1580,7 +1604,7 @@ class ScriptRedeemModal(discord.ui.Modal, title="Crystal Hub — Redeem a Key"):
         )
 
 
-class ViewMobileResponseView(discord.ui.View):
+class ViewMobileResponseView(BlacklistAwareView):
     """Shown under the normal script message; Mobile is available only from this message."""
     def __init__(self, script_name: str, user_key: str):
         super().__init__(timeout=300)
@@ -1609,7 +1633,7 @@ class ViewMobileResponseView(discord.ui.View):
         await interaction.response.send_message(mobile, ephemeral=True)
 
 
-class PanelControlView(discord.ui.View):
+class PanelControlView(BlacklistAwareView):
     def __init__(self, script_name: str):
         super().__init__(timeout=None)
         self.script_name = script_name
@@ -1755,6 +1779,9 @@ class PanelControlView(discord.ui.View):
 
 @bot.event
 async def on_ready():
+    if not getattr(bot, "_crystal_admin_view_registered", False):
+        bot.add_view(AdminGuideLanguageView())
+        bot._crystal_admin_view_registered = True
     # Remove old guild-specific copies first; registering the same commands
     # globally and per-guild made Discord show duplicate slash commands.
     for guild in bot.guilds:
@@ -1913,226 +1940,7 @@ async def whitelist_command(
     await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}` ({when})! ({dm_status})", ephemeral=True)
 
 
-@bot.tree.command(name="whilst", description="Whitelist a user with PERM or TIME access")
-@app_commands.describe(user="The member to whitelist", script="Target script", duration_type="PERM = permanent, TIME = timed", duration="Required for TIME (e.g. 1m, 30m, 1h, 7d)")
-@app_commands.autocomplete(script=script_autocomplete)
-@app_commands.choices(duration_type=[
-    app_commands.Choice(name="PERM (permanent)", value="PERM"),
-    app_commands.Choice(name="TIME (timed)", value="TIME"),
-])
-async def whilst_command(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    script: str,
-    duration_type: app_commands.Choice[str],
-    duration: str = None,
-):
-    if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to whitelist users.", ephemeral=True)
-        return
-    if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
-        return
-    mode = duration_type.value.upper()
-    try:
-        mode, expires_at = resolve_expires(mode, duration)
-    except ValueError as exc:
-        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
-        return
-    quota_ok, quota_error = _quota_check(interaction.user.id, "keys")
-    if not quota_ok:
-        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
-        return
-    s_info = scripts_data[script]
-    new_key_val = generate_random_key()
-    grant_user_access(s_info, user.id, new_key_val, mode, expires_at, created_by=interaction.user.id)
-    save_data()
-    _quota_increment(interaction.user.id, "keys")
-    if s_info.get("buyer_role_id"):
-        role = interaction.guild.get_role(s_info["buyer_role_id"])
-        if role and role not in user.roles:
-            try:
-                await user.add_roles(role)
-            except Exception:
-                pass
-    when = "permanent" if mode == "PERM" else f"TIME — {format_remaining(expires_at)} remaining"
-    try:
-        dm_embed = discord.Embed(
-            title="🎉 Whitelist Granted!",
-            description=f"You have been whitelisted in **{interaction.guild.name}** for script: **{script}**!\n\nYour Key: `{new_key_val}`\nAccess: {when}",
-            color=0x00ff00
-        )
-        await user.send(embed=dm_embed)
-        dm_status = "DM sent successfully."
-    except Exception:
-        dm_status = "Could not send DM (user DMs closed)."
-    await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}` ({when})! ({dm_status})", ephemeral=True)
-
-
-
-@bot.tree.command(name="see-keys", description="Show your active keys and whitelist grants")
-@app_commands.describe(script="Optional script to filter by")
-@app_commands.autocomplete(script=script_autocomplete)
-async def see_keys_command(interaction: discord.Interaction, script: str = None):
-    if script and script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
-        return
-
-    # Only show keys created by this user, grouped by the whitelisted person.
-    # Unassigned/generated keys are shown separately.
-    grouped = {}
-    unassigned = []
-    total = 0
-
-    selected = {script: scripts_data[script]} if script else scripts_data
-    for script_name, s_info in selected.items():
-        meta_map = s_info.get("key_meta") or {}
-        valid = s_info.get("valid_keys", set())
-        user_keys = s_info.get("user_keys", {}) or {}
-
-        for key in list(valid):
-            meta = meta_map.get(key, {})
-            if not isinstance(meta, dict):
-                meta = {}
-            if str(meta.get("created_by", "")) != str(interaction.user.id):
-                continue
-            if meta.get("disabled"):
-                continue
-
-            expires_at = meta.get("expires_at")
-            if expires_at:
-                try:
-                    if datetime.datetime.fromisoformat(expires_at) <= datetime.datetime.now(datetime.timezone.utc):
-                        continue
-                except (ValueError, TypeError):
-                    pass
-
-            total += 1
-            owner_id = None
-            for uid, user_key in user_keys.items():
-                if user_key == key:
-                    owner_id = int(uid)
-                    break
-
-            mode = str(meta.get("mode", "PERM"))
-            when = "PERM"
-            if expires_at:
-                when = f"expires {format_remaining(expires_at)}"
-
-            entry = f"**{script_name}** — `{key}` ({mode}, {when})"
-            if owner_id is not None:
-                grouped.setdefault(owner_id, []).append(entry)
-            else:
-                unassigned.append(entry)
-
-    if total == 0:
-        msg = "🔑 You currently have no active keys or whitelist grants."
-    else:
-        chunks = [f"🔑 **Your Keys / Whitelist ({total})**"]
-        for uid, entries in grouped.items():
-            chunks.append(f"\n👤 <@{uid}>")
-            chunks.extend(f"  {entry}" for entry in entries)
-        if unassigned:
-            chunks.append("\n📌 **Generated Keys**")
-            chunks.extend(f"  {entry}" for entry in unassigned)
-        chunks.append("\nUse `/delete-key` to delete any key.")
-        chunks.append("Use `/unwhitelist` to remove a whitelist.")
-        msg = "\n".join(chunks)
-
-    # Discord message limit protection.
-    if len(msg) > 1900:
-        msg = msg[:1870] + "\n…\nUse `/see-keys script:<name>` to filter."
-    await interaction.response.send_message(msg, ephemeral=True)
-
-
-@bot.tree.command(name="delete-key", description="Delete one of your active keys")
-@app_commands.describe(key="The exact key to delete")
-async def delete_key_command(interaction: discord.Interaction, key: str):
-    key = key.strip()
-    found = False
-    for script_name, s_info in scripts_data.items():
-        meta_map = s_info.get("key_meta") or {}
-        meta = meta_map.get(key)
-        if not isinstance(meta, dict):
-            continue
-        if str(meta.get("created_by", "")) != str(interaction.user.id) and not is_admin_or_has_role(interaction, script_name):
-            continue
-
-        if key not in s_info.get("valid_keys", set()):
-            continue
-
-        s_info["valid_keys"].discard(key)
-        s_info.setdefault("key_meta", {}).pop(key, None)
-
-        # Remove any whitelist/access entry tied to this key.
-        for uid, user_key in list(s_info.get("user_keys", {}).items()):
-            if user_key == key:
-                s_info["user_keys"].pop(uid, None)
-                s_info.get("whitelisted_users", set()).discard(uid)
-                s_info.get("user_access", {}).pop(uid, None)
-
-        hwid_bindings.pop(key, None)
-        found = True
-        save_data()
-        save_hwid_bindings()
-        await interaction.response.send_message(
-            f"🗑️ Key `{key}` was deleted from `{script_name}`. The key/whitelist slot is free again.",
-            ephemeral=True
-        )
-        return
-
-    if not found:
-        await interaction.response.send_message(
-            "❌ Key not found, or you do not have permission to delete it.",
-            ephemeral=True
-        )
-
-
-@bot.tree.command(name="unwhitelist", description="Remove a user from a script whitelist")
-@app_commands.describe(user="The whitelisted member", script="Target script")
-@app_commands.autocomplete(script=script_autocomplete)
-async def unwhitelist_command(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    script: str,
-):
-    if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
-        return
-    if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message(
-            "❌ You need the **Admin Editor** role (or script admin role) to remove whitelist access.",
-            ephemeral=True
-        )
-        return
-
-    s_info = scripts_data[script]
-    uid = int(user.id)
-    old_key = s_info.get("user_keys", {}).get(uid)
-    if uid not in s_info.get("whitelisted_users", set()) and not old_key:
-        await interaction.response.send_message(
-            f"❌ {user.mention} is not whitelisted for `{script}`.",
-            ephemeral=True
-        )
-        return
-
-    s_info.get("whitelisted_users", set()).discard(uid)
-    s_info.get("user_keys", {}).pop(uid, None)
-    s_info.get("user_access", {}).pop(uid, None)
-
-    # A whitelist grant owns its generated key, so remove that key too and free the shared slot.
-    if old_key:
-        s_info.get("valid_keys", set()).discard(old_key)
-        s_info.get("key_meta", {}).pop(old_key, None)
-        hwid_bindings.pop(old_key, None)
-
-    save_data()
-    save_hwid_bindings()
-    await interaction.response.send_message(
-        f"✅ Removed {user.mention} from the whitelist for `{script}`."
-        + (" Their whitelist key was deleted too." if old_key else ""),
-        ephemeral=True
-    )
+# Removed duplicate whitelist alias `/whilst`; `/whitelist` is the canonical command.
 
 
 @bot.tree.command(name="trail", description="Enable or disable free Trail access for a script")
@@ -2310,7 +2118,7 @@ async def delete_script_command(interaction: discord.Interaction, script: str):
 
 
 # 4. ربط السورس
-class SourceObfuscationView(discord.ui.View):
+class SourceObfuscationView(BlacklistAwareView):
     def __init__(
         self,
         owner_id: int,
@@ -2328,6 +2136,8 @@ class SourceObfuscationView(discord.ui.View):
         self.done = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await super().interaction_check(interaction):
+            return False
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
                 "❌ Only the person who ran `/source-setup` can choose this option.",
@@ -2558,21 +2368,34 @@ async def my_plan_command(interaction: discord.Interaction):
     await interaction.response.send_message(_quota_status(interaction.user.id), ephemeral=True)
 
 
-@bot.tree.command(name="avatar-bot", description="Change the bot nickname and avatar")
+@bot.tree.command(name="avatar-bot", description="Change the bot profile for this server")
 @app_commands.describe(
-    avatar_url="Direct URL to a PNG/JPG/GIF image (avatar change affects the bot globally)",
-    nickname="Optional nickname for this server only"
+    avatar_url="Direct public URL to a PNG/JPG/GIF image (server avatar only)",
+    nickname="Optional nickname for this server only",
+    bio="Text to append to the bot's existing server bio"
 )
 async def avatar_bot_command(
     interaction: discord.Interaction,
     avatar_url: Optional[str] = None,
-    nickname: Optional[str] = None
+    nickname: Optional[str] = None,
+    bio: Optional[str] = None
 ):
+    """Customize the bot's profile in this server only.
+
+    Avatar and bio use Discord's Modify Current Member endpoint, so they do not
+    change the bot's global profile. When bio text is supplied, the current
+    server bio is preserved and the new text is appended after the requested
+    separator.
+    """
     if not interaction.guild or not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Only a server administrator can use this command.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Only a server administrator can use this command.", ephemeral=True
+        )
         return
-    if not avatar_url and not nickname:
-        await interaction.response.send_message("❌ Provide an avatar URL, a nickname, or both.", ephemeral=True)
+    if not avatar_url and not nickname and bio is None:
+        await interaction.response.send_message(
+            "❌ Provide an avatar URL, a nickname, or bio text.", ephemeral=True
+        )
         return
 
     quota_ok, quota_error = _quota_check(interaction.user.id, "avatars")
@@ -2580,45 +2403,121 @@ async def avatar_bot_command(
         await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
         return
 
+    # The avatar quota is charged only after at least one requested change succeeds.
     changes = []
+    payload = {}
+
     if nickname is not None:
-        bot_member = interaction.guild.me
-        if bot_member is None:
-            bot_member = interaction.guild.get_member(bot.user.id)
-        if bot_member is None:
-            await interaction.response.send_message("❌ Could not find the bot member in this server.", ephemeral=True)
-            return
-        try:
-            await bot_member.edit(nick=nickname[:32] if nickname else None, reason="Crystal Hub /avatar-bot command")
-            changes.append("server nickname updated")
-        except discord.Forbidden:
-            await interaction.response.send_message("❌ I need the Change Nickname permission and a suitable role position.", ephemeral=True)
-            return
+        payload["nick"] = nickname[:32] if nickname else None
 
     if avatar_url:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(avatar_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                async with session.get(
+                    avatar_url,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    allow_redirects=True,
+                ) as response:
                     if response.status != 200:
-                        await interaction.response.send_message("❌ Could not download the image URL. Use a direct public image URL.", ephemeral=True)
+                        await interaction.response.send_message(
+                            "❌ Could not download the image URL. Use a direct public image URL.",
+                            ephemeral=True,
+                        )
                         return
                     image_bytes = await response.read()
-                    if len(image_bytes) > 8 * 1024 * 1024:
-                        await interaction.response.send_message("❌ Image must be under 8 MB.", ephemeral=True)
-                        return
-            await bot.user.edit(avatar=image_bytes)
-            changes.append("bot avatar updated globally")
-        except Exception as exc:
+                    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+
+            if len(image_bytes) > 8 * 1024 * 1024:
+                await interaction.response.send_message("❌ Image must be under 8 MB.", ephemeral=True)
+                return
+
+            # Discord expects a data URI for the current guild member avatar.
+            if content_type not in {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"}:
+                guessed = "image/png"
+                if image_bytes.startswith(b"\x89PNG"):
+                    guessed = "image/png"
+                elif image_bytes.startswith(b"\xff\xd8\xff"):
+                    guessed = "image/jpeg"
+                elif image_bytes.startswith((b"GIF87a", b"GIF89a")):
+                    guessed = "image/gif"
+                elif image_bytes.startswith(b"RIFF") and b"WEBP" in image_bytes[:16]:
+                    guessed = "image/webp"
+                content_type = guessed
+
+            payload["avatar"] = f"data:{content_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        except Exception:
             await interaction.response.send_message(
-                "❌ Could not change the bot avatar. Check the direct image URL and try again.",
-                ephemeral=True
+                "❌ Could not download the image URL. Check that it is a direct public image URL.",
+                ephemeral=True,
             )
             return
 
+    if bio is not None:
+        bio = bio.strip()
+        if not bio:
+            await interaction.response.send_message("❌ Bio text cannot be empty.", ephemeral=True)
+            return
+
+        # Discord does not expose GET /guilds/{guild.id}/members/@me. An empty
+        # Modify Current Member request returns the current member object, which
+        # includes the bot's current guild bio on supported Discord API versions.
+        try:
+            current_member = await bot.http.request(
+                Route("PATCH", f"/guilds/{interaction.guild.id}/members/@me"),
+                json={},
+            )
+            original_bio = str(current_member.get("bio") or "").strip()
+        except Exception as exc:
+            print(f"Could not read current guild bio: {exc}")
+            original_bio = ""
+
+        separator = "_ _ _ _ _ _ _ _ _ _ _"
+        combined = f"{original_bio}\n{separator}\n{bio}" if original_bio else f"{separator}\n{bio}"
+        if len(combined) > 190:
+            await interaction.response.send_message(
+                f"❌ The final server bio is {len(combined)}/190 characters. "
+                "Shorten the new bio so the original bio and separator can be preserved.",
+                ephemeral=True,
+            )
+            return
+        payload["bio"] = combined
+
+    try:
+        await bot.http.request(
+            Route("PATCH", f"/guilds/{interaction.guild.id}/members/@me"),
+            json=payload,
+        )
+    except discord.HTTPException as exc:
+        if exc.status == 403:
+            await interaction.response.send_message(
+                "❌ Discord rejected the server profile update. Make sure the bot can change its nickname/profile in this server.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Discord could not update the server profile (HTTP {exc.status}).",
+                ephemeral=True,
+            )
+        return
+    except Exception as exc:
+        print(f"avatar-bot server profile update failed: {exc}")
+        await interaction.response.send_message(
+            "❌ Could not update the bot's server profile.", ephemeral=True
+        )
+        return
+
+    if nickname is not None:
+        changes.append("server nickname updated")
+    if avatar_url:
+        changes.append("server avatar updated")
+    if bio is not None:
+        changes.append("server bio updated")
+
     _quota_increment(interaction.user.id, "avatars")
     await interaction.response.send_message(
-        "✅ Crystal Hub: " + ", ".join(changes) + f".\n{_quota_status(interaction.user.id)}",
-        ephemeral=True
+        "✅ Crystal Hub: " + ", ".join(changes) +
+        f".\nThe avatar and bio changes apply to this server only.\n{_quota_status(interaction.user.id)}",
+        ephemeral=True,
     )
 
 
@@ -2770,6 +2669,313 @@ def is_bot_owner(user_id: int) -> bool:
     owner_id = os.getenv("BOT_OWNER_ID", "").strip()
     return bool(owner_id) and str(user_id) == owner_id
 
+
+
+# ==================== Settings Backup / Restore ==================== #
+
+SETTINGS_BACKUP_VERSION = "crystal_hub_settings_backup_v3"
+BACKUP_SIGNING_KEY = os.getenv("BACKUP_SIGNING_KEY", "").strip()
+KNOWN_USERS_FILE = "crystal_hub_known_users.json"
+
+def _load_known_users():
+    try:
+        with open(KNOWN_USERS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return {int(x) for x in (raw.get("users", []) if isinstance(raw, dict) else []) if str(x).isdigit()}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return set()
+
+KNOWN_USERS = _load_known_users()
+
+def _remember_user(user_id: int):
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return
+    if uid in KNOWN_USERS:
+        return
+    KNOWN_USERS.add(uid)
+    try:
+        with open(KNOWN_USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"users": sorted(KNOWN_USERS)}, f, indent=2)
+    except OSError as exc:
+        print(f"Could not save known users: {exc}")
+
+def _backup_secret():
+    # Keep this secret outside the backup itself. A stable BACKUP_SIGNING_KEY
+    # is recommended so Admin backups remain valid after a bot restart/redeploy.
+    return BACKUP_SIGNING_KEY or os.getenv("DISCORD_TOKEN", "").strip() or os.getenv("BOT_OWNER_ID", "").strip()
+
+def _backup_signature(payload_without_signature):
+    raw = json.dumps(payload_without_signature, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    secret = _backup_secret()
+    if not secret:
+        return ""
+    return hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+
+def _backup_snapshot(backup_type):
+    backup_type = str(backup_type).lower().strip()
+    if backup_type not in ("normal", "admin"):
+        raise ValueError("Unknown backup type.")
+
+    # Main bot data: scripts, keys, panels, whitelist records, and blacklist.
+    main_data = {
+        "scripts": {},
+        "blacklisted_users": sorted(int(x) for x in blacklisted_users),
+    }
+    for name, info in scripts_data.items():
+        # Use the same serializable shape as save_data(), without touching the
+        # live in-memory sets/dicts.
+        main_data["scripts"][name] = {
+            "version": info.get("version", "1.0.0"),
+            "buyer_role_id": info.get("buyer_role_id"),
+            "admin_role_id": info.get("admin_role_id"),
+            "source_code": info.get("source_code", "-- Default Script"),
+            "source_obfuscated": bool(info.get("source_obfuscated", False)),
+            "panel_guild_id": info.get("panel_guild_id"),
+            "panel_channel_id": info.get("panel_channel_id"),
+            "panel_message_id": info.get("panel_message_id"),
+            "panel_name": info.get("panel_name"),
+            "panel_description": info.get("panel_description", ""),
+            "valid_keys": list(info.get("valid_keys", set())),
+            "whitelisted_users": list(info.get("whitelisted_users", set())),
+            "user_keys": {str(k): v for k, v in info.get("user_keys", {}).items()},
+            "trail_enabled": bool(info.get("trail_enabled", False)),
+            "trail_mode": info.get("trail_mode", "PERM"),
+            "trail_expires_at": info.get("trail_expires_at"),
+            "file_id": info.get("file_id"),
+            "key_meta": info.get("key_meta") if isinstance(info.get("key_meta"), dict) else {},
+            "user_access": {str(k): v for k, v in (info.get("user_access") or {}).items()},
+            "created_by": info.get("created_by"),
+            "panel_created_by": info.get("panel_created_by"),
+        }
+
+    snapshot = {
+        "backup_version": SETTINGS_BACKUP_VERSION,
+        "backup_type": backup_type,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "data": main_data,
+        "security_state": security_state,
+        "hwid_bindings": hwid_bindings,
+        "ai_knowledge": AI_KNOWLEDGE,
+        "ai_chat_channels": sorted(int(x) for x in AI_CHAT_CHANNELS),
+        "ai_question_channel_id": AI_QUESTION_CHANNEL_ID,
+        "site_redeem_codes": site_redeem_codes,
+        "site_entitlements": site_entitlements,
+        "monthly_usage": monthly_usage,
+        "known_users": sorted(KNOWN_USERS),
+    }
+
+    # Normal backups intentionally DO NOT carry any personal subscription/
+    # admin rank state. Admin backups carry the complete permission database
+    # so a redeployed bot can restore who has which plan.
+    if backup_type == "admin":
+        snapshot["permission_state"] = {
+            "global_admin_roles": GLOBAL_ADMIN_ROLE_IDS,
+            "admin_redeemed_users": sorted(admin_redeemed_users),
+            "discord_plan_codes": discord_plan_codes,
+            "discord_plan_entitlements": discord_plan_entitlements,
+        }
+        unsigned = dict(snapshot)
+        snapshot["signature"] = _backup_signature(unsigned)
+    else:
+        snapshot["permission_state"] = {
+            "global_admin_roles": {},
+            "admin_redeemed_users": [],
+            "discord_plan_codes": {},
+            "discord_plan_entitlements": {},
+        }
+    return snapshot
+
+def _has_admin_backup_access(user_id):
+    return bool(
+        is_bot_owner(user_id)
+        or str(user_id) in admin_redeemed_users
+        or _discord_plan(user_id) == "Admin"
+    )
+
+def _restore_settings_backup(snapshot, backup_type, guild_id=None):
+    global scripts_data, blacklisted_users, security_state, hwid_bindings
+    global AI_KNOWLEDGE, AI_QUESTION_CHANNEL_ID
+    global site_redeem_codes, site_entitlements, monthly_usage
+    global AI_CHAT_CHANNELS, GLOBAL_ADMIN_ROLE_IDS
+    global admin_redeemed_users, discord_plan_codes, discord_plan_entitlements
+    global KNOWN_USERS
+
+    if not isinstance(snapshot, dict) or snapshot.get("backup_version") != SETTINGS_BACKUP_VERSION:
+        raise ValueError("This is not a compatible Crystal Hub settings backup.")
+
+    actual_type = str(snapshot.get("backup_type", "")).lower()
+    requested_type = str(backup_type).lower()
+    if actual_type != requested_type:
+        raise ValueError(f"This file is a {actual_type.title()} backup, not a {requested_type.title()} backup.")
+
+    if actual_type == "admin":
+        signature = snapshot.get("signature", "")
+        unsigned = dict(snapshot)
+        unsigned.pop("signature", None)
+        expected = _backup_signature(unsigned)
+        if not signature or not expected or not hmac.compare_digest(str(signature), str(expected)):
+            raise ValueError("Admin backup signature is missing or invalid. The file may have been edited.")
+
+    data = snapshot.get("data") or {}
+    if not isinstance(data, dict):
+        raise ValueError("Backup data is invalid.")
+
+    # Restore ordinary bot state.
+    scripts_raw = data.get("scripts", {})
+    restored_scripts = {}
+    if isinstance(scripts_raw, dict):
+        for name, info in scripts_raw.items():
+            if not isinstance(info, dict):
+                continue
+            item = dict(info)
+            item["valid_keys"] = set(item.get("valid_keys", []))
+            item["whitelisted_users"] = set(item.get("whitelisted_users", []))
+            item["user_keys"] = {int(k): v for k, v in (item.get("user_keys") or {}).items() if str(k).lstrip("-").isdigit()}
+            item["user_access"] = {int(k): v for k, v in (item.get("user_access") or {}).items() if str(k).lstrip("-").isdigit()}
+            item.setdefault("key_meta", {})
+            restored_scripts[str(name)] = item
+    scripts_data = restored_scripts
+    blacklisted_users = {int(x) for x in data.get("blacklisted_users", []) if str(x).isdigit()}
+
+    if isinstance(snapshot.get("security_state"), dict):
+        security_state = snapshot["security_state"]
+        save_security_state()
+    if isinstance(snapshot.get("hwid_bindings"), dict):
+        hwid_bindings = snapshot["hwid_bindings"]
+        save_hwid_bindings()
+
+    if isinstance(snapshot.get("ai_knowledge"), list):
+        AI_KNOWLEDGE = snapshot["ai_knowledge"]
+        _save_ai_knowledge()
+    if isinstance(snapshot.get("ai_chat_channels"), list):
+        AI_CHAT_CHANNELS = {int(x) for x in snapshot["ai_chat_channels"] if str(x).isdigit()}
+        _save_ai_chat_channels()
+    AI_QUESTION_CHANNEL_ID = snapshot.get("ai_question_channel_id")
+    _save_ai_question_channel()
+
+    if isinstance(snapshot.get("site_redeem_codes"), dict):
+        site_redeem_codes = snapshot["site_redeem_codes"]
+        _save_json_dict(SITE_CODES_FILE, site_redeem_codes)
+    if isinstance(snapshot.get("site_entitlements"), dict):
+        site_entitlements = snapshot["site_entitlements"]
+        _save_json_dict(SITE_ENTITLEMENTS_FILE, site_entitlements)
+    if isinstance(snapshot.get("monthly_usage"), dict):
+        monthly_usage = snapshot["monthly_usage"]
+        _save_json_dict(MONTHLY_USAGE_FILE, monthly_usage)
+
+    if isinstance(snapshot.get("known_users"), list):
+        KNOWN_USERS = {int(x) for x in snapshot["known_users"] if str(x).isdigit()}
+        try:
+            with open(KNOWN_USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump({"users": sorted(KNOWN_USERS)}, f, indent=2)
+        except OSError:
+            pass
+
+    # CRITICAL: Normal never changes permission/rank state.
+    if actual_type == "admin":
+        perms = snapshot.get("permission_state") or {}
+        GLOBAL_ADMIN_ROLE_IDS = {
+            str(g): int(r) for g, r in (perms.get("global_admin_roles") or {}).items()
+            if str(g).isdigit() and str(r).isdigit()
+        }
+        admin_redeemed_users = {str(x) for x in perms.get("admin_redeemed_users", [])}
+        discord_plan_codes = perms.get("discord_plan_codes") if isinstance(perms.get("discord_plan_codes"), dict) else {}
+        discord_plan_entitlements = perms.get("discord_plan_entitlements") if isinstance(perms.get("discord_plan_entitlements"), dict) else {}
+
+        _save_global_admin_roles()
+        save_admin_redeems()
+        _save_json_dict(DISCORD_PLAN_CODES_FILE, discord_plan_codes)
+        _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
+
+    save_data()
+
+@bot.tree.command(name="setting", description="Get or restore Crystal Hub settings")
+@app_commands.describe(
+    action="Get File or Upload File",
+    backup_type="Normal = general settings only; Admin = all rank/permission state",
+    file="JSON backup file for Upload File",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="Get File", value="get_file"),
+    app_commands.Choice(name="Upload File", value="upload_file"),
+])
+@app_commands.choices(backup_type=[
+    app_commands.Choice(name="Normal", value="normal"),
+    app_commands.Choice(name="Admin", value="admin"),
+])
+async def setting_command(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    backup_type: app_commands.Choice[str],
+    file: Optional[discord.Attachment] = None,
+):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Use `/setting` inside a server.", ephemeral=True)
+        return
+
+    # Normal backup/restore is available to the configured server admin role.
+    # Admin backup/restore requires the actual Admin entitlement.
+    if action.value == "get_file":
+        if not _has_global_admin_access(interaction):
+            await interaction.response.send_message(
+                "❌ You need the configured server admin role to use `/setting`.",
+                ephemeral=True,
+            )
+            return
+        if backup_type.value == "admin" and not _has_admin_backup_access(interaction.user.id):
+            await interaction.response.send_message(
+                "❌ Only an Admin user can create an Admin backup.",
+                ephemeral=True,
+            )
+            return
+        try:
+            payload = _backup_snapshot(backup_type.value)
+            raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+            filename = f"crystal_hub_settings_{backup_type.value}.json"
+            await interaction.response.send_message(
+                f"✅ {backup_type.name} settings backup created.",
+                file=discord.File(io.BytesIO(raw), filename=filename),
+                ephemeral=True,
+            )
+        except Exception as exc:
+            print(f"/setting get file error: {type(exc).__name__}: {exc}")
+            await interaction.response.send_message("❌ Could not create the settings backup.", ephemeral=True)
+        return
+
+    # Upload File
+    if not _has_global_admin_access(interaction):
+        await interaction.response.send_message(
+            "❌ You need the configured server admin role to use `/setting`.",
+            ephemeral=True,
+        )
+        return
+    if file is None:
+        await interaction.response.send_message("❌ Attach the JSON backup file.", ephemeral=True)
+        return
+    if file.size and file.size > 8 * 1024 * 1024:
+        await interaction.response.send_message("❌ The backup file is too large.", ephemeral=True)
+        return
+    if backup_type.value == "admin" and not _has_admin_backup_access(interaction.user.id):
+        await interaction.response.send_message("❌ Only an Admin user can restore an Admin backup.", ephemeral=True)
+        return
+
+    try:
+        raw = await file.read()
+        snapshot = json.loads(raw.decode("utf-8"))
+        _restore_settings_backup(snapshot, backup_type.value, interaction.guild.id)
+        await interaction.response.send_message(
+            f"✅ {backup_type.name} settings restored successfully."
+            + (" All Admin/Premium/Ultra permission data was restored too." if backup_type.value == "admin"
+               else " Rank and Admin/Premium/Ultra permission data was not changed."),
+            ephemeral=True,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        await interaction.response.send_message(f"❌ Could not restore this backup: {exc}", ephemeral=True)
+    except Exception as exc:
+        print(f"/setting upload error: {type(exc).__name__}: {exc}")
+        await interaction.response.send_message("❌ Could not restore the settings backup. Check the bot logs.", ephemeral=True)
 
 # ==================== Admin Redeem + -massage ==================== #
 
@@ -3460,7 +3666,7 @@ def _crystal_faq_embed(kind: str):
 
 
 
-class AIAnswerModal(discord.ui.Modal, title="Save Crystal Hub answer"):
+class AIAnswerModal(BlacklistAwareModal, title="Save Crystal Hub answer"):
     question = discord.ui.TextInput(label="Question", placeholder="The question the member asked", max_length=300)
     answer = discord.ui.TextInput(label="Correct answer", style=discord.TextStyle.paragraph, placeholder="Write the approved answer here", max_length=1800)
 
@@ -3487,7 +3693,7 @@ class AIAnswerModal(discord.ui.Modal, title="Save Crystal Hub answer"):
         await interaction.response.send_message(f"Saved. The bot now has **{len(AI_KNOWLEDGE)}** knowledge entries and will match similar wording.", ephemeral=True)
 
 
-class AIQuestionReviewView(discord.ui.View):
+class AIQuestionReviewView(BlacklistAwareView):
     def __init__(self, original_question: str):
         super().__init__(timeout=86400)
         self.original_question = original_question
@@ -3621,53 +3827,76 @@ async def ai_bot_command_error(interaction: discord.Interaction, error):
             )
 
 
+class AdminGuideLanguageView(BlacklistAwareView):
+    """Persistent bilingual guide for the two supported prefix administration commands."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="English", emoji="🇬🇧", style=discord.ButtonStyle.secondary, custom_id="crystal_admin_guide_english")
+    async def english_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="Crystal Hub — Admin Guide",
+            description=(
+                "**Administration Commands**\n"
+                "• `-massage #channel Your message` — Send your text to the selected channel.\n"
+                "• `-blacklist @user` — Globally block the mentioned user from using the bot."
+            ),
+            color=discord.Color.gold(),
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="العربية", emoji="🇸🇦", style=discord.ButtonStyle.secondary, custom_id="crystal_admin_guide_arabic")
+    async def arabic_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="Crystal Hub — دليل الإدارة",
+            description=(
+                "**أوامر الإدارة**\n"
+                "• `-massage #channel Your message` — إرسال النص الذي تكتبه إلى القناة المحددة.\n"
+                "• `-blacklist @user` — منع المستخدم المحدد من استخدام البوت بشكل عام."
+            ),
+            color=discord.Color.gold(),
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
 @bot.tree.command(name="admin", description="Show the Crystal Hub administration guide")
 async def admin_command(interaction: discord.Interaction):
-    # Admin access requires BOTH the redeemed admi-on-top code and Discord Administrator permission.
-    if not is_guild_administrator(interaction):
-        await interaction.response.send_message(
-            "❌ You need Discord Administrator permission to use `/admin`.",
-            ephemeral=True
-        )
-        return
-
     if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users):
         await interaction.response.send_message(
-            "❌ Redeem the existing `admi-on-top` admin code through Redeem Key before using `/admin`.",
-            ephemeral=True
+            "❌ Redeem the existing `admi-on-top` admin code through `/redeem` before using `/admin`.",
+            ephemeral=True,
         )
         return
-
     embed = discord.Embed(
         title="Crystal Hub — Admin Guide",
         description=(
-            "**Administration Commands**\\n"
-            "• `-massage #channel Your message` — Send a message to a channel.\\n"
-            "• `-massage CHANNEL_LINK Your message` — Use a channel link or ID instead of a mention.\\n"
-            "• `/blacklist @user` — Globally block a user from bot features.\\n"
-            "• `/unblacklist user_id` — Remove a user's global blacklist.\\n\\n"
-            "**Note:** Only use messaging commands in channels where the bot has permission to send messages."
+            "**Administration Commands**\n"
+            "• `-massage #channel Your message` — Send your text to the selected channel.\n"
+            "• `-blacklist @user` — Globally block the mentioned user from using the bot."
         ),
-        color=discord.Color.gold()
+        color=discord.Color.gold(),
     )
     await interaction.response.send_message(
-        embed=embed,
-        view=AdminGuideLanguageView(),
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none()
+        embed=embed, view=AdminGuideLanguageView(), ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
 @bot.tree.command(name="blacklist", description="Globally block a user from bot features")
 @app_commands.describe(user="The user to blacklist")
 async def blacklist_command(interaction: discord.Interaction, user: discord.Member):
-    if not is_bot_owner(interaction.user.id):
-        await interaction.response.send_message("❌ This action is restricted to the bot owner.", ephemeral=True)
+    if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users):
+        await interaction.response.send_message("❌ Redeem the Admin code first using `/redeem` before using `/blacklist`.", ephemeral=True)
         return
-
-    blacklisted_users.add(user.id)
-    save_data()
-    await interaction.response.send_message(f"🚫 {user.mention} has been added to the global bot blacklist.", ephemeral=True)
+    if user.id == interaction.user.id:
+        await interaction.response.send_message("❌ You cannot blacklist yourself.", ephemeral=True)
+        return
+    blacklisted_users.add(int(user.id))
+    if not save_data():
+        blacklisted_users.discard(int(user.id))
+        await interaction.response.send_message("❌ Could not save the blacklist. The change was cancelled; check the bot's file permissions.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🚫 {user.mention} has been added to the global bot blacklist.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="unblacklist", description="Remove a user from the global bot blacklist")
@@ -3681,8 +3910,13 @@ async def unblacklist_command(interaction: discord.Interaction, user_id: str):
     except (TypeError, ValueError):
         await interaction.response.send_message("❌ Enter a valid numeric Discord user ID.", ephemeral=True)
         return
+    was_blacklisted = target_id in blacklisted_users
     blacklisted_users.discard(target_id)
-    save_data()
+    if not save_data():
+        if was_blacklisted:
+            blacklisted_users.add(target_id)
+        await interaction.response.send_message("❌ Could not save the blacklist change. It was rolled back; check the bot's file permissions.", ephemeral=True)
+        return
     await interaction.response.send_message(f"✅ User `{target_id}` removed from the global blacklist.", ephemeral=True)
 
 
@@ -3808,6 +4042,72 @@ async def on_message(message: discord.Message):
     """Answer messages in configured AI channels and forward unknown questions to staff."""
     if message.author.bot:
         await bot.process_commands(message)
+        return
+
+    content = (message.content or "").strip()
+    if message.author.id in blacklisted_users:
+        if content.startswith(("!", "-")):
+            await message.reply("🚫 You are globally blacklisted from using this bot.", mention_author=False)
+        # Do not let globally blacklisted users use AI chat or other message-based features.
+        return
+
+    if content.lower().startswith("-massage"):
+        if not message.guild:
+            await message.reply("❌ Use this command inside a server.", mention_author=False)
+            return
+        if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users):
+            await message.reply("❌ Redeem the Admin code first using `/redeem` before using `-massage`.", mention_author=False)
+            return
+        parts = content.split(maxsplit=2)
+        if len(parts) < 3:
+            await message.reply("Usage: `-massage #channel Your message`", mention_author=False)
+            return
+        target = _parse_massage_target(message.guild, parts[1])
+        if target is None or not isinstance(target, (discord.TextChannel, discord.Thread)):
+            await message.reply("❌ Channel not found. Mention a text channel, or use its ID/link.", mention_author=False)
+            return
+        perms = target.permissions_for(message.guild.me) if message.guild.me else None
+        can_send = bool(perms and (perms.send_messages_in_threads if isinstance(target, discord.Thread) else perms.send_messages))
+        if not can_send:
+            await message.reply("❌ I do not have permission to send messages in that channel/thread.", mention_author=False)
+            return
+        try:
+            await target.send(parts[2], allowed_mentions=discord.AllowedMentions.none())
+            await message.reply(f"✅ Message sent to {target.mention}.", mention_author=False)
+        except discord.HTTPException as exc:
+            await message.reply(f"❌ Could not send the message: {type(exc).__name__}.", mention_author=False)
+        return
+
+    if content.lower().startswith("-blacklist"):
+        if not message.guild:
+            await message.reply("❌ Use this command inside a server.", mention_author=False)
+            return
+        if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users):
+            await message.reply("❌ Redeem the Admin code first using `/redeem` before using `-blacklist`.", mention_author=False)
+            return
+        parts = content.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.reply("Usage: `-blacklist @user` or `-blacklist USER_ID`", mention_author=False)
+            return
+        target_id = None
+        if message.mentions:
+            target_id = message.mentions[0].id
+        else:
+            raw_target = parts[1].strip().strip("<@!>")
+            if raw_target.isdigit():
+                target_id = int(raw_target)
+        if target_id is None:
+            await message.reply("❌ Could not identify the user. Mention them or provide a numeric ID.", mention_author=False)
+            return
+        if target_id == message.author.id:
+            await message.reply("❌ You cannot blacklist yourself.", mention_author=False)
+            return
+        blacklisted_users.add(int(target_id))
+        if not save_data():
+            blacklisted_users.discard(int(target_id))
+            await message.reply("❌ Could not save the blacklist. The change was cancelled; check the bot's file permissions.", mention_author=False)
+            return
+        await message.reply(f"🚫 User `{target_id}` has been globally blacklisted.", mention_author=False)
         return
 
     try:
