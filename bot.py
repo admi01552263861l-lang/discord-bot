@@ -2840,6 +2840,141 @@ def _parse_massage_target(guild: discord.Guild, target: str):
 
 
 
+# AI chat can be enabled/disabled per text channel with /ai-bot.
+AI_CHANNEL_CONFIG_FILE = "crystal_ai_channel.json"
+AI_CHAT_CHANNELS = set()
+_AI_CHAT_HISTORY = {}
+_AI_LAST_REPLY = {}
+
+def _load_ai_chat_channels():
+    try:
+        with open(AI_CHANNEL_CONFIG_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return {int(x) for x in raw.get("channel_ids", []) if str(x).isdigit()}
+    except (OSError, ValueError, TypeError):
+        return set()
+
+def _save_ai_chat_channels():
+    try:
+        with open(AI_CHANNEL_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"channel_ids": sorted(AI_CHAT_CHANNELS)}, f, indent=2)
+    except OSError as exc:
+        print(f"Could not save AI channel config: {exc}")
+
+AI_CHAT_CHANNELS = _load_ai_chat_channels()
+
+# AI FAQ support (Gemini primary, OpenAI fallback). Set API keys as host environment variables.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+CRYSTAL_DISCORD_INVITE = "https://discord.gg/DsQ2sQkBW3"
+_ai_last_reply_by_user = {}
+
+
+def _crystal_ai_context():
+    """Build grounded context from the bot's current settings; never invent prices."""
+    scripts = []
+    for name, info in list(scripts_data.items())[:30]:
+        if not isinstance(info, dict):
+            continue
+        label = str(info.get("panel_name") or name).strip()
+        desc = str(info.get("panel_description") or info.get("description") or info.get("script_description") or "").strip()
+        scripts.append({"name": label[:120], "description": desc[:500] or "No description configured; ask staff."})
+    return {
+        "plans": {
+            "Free": {"price": "Free", "duration": "free tier", "active_scripts": 5, "active_panels": 5, "source_operations_per_month": 20, "active_keys_or_whitelist_slots": 100, "avatar_changes": "not included"},
+            "Premium": {"price": "$1 USD", "duration": "lifetime", "active_scripts": 10, "active_panels": 10, "source_operations_per_month": 100, "active_keys_or_whitelist_slots": 1000, "avatar_changes_per_month": 5},
+            "Ultra": {"price": "$2 USD", "duration": "lifetime", "limits": "unlimited according to the current bot quota logic"}
+        },
+        "configured_scripts": scripts,
+        "purchase_instructions": "Join https://discord.gg/DsQ2sQkBW3, go to the Buy channel, and open a ticket to purchase. Staff can confirm current prices and availability.",
+        "server_invite": CRYSTAL_DISCORD_INVITE,
+    }
+
+
+def _crystal_purchase_intent(content: str) -> bool:
+    text = re.sub(r"[^\w\s]", " ", (content or "").lower(), flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    terms = (
+        "buy", "purchase", "where can i buy", "where to buy", "how can i buy", "how to buy", "get premium", "buy premium", "buy a script", "buy script",
+        "اشتري", "اشتريه", "شراء", "اشتري من وين", "من وين اشتري", "كيف اشتري", "كيف أشتري", "وين اشتري", "وين أشتري", "ابغى اشتري", "ابي اشتري", "أبي أشتري", "شراء سكربت"
+    )
+    return any(term in text for term in terms)
+
+
+def _crystal_purchase_reply(is_arabic: bool) -> str:
+    if is_arabic:
+        return ("تقدر تشتري من سيرفر Crystal Hub: ادخل السيرفر، وروح إلى قناة **#buy** وافتح تكت، "
+                "وفريق الإدارة بيساعدك ويأكد لك السعر والتوفر.\n" + CRYSTAL_DISCORD_INVITE)
+    return ("You can purchase through the Crystal Hub server: join, go to the **#buy** channel, and open a ticket. "
+            "Staff will confirm the current price and availability.\n" + CRYSTAL_DISCORD_INVITE)
+
+
+def _crystal_is_question(content: str) -> bool:
+    text = (content or "").strip()
+    if not text or text.startswith(("/", "-", "!")):
+        return False
+    if "?" in text or "؟" in text:
+        return True
+    lowered = text.lower()
+    question_starters = (
+        "what ", "how ", "where ", "when ", "why ", "can i ", "can you ", "does ", "do i ", "is ", "are ", "which ", "who ",
+        "وش ", "ايش ", "إيش ", "كيف ", "وين ", "من وين", "هل ", "ليه ", "ليش ", "متى ", "كم ", "اقدر ", "أقدر ", "عندكم ", "فيه "
+    )
+    return any(lowered.startswith(x) for x in question_starters)
+
+
+def _crystal_call_gemini(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        return ""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(GEMINI_MODEL)}:generateContent?key={urllib.parse.quote(GEMINI_API_KEY)}"
+    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+               "generationConfig": {"temperature": 0.35, "maxOutputTokens": 500}}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=18) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    return "".join(part.get("text", "") for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", [])).strip()
+
+
+def _crystal_call_openai(prompt: str) -> str:
+    if not OPENAI_API_KEY:
+        return ""
+    payload = {"model": OPENAI_MODEL,
+               "messages": [{"role": "system", "content": "You are Crystal Hub Discord support. Answer in the same language as the user's message. Be concise, friendly, and grounded only in the supplied context. Never invent prices, features, scripts, or purchase availability. If asked how to buy, direct them to the server's #buy channel and tell them to open a ticket; include the supplied invite. If details are unknown, say staff can confirm."},
+                           {"role": "user", "content": prompt}],
+               "temperature": 0.35, "max_tokens": 500}
+    req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "Authorization": f"Bearer {OPENAI_API_KEY}"}, method="POST")
+    with urllib.request.urlopen(req, timeout=18) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    return str(data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+
+
+async def _crystal_ai_answer(content: str, history=None) -> str:
+    context = json.dumps(_crystal_ai_context(), ensure_ascii=False)
+    history_text = "\n".join(f"{item.get('role', 'user')}: {item.get('content', '')}" for item in (history or [])[-8:])
+    prompt = (
+        "You are Crystal Hub's friendly Discord AI chat assistant. Understand paraphrases, typos, follow-up messages, and casual conversation. "
+        "Reply in the same language as the user (Arabic if their message is Arabic, otherwise English). Keep replies concise and natural. "
+        "Use only this context for product facts; never invent prices or undocumented features. Only describe Free, Premium, and Ultra plans; never mention internal/admin-only plans or access. "
+        "Premium costs $1 USD for lifetime access; Ultra costs $2 USD for lifetime access. For purchases, direct users to the server's #buy channel and tell them to open a ticket.\n\n"
+        f"TRUSTED CRYSTAL HUB CONTEXT:\n{context}\n\nRECENT CHANNEL CONVERSATION:\n{history_text or '(no previous conversation)'}\n\nLATEST USER MESSAGE:\n{content[:1500]}"
+    )
+    # Gemini first, then ChatGPT as a fallback if Gemini is not configured or errors.
+    for provider in (_crystal_call_gemini, _crystal_call_openai):
+        if provider is _crystal_call_gemini and not GEMINI_API_KEY:
+            continue
+        if provider is _crystal_call_openai and not OPENAI_API_KEY:
+            continue
+        try:
+            answer = await asyncio.to_thread(provider, prompt)
+            if answer:
+                return answer[:1900]
+        except Exception as exc:
+            print(f"Crystal Hub AI provider {provider.__name__} failed: {type(exc).__name__}: {exc}")
+    return ""
+
+
 def _crystal_faq_kind(content: str):
     """Match common English/Arabic phrasings to FAQ topics without requiring exact wording."""
     text = re.sub(r"[^\w\s]", " ", (content or "").lower(), flags=re.UNICODE)
@@ -2915,15 +3050,15 @@ def _crystal_faq_embed(kind: str):
                 "• **20 عملية مصدر شهريًا**\n"
                 "• حتى **100 مفتاح/مكان Whitelist نشط**\n"
                 "• تغييرات الأفاتار غير مشمولة ضمن حد الخطة المجانية\n\n"
-                "**خطة Premium**\n"
+                "**خطة Premium — 1 دولار للأبد**\n"
                 "• حتى **10 سكربتات نشطة**\n"
                 "• حتى **10 لوحات نشطة**\n"
                 "• **100 عملية مصدر شهريًا**\n"
                 "• حتى **1,000 مفتاح/مكان Whitelist نشط**\n"
                 "• **5 تغييرات أفاتار شهريًا**\n\n"
-                "**Ultra / Admin**\n"
-                "• حدود الاستخدام لهذه الخطط غير محدودة حسب إعدادات البوت الحالية.\n\n"
-                "للسعر الحالي وطريقة الترقية، اسأل فريق الإدارة؛ البوت لا يخمّن الأسعار."
+                "**خطة Ultra — 2 دولار للأبد**\n"
+                "• حدود الاستخدام غير محدودة حسب إعدادات البوت الحالية.\n\n"
+                "للشراء، ادخل سيرفر Crystal Hub وروح لقناة **#buy** وافتح تكت: https://discord.gg/DsQ2sQkBW3"
             )
             footer = "الحدود المعروضة مأخوذة من إعدادات البوت الحالية."
         else:
@@ -2937,16 +3072,15 @@ def _crystal_faq_embed(kind: str):
                 "• **20 source operations per month**\n"
                 "• Up to **100 active keys/whitelist slots**\n"
                 "• Avatar changes are not included in the Free quota\n\n"
-                "**Premium plan**\n"
+                "**Premium plan — $1 USD, lifetime**\n"
                 "• Up to **10 active scripts**\n"
                 "• Up to **10 active panels**\n"
                 "• **100 source operations per month**\n"
                 "• Up to **1,000 active keys/whitelist slots**\n"
                 "• **5 avatar changes per month**\n\n"
-                "**Ultra / Admin**\n"
-                "• The current bot quota logic treats these plans as unlimited.\n\n"
-                "For current prices and upgrade availability, please ask a server staff member; "
-                "this bot FAQ does not assume a price."
+                "**Ultra plan — $2 USD, lifetime**\n"
+                "• Unlimited usage according to the current bot quota logic.\n\n"
+                "To purchase, join the Crystal Hub server, go to **#buy**, and open a ticket: https://discord.gg/DsQ2sQkBW3"
             )
             footer = "Limits shown are the bot's current configured quotas."
         embed = discord.Embed(title=title, color=0x5865F2, description=description)
@@ -3004,6 +3138,44 @@ def _crystal_faq_embed(kind: str):
     return None
 
 
+@bot.tree.command(name="ai-bot", description="Turn AI chat on or off in this channel")
+@app_commands.describe(mode="Turn AI chat on or off in the channel where you run this command")
+@app_commands.choices(mode=[app_commands.Choice(name="On", value="on"), app_commands.Choice(name="Off", value="off")])
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ai_bot_command(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+    if not interaction.guild or not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message("Use this command in a server text channel.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    if mode.value == "on":
+        AI_CHAT_CHANNELS.add(channel_id)
+        _AI_CHAT_HISTORY[channel_id] = []
+        _save_ai_chat_channels()
+        await interaction.response.send_message(
+            f"AI chat is now **ON** in {interaction.channel.mention}. You can chat normally in this channel and the bot will reply. Run `/ai-bot` with **Off** here to stop it.",
+            ephemeral=True,
+        )
+    else:
+        AI_CHAT_CHANNELS.discard(channel_id)
+        _AI_CHAT_HISTORY.pop(channel_id, None)
+        _save_ai_chat_channels()
+        await interaction.response.send_message(f"AI chat is now **OFF** in {interaction.channel.mention}.", ephemeral=True)
+
+
+@ai_bot_command.error
+async def ai_bot_command_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        message = "You need **Manage Server** permission to change AI chat settings."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    else:
+        print(f"/ai-bot command error: {type(error).__name__}: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Could not change AI chat settings. Check the bot logs.", ephemeral=True)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -3011,15 +3183,35 @@ async def on_message(message: discord.Message):
 
     content = message.content.strip()
 
-    # Answer common Crystal Hub questions automatically, while leaving commands untouched.
-    faq_kind = _crystal_faq_kind(content)
-    if faq_kind:
-        # Reply in Arabic when the question contains Arabic letters; otherwise use English.
-        _crystal_faq_embed._reply_arabic = bool(re.search(r"[\u0600-\u06FF]", content))
-        faq_embed = _crystal_faq_embed(faq_kind)
-        if faq_embed is not None:
-            await message.reply(embed=faq_embed, mention_author=False)
-            return
+    # AI replies only in channels explicitly enabled with /ai-bot On.
+    if message.guild and message.channel.id in AI_CHAT_CHANNELS and content and not content.startswith(("/", "!", "-")):
+        now = time.time()
+        cooldown_key = (message.channel.id, message.author.id)
+        if now - _AI_LAST_REPLY.get(cooldown_key, 0) >= 3:
+            _AI_LAST_REPLY[cooldown_key] = now
+            history = _AI_CHAT_HISTORY.setdefault(message.channel.id, [])
+            history.append({"role": "user", "content": f"{message.author.display_name}: {content[:1000]}"})
+            history = history[-8:]
+            is_arabic = bool(re.search(r"[\u0600-\u06FF]", content))
+            if _crystal_purchase_intent(content):
+                answer = _crystal_purchase_reply(is_arabic)
+            else:
+                answer = await _crystal_ai_answer(content, history)
+                if not answer:
+                    faq_kind = _crystal_faq_kind(content)
+                    if faq_kind:
+                        _crystal_faq_embed._reply_arabic = is_arabic
+                        faq_embed = _crystal_faq_embed(faq_kind)
+                        if faq_embed is not None:
+                            await message.reply(embed=faq_embed, mention_author=False)
+                            return
+            if answer:
+                await message.reply(answer, mention_author=False)
+                history.append({"role": "assistant", "content": answer[:1000]})
+                _AI_CHAT_HISTORY[message.channel.id] = history[-8:]
+                return
+
+    # Do not auto-answer in other channels; existing bot commands continue below.
     if content.lower().startswith("-createcode"):
         if not is_code_creator(message.author):
             await message.reply("❌ Only **admi111** can create Crystal Hub plan codes.")
