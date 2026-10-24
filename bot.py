@@ -900,37 +900,164 @@ def _utcnow():
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-def obfuscate_lua_source(source: str) -> str:
-    """Wrap Lua source as decimal byte escapes so the hosted source is not readable."""
-    raw = source.encode("utf-8")
-    chunks = []
-    current = []
-    # Lua decimal escapes are safest when kept at <= 3 digits each.
-    for byte in raw:
-        current.append(f"\\{byte:03d}")
-        if len(current) >= 80:
-            chunks.append("".join(current))
-            current = []
-    if current:
-        chunks.append("".join(current))
+def _lua_long_string(value: str) -> str:
+    """Return a Lua long-bracket string whose closing delimiter cannot occur in value."""
+    level = 0
+    while True:
+        equals = "=" * level
+        closing = "]" + equals + "]"
+        if closing not in value:
+            return "[" + equals + "[" + value + closing
+        level += 1
 
-    encoded = "".join(chunks)
-    # A split string makes the result less visually obvious and avoids huge
-    # single-line literals for larger scripts.
-    pieces = [encoded[i:i + 2400] for i in range(0, len(encoded), 2400)]
-    lua_parts = ",\n".join(f'    "{piece}"' for piece in pieces) or '    ""'
-    return (
-        "-- Crystal Hub protected source\\n"
-        "local _c={\\n"
-        f"{lua_parts}\\n"
-        "}\\n"
-        "local _s=table.concat(_c)\\n"
-        "local _f=loadstring or load\\n"
-        "if type(_f)~=\"function\" then error(\"loadstring unavailable\") end\\n"
-        "local _x=_f(_s)\\n"
-        "if type(_x)~=\"function\" then error(\"source compile failed\") end\\n"
-        "_x()\\n"
-    )
+
+def add_key_gate_before_obfuscation(source: str, script_name: str) -> str:
+    """Wrap source with Crystal Hub key/HWID validation before the payload runs."""
+    app_url = os.getenv("RENDER_EXTERNAL_URL", "https://discord-bot-3u9m.onrender.com").rstrip("/")
+    script_name_lua = json.dumps(str(script_name))
+    payload_literal = _lua_long_string(source)
+    return f"""-- Crystal Hub key gate (inserted before obfuscation)
+local _Players = game:GetService("Players")
+local _player = _Players.LocalPlayer
+local _key = rawget(_G, "script_key") or script_key
+if type(_key) ~= "string" or _key == "" then
+    if _player then _player:Kick("key not found") end
+    return
+end
+local _okId, _hwid = pcall(function()
+    return game:GetService("RbxAnalyticsService"):GetClientId()
+end)
+if not _okId or type(_hwid) ~= "string" or _hwid == "" then
+    if _player then _player:Kick("HWID check failed. Please retry.") end
+    return
+end
+local _request = (syn and syn.request) or http_request or request
+if type(_request) ~= "function" then
+    if _player then _player:Kick("Key check unavailable") end
+    return
+end
+local _HttpService = game:GetService("HttpService")
+local _Input = game:GetService("UserInputService")
+local _device = _Input.TouchEnabled and "Mobile" or "PC"
+local _reqOk, _response = pcall(function()
+    return _request({{
+        Url = "{app_url}/hwid/check",
+        Method = "POST",
+        Headers = {{["Content-Type"] = "application/json"}},
+        Body = _HttpService:JSONEncode({{
+            script_name = {script_name_lua},
+            key = _key,
+            hwid = _hwid,
+            device = _device
+        }})
+    }})
+end)
+if not _reqOk or type(_response) ~= "table" then
+    if _player then _player:Kick("Key authorization failed") end
+    return
+end
+local _status = tonumber(_response.StatusCode or _response.Status or 0)
+local _body = tostring(_response.Body or "")
+if _status ~= 200 then
+    if _player then
+        if string.find(string.lower(_body), "you need to reset hwid", 1, true) then
+            _player:Kick("you need to reset hwid")
+        elseif string.find(string.lower(_body), "invalid key", 1, true) then
+            _player:Kick("key not found")
+        else
+            _player:Kick("Key authorization failed")
+        end
+    end
+    return
+end
+local _payload = {payload_literal}
+local _loader = loadstring or load
+if type(_loader) ~= "function" then error("loadstring unavailable") end
+local _compiled, _compileError = _loader(_payload)
+if type(_compiled) ~= "function" then error("source compile failed: " .. tostring(_compileError)) end
+_compiled()
+"""
+
+
+async def obfuscate_lua_source(source: str, script_name: str = "") -> str:
+    """Add Crystal Hub's key gate, then use the site's browser-only Lua obfuscator."""
+    source = str(source or "")
+    if not source.strip():
+        raise ValueError("The uploaded Lua source is empty.")
+    if not str(script_name).strip():
+        raise ValueError("Script name is required to add the key gate before obfuscation.")
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "Playwright is missing. Add 'playwright' to requirements.txt and install Chromium "
+            "in the Render build command before using this obfuscator."
+        ) from exc
+
+    # The selected site processes code in the browser and does not advertise a public API.
+    # Add Crystal Hub's key/HWID gate BEFORE putting the source into the browser tool.
+    prepared_source = add_key_gate_before_obfuscation(source, script_name)
+    tool_url = "https://obfuscatortools.com/tools/lua-obfuscator.php"
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox"])
+        try:
+            page = await browser.new_page()
+            await page.goto(tool_url, wait_until="domcontentloaded", timeout=60000)
+            await page.locator("textarea").first.wait_for(state="visible", timeout=30000)
+
+            # The site has separate source and output text areas. Fail clearly if its UI changes.
+            textareas = page.locator("textarea")
+            count = await textareas.count()
+            if count < 2:
+                raise RuntimeError(
+                    "The obfuscator page layout changed (expected source and output text areas); "
+                    "no result was saved."
+                )
+
+            # Ensure the site's own optional banner is disabled; Crystal Hub adds its own label.
+            try:
+                header_label = page.get_by_text("Add Protection Header", exact=False).first
+                if await header_label.count():
+                    checkbox = header_label.locator("input[type=checkbox]")
+                    if await checkbox.count() and await checkbox.is_checked():
+                        await checkbox.uncheck()
+            except Exception:
+                # The checkbox may be wrapped differently; the output is still branded below.
+                pass
+
+            await textareas.nth(0).fill(prepared_source, timeout=30000)
+            button = page.get_by_role("button", name=re.compile(r"Obfuscate Lua Script", re.I))
+            if await button.count() == 0:
+                button = page.get_by_text("Obfuscate Lua Script", exact=False).last
+            await button.click(timeout=30000)
+
+            # Wait until the output field contains transformed source, not the input itself.
+            await page.wait_for_function(
+                """(original) => {
+                    const fields = document.querySelectorAll('textarea');
+                    return fields.length >= 2 && fields[1].value.trim().length > 0 &&
+                           fields[1].value.trim() !== original.trim();
+                }""",
+                arg=prepared_source,
+                timeout=90000,
+            )
+            output = (await textareas.nth(1).input_value()).strip()
+            if not output or output == prepared_source.strip():
+                raise RuntimeError("The website did not return transformed Lua source.")
+
+            # Remove an optional third-party protection banner if the tool inserted one.
+            output = re.sub(
+                r"^\s*--[^\n]*(?:obfuscatortools|lua obfuscator)[^\n]*\n",
+                "",
+                output,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            return "--[[ Protected by Crystal Hub ]]\n" + output.lstrip()
+        finally:
+            await browser.close()
 
 
 def _iso_now():
@@ -2194,11 +2321,11 @@ class SourceObfuscationView(discord.ui.View):
         # Prepare and validate the output before saving or announcing success.
         try:
             if obfuscate:
-                final_source = obfuscate_lua_source(self.file_content)
+                final_source = await obfuscate_lua_source(self.file_content, self.script)
                 if not isinstance(final_source, str) or not final_source.strip():
                     raise ValueError("Obfuscator returned an empty output.")
-                if "local _s=table.concat(_c)" not in final_source or "source compile failed" not in final_source:
-                    raise ValueError("Obfuscator output failed its structural validation.")
+                if len(final_source.strip()) < 100 or final_source.strip() == self.file_content.strip():
+                    raise ValueError("Obfuscator output failed its basic validation.")
             else:
                 final_source = self.file_content
                 if not final_source.strip():
@@ -2237,25 +2364,22 @@ class SourceObfuscationView(discord.ui.View):
 
         mode_text = "obfuscated/protected" if obfuscate else "normal (not obfuscated)"
         if obfuscate:
-            # Deliver the encrypted/protected result in the command channel, never by DM.
+            # The protected source is saved first, then share the existing Crystal Hub hosted loader URL.
             try:
-                download_name = os.path.basename(self.filename or f"{self.script}.lua")
-                if not download_name.lower().endswith(".lua"):
-                    download_name += ".lua"
-                result_file = discord.File(
-                    io.BytesIO(final_source.encode("utf-8")),
-                    filename=download_name,
-                )
+                hosted_url = file_public_url(ensure_file_id(self.script, s_info))
                 if interaction.channel is None or not hasattr(interaction.channel, "send"):
-                    raise RuntimeError("The command channel cannot receive file uploads.")
+                    raise RuntimeError("The command channel cannot receive the hosted link.")
                 await interaction.channel.send(
-                    content=f"🔐 Obfuscated script for {interaction.user.mention} — `{self.script}`",
-                    file=result_file,
+                    content=(
+                        f"🔐 **Crystal Hub protected script is ready** for {interaction.user.mention} — `{self.script}`\n"
+                        f"🔗 Hosted script link: {hosted_url}\n"
+                        "Use the link in your supported script executor. Opening it in a normal browser may show an access-denied page."
+                    ),
                     allowed_mentions=discord.AllowedMentions(users=True),
                 )
             except Exception as exc:
                 await interaction.response.edit_message(
-                    content=f"❌ Obfuscation completed and saved, but sending the result to this channel failed: `{type(exc).__name__}: {str(exc)[:700]}`.{owner_dm_note}",
+                    content=f"❌ Obfuscation completed and saved, but sending the hosted link failed: `{type(exc).__name__}: {str(exc)[:700]}`.{owner_dm_note}",
                     view=self,
                 )
                 return
@@ -2715,12 +2839,187 @@ def _parse_massage_target(guild: discord.Guild, target: str):
     return None
 
 
+
+def _crystal_faq_kind(content: str):
+    """Match common English/Arabic phrasings to FAQ topics without requiring exact wording."""
+    text = re.sub(r"[^\w\s]", " ", (content or "").lower(), flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text or text.startswith(("/", "-", "!")):
+        return None
+
+    # Keep commands and very short unrelated messages out of the FAQ matcher.
+    words = set(text.split())
+
+    free_terms = (
+        "free", "freebie", "pricing", "price", "prices", "cost", "costs",
+        "subscription", "subscriptions", "plan", "plans", "paid", "premium",
+        "مجاني", "مجانية", "مجانا", "ببلاش", "فلوس", "السعر", "اسعار",
+        "أسعار", "بكم", "كم السعر", "اشتراك", "مدفوع", "مدفوعة", "بريميوم"
+    )
+    crystal_terms = ("crystal", "hub", "bot", "كريستال", "كريستل", "كريستال هب", "البوت")
+    free_question = (
+        ("free" in words or any(x in text for x in free_terms))
+        and (any(x in text for x in crystal_terms) or len(words) >= 2)
+    )
+    if free_question:
+        return "plans"
+
+    script_terms = (
+        "script", "scripts", "panel", "panels", "feature", "features",
+        "available", "list", "what does", "what do", "which", "show me",
+        "سكربت", "سكربتات", "السكربت", "السكربتات", "بانل", "بانلات",
+        "لوحة", "لوحات", "مميزات", "المميزات", "ميزات", "وش يسوي",
+        "وش تسوي", "ايش يسوي", "ايش تسوي", "وش عندكم", "المتوفر",
+        "الموجود", "وظيفة", "وظيفته", "وظيفتها", "شرح"
+    )
+    if any(term in text for term in script_terms):
+        # Avoid interpreting a simple question about free pricing as a script list.
+        if not free_question:
+            return "scripts"
+
+    start_terms = (
+        "how to start", "how do i use", "how to use", "getting started",
+        "how can i use", "setup", "set up", "start using", "help me start",
+        "كيف استخدم", "كيف أستخدم", "كيف استعمل", "كيف ابدأ", "كيف أبدأ",
+        "طريقة الاستخدام", "كيف اشغل", "كيف أشغل", "كيف افعل", "كيف أفعل",
+        "شرح الاستخدام", "ابدأ من وين", "من وين ابدأ"
+    )
+    if any(term in text for term in start_terms):
+        return "start"
+
+    # Generic intent patterns: match natural variations such as "do I have to pay?"
+    if any(term in text for term in ("do i have to pay", "have to pay", "need to pay",
+                                     "is there a free", "got a free", "any free",
+                                     "is there premium", "is premium", "what plans",
+                                     "في مجاني", "فيه مجاني", "لازم ادفع", "لازم أدفع",
+                                     "هل ادفع", "هل أدفع", "عندكم مجاني", "في اشتراك",
+                                     "فيه اشتراك", "وش الباقات", "ايش الباقات")):
+        return "plans"
+
+    return None
+
+
+def _crystal_faq_embed(kind: str):
+    """Build factual FAQ answers from the bot's current configured limits/scripts."""
+    if kind == "plans":
+        # The caller's message language determines the response language.
+        # This state is set by the message handler immediately before building the embed.
+        is_arabic = bool(getattr(_crystal_faq_embed, "_reply_arabic", False))
+        if is_arabic:
+            title = "Crystal Hub — الخطط والحدود"
+            description = (
+                "إيه، فيه خطة **مجانية** في Crystal Hub، وتقدر ترقي إذا احتجت حدودًا أعلى.\n\n"
+                "**الخطة المجانية**\n"
+                "• حتى **5 سكربتات نشطة**\n"
+                "• حتى **5 لوحات نشطة**\n"
+                "• **20 عملية مصدر شهريًا**\n"
+                "• حتى **100 مفتاح/مكان Whitelist نشط**\n"
+                "• تغييرات الأفاتار غير مشمولة ضمن حد الخطة المجانية\n\n"
+                "**خطة Premium**\n"
+                "• حتى **10 سكربتات نشطة**\n"
+                "• حتى **10 لوحات نشطة**\n"
+                "• **100 عملية مصدر شهريًا**\n"
+                "• حتى **1,000 مفتاح/مكان Whitelist نشط**\n"
+                "• **5 تغييرات أفاتار شهريًا**\n\n"
+                "**Ultra / Admin**\n"
+                "• حدود الاستخدام لهذه الخطط غير محدودة حسب إعدادات البوت الحالية.\n\n"
+                "للسعر الحالي وطريقة الترقية، اسأل فريق الإدارة؛ البوت لا يخمّن الأسعار."
+            )
+            footer = "الحدود المعروضة مأخوذة من إعدادات البوت الحالية."
+        else:
+            title = "Crystal Hub — Plans & Limits"
+            description = (
+                "Yes! **Crystal Hub has a Free plan**. You can start for free, "
+                "and upgrade if you need higher limits.\n\n"
+                "**Free plan**\n"
+                "• Up to **5 active scripts**\n"
+                "• Up to **5 active panels**\n"
+                "• **20 source operations per month**\n"
+                "• Up to **100 active keys/whitelist slots**\n"
+                "• Avatar changes are not included in the Free quota\n\n"
+                "**Premium plan**\n"
+                "• Up to **10 active scripts**\n"
+                "• Up to **10 active panels**\n"
+                "• **100 source operations per month**\n"
+                "• Up to **1,000 active keys/whitelist slots**\n"
+                "• **5 avatar changes per month**\n\n"
+                "**Ultra / Admin**\n"
+                "• The current bot quota logic treats these plans as unlimited.\n\n"
+                "For current prices and upgrade availability, please ask a server staff member; "
+                "this bot FAQ does not assume a price."
+            )
+            footer = "Limits shown are the bot's current configured quotas."
+        embed = discord.Embed(title=title, color=0x5865F2, description=description)
+        embed.set_footer(text=footer)
+        return embed
+
+    if kind == "scripts":
+        embed = discord.Embed(
+            title="Crystal Hub — Available Scripts",
+            color=0x5865F2,
+            description=(
+                "Here are the scripts currently configured in Crystal Hub. "
+                "Descriptions are shown only when staff have added them."
+            )
+        )
+        listed = 0
+        for name, info in list(scripts_data.items())[:20]:
+            if not isinstance(info, dict):
+                continue
+            description = str(
+                info.get("panel_description")
+                or info.get("description")
+                or info.get("script_description")
+                or ""
+            ).strip()
+            panel_name = str(info.get("panel_name") or name).strip()
+            value = description[:900] if description else (
+                "No description has been added yet. Please ask staff for details."
+            )
+            embed.add_field(name=panel_name[:256], value=value, inline=False)
+            listed += 1
+
+        if listed == 0:
+            embed.description = (
+                "There are no scripts configured in the bot right now, "
+                "or none are available to display. Please ask staff for the current list."
+            )
+        elif len(scripts_data) > 20:
+            embed.set_footer(text="Showing the first 20 configured scripts.")
+        return embed
+
+    if kind == "start":
+        return discord.Embed(
+            title="Crystal Hub — Getting Started",
+            color=0x5865F2,
+            description=(
+                "1. Check the server's script/panel information and choose the feature you need.\n"
+                "2. Use the relevant panel buttons to redeem your key or request access.\n"
+                "3. Follow the script's instructions and keep your key private.\n"
+                "4. If you see an HWID/device error, use the panel's Reset HWID option if available, "
+                "or contact staff.\n\n"
+                "If you need exact instructions for a specific script, ask staff for its description."
+            )
+        )
+    return None
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
     content = message.content.strip()
+
+    # Answer common Crystal Hub questions automatically, while leaving commands untouched.
+    faq_kind = _crystal_faq_kind(content)
+    if faq_kind:
+        # Reply in Arabic when the question contains Arabic letters; otherwise use English.
+        _crystal_faq_embed._reply_arabic = bool(re.search(r"[\u0600-\u06FF]", content))
+        faq_embed = _crystal_faq_embed(faq_kind)
+        if faq_embed is not None:
+            await message.reply(embed=faq_embed, mention_author=False)
+            return
     if content.lower().startswith("-createcode"):
         if not is_code_creator(message.author):
             await message.reply("❌ Only **admi111** can create Crystal Hub plan codes.")
