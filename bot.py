@@ -3801,6 +3801,93 @@ async def revoke_redeem_code_command(interaction: discord.Interaction, code: str
     _save_json_dict(SITE_CODES_FILE, site_redeem_codes)
     await interaction.response.send_message("✅ Redeem code revoked.", ephemeral=True)
 
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    """Answer messages in configured AI channels and forward unknown questions to staff."""
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+
+    try:
+        if message.guild is not None and message.channel.id in AI_CHAT_CHANNELS:
+            content = (message.content or "").strip()
+            if content and not content.startswith(("/", "-", "!")):
+                now = asyncio.get_running_loop().time()
+                last = _ai_last_reply_by_user.get(message.author.id, 0)
+                if now - last >= 2:
+                    _ai_last_reply_by_user[message.author.id] = now
+                    saved_item, score = _find_saved_answer(content)
+                    if saved_item:
+                        await message.reply(str(saved_item["answer"])[:1900], mention_author=False)
+                    else:
+                        faq_kind = _crystal_faq_kind(content)
+                        if faq_kind:
+                            _crystal_faq_embed._reply_arabic = bool(
+                                re.search(r"[\u0600-\u06FF]", content)
+                            )
+                            embed = _crystal_faq_embed(faq_kind)
+                            if embed is not None:
+                                await message.reply(embed=embed, mention_author=False)
+                        else:
+                            history = _AI_CHAT_HISTORY.setdefault(message.channel.id, [])
+                            answer = await _crystal_ai_answer(content, history=history)
+                            history.append({"role": "user", "content": content[:1000]})
+                            if answer:
+                                history.append({"role": "assistant", "content": answer[:1500]})
+                                del history[:-12]
+                                await message.reply(answer[:1900], mention_author=False)
+                            elif AI_QUESTION_CHANNEL_ID:
+                                staff_channel = bot.get_channel(AI_QUESTION_CHANNEL_ID)
+                                if staff_channel is None:
+                                    try:
+                                        staff_channel = await bot.fetch_channel(AI_QUESTION_CHANNEL_ID)
+                                    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                                        print(f"Could not access AI question channel: {type(exc).__name__}: {exc}")
+                                        staff_channel = None
+
+                                if staff_channel is not None:
+                                    question_embed = discord.Embed(
+                                        title="New unanswered AI question",
+                                        description=content[:3500],
+                                        color=discord.Color.orange(),
+                                    )
+                                    question_embed.add_field(
+                                        name="Asked by",
+                                        value=f"{message.author.mention} (`{message.author.id}`)",
+                                        inline=False,
+                                    )
+                                    question_embed.add_field(
+                                        name="Source channel",
+                                        value=f"{message.channel.mention}",
+                                        inline=False,
+                                    )
+                                    await staff_channel.send(
+                                        embed=question_embed,
+                                        view=AIQuestionReviewView(content[:1000]),
+                                        allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
+                                    )
+                                    await message.reply(
+                                        "ما عندي إجابة محفوظة لهذا السؤال، أرسلته لفريق الدعم عشان يضيفون الإجابة.",
+                                        mention_author=False,
+                                    )
+                                else:
+                                    await message.reply(
+                                        "ما قدرت أجاوب، وقناة الأسئلة غير متاحة حاليًا. تأكد من إعداد `/ai-bot` وصلاحيات البوت.",
+                                        mention_author=False,
+                                    )
+                            else:
+                                await message.reply(
+                                    "ما عندي إجابة لهذا السؤال حتى الآن. تأكد من اختيار Questions Channel في `/ai-bot`.",
+                                    mention_author=False,
+                                )
+    except Exception as exc:
+        print(f"AI message handler failed: {type(exc).__name__}: {exc}")
+
+    await bot.process_commands(message)
+
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
     bot.run(TOKEN)
