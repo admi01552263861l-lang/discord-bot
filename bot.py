@@ -140,7 +140,7 @@ discord_plan_codes = _load_json_dict(DISCORD_PLAN_CODES_FILE)
 discord_plan_entitlements = _load_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE)
 monthly_usage = _load_json_dict(MONTHLY_USAGE_FILE)
 FREE_LIMITS = {"scripts": 5, "panels": 5, "sources": 20, "keys": 100, "avatars": 0}
-PREMIUM_LIMITS = {"scripts": 15, "panels": 15, "sources": 100, "keys": None, "avatars": 5}
+PREMIUM_LIMITS = {"scripts": 10, "panels": 10, "sources": 100, "keys": 1000, "avatars": 5}
 
 def _month_key():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
@@ -170,6 +170,32 @@ def _quota_check(user_id, category):
         return True, None
 
     # Scripts/panels are active inventory limits. Deleting an item frees a slot.
+    # "keys" is one shared active pool: a generated key OR a whitelist grant
+    # consumes exactly one slot. Deleting the key frees that slot.
+    if category == "keys":
+        owned_keys = 0
+        for s_info in scripts_data.values():
+            for key, meta in (s_info.get("key_meta") or {}).items():
+                if not isinstance(meta, dict):
+                    continue
+                if str(meta.get("created_by", "")) != str(user_id):
+                    continue
+                if key not in s_info.get("valid_keys", set()):
+                    continue
+                if meta.get("disabled"):
+                    continue
+                expires_at = meta.get("expires_at")
+                if expires_at:
+                    try:
+                        if datetime.datetime.fromisoformat(expires_at) <= datetime.datetime.now(datetime.timezone.utc):
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                owned_keys += 1
+        if owned_keys >= limit:
+            return False, f"{plan} key/whitelist limit reached: {limit} active slots. Delete a key to free a slot."
+        return True, None
+
     if category == "scripts":
         owned = sum(1 for item in scripts_data.values()
                     if str(item.get("created_by", "")) == str(user_id))
@@ -210,7 +236,7 @@ def _quota_status(user_id):
     rec = monthly_usage.setdefault(str(user_id), {})
     if rec.get("month") != _month_key():
         rec = {"month": _month_key()}
-    names = {"scripts": "active scripts", "panels": "active panels", "sources": "sources this month", "keys": "keys this month", "avatars": "avatar changes this month"}
+    names = {"scripts": "active scripts", "panels": "active panels", "sources": "sources this month", "keys": "active keys/whitelists", "avatars": "avatar changes this month"}
     active_scripts = sum(1 for item in scripts_data.values() if str(item.get("created_by", "")) == str(user_id))
     active_panels = sum(1 for item in scripts_data.values()
                         if str(item.get("panel_created_by", item.get("created_by", ""))) == str(user_id)
@@ -870,6 +896,39 @@ def _utcnow():
     return datetime.datetime.now(datetime.timezone.utc)
 
 
+def obfuscate_lua_source(source: str) -> str:
+    """Wrap Lua source as decimal byte escapes so the hosted source is not readable."""
+    raw = source.encode("utf-8")
+    chunks = []
+    current = []
+    # Lua decimal escapes are safest when kept at <= 3 digits each.
+    for byte in raw:
+        current.append(f"\\{byte:03d}")
+        if len(current) >= 80:
+            chunks.append("".join(current))
+            current = []
+    if current:
+        chunks.append("".join(current))
+
+    encoded = "".join(chunks)
+    # A split string makes the result less visually obvious and avoids huge
+    # single-line literals for larger scripts.
+    pieces = [encoded[i:i + 2400] for i in range(0, len(encoded), 2400)]
+    lua_parts = ",\n".join(f'    "{piece}"' for piece in pieces) or '    ""'
+    return (
+        "-- Crystal Hub protected source\\n"
+        "local _c={\\n"
+        f"{lua_parts}\\n"
+        "}\\n"
+        "local _s=table.concat(_c)\\n"
+        "local _f=loadstring or load\\n"
+        "if type(_f)~=\"function\" then error(\"loadstring unavailable\") end\\n"
+        "local _x=_f(_s)\\n"
+        "if type(_x)~=\"function\" then error(\"source compile failed\") end\\n"
+        "_x()\\n"
+    )
+
+
 def _iso_now():
     return _utcnow().isoformat()
 
@@ -987,7 +1046,13 @@ def user_access_ok(s_info: dict, user_id: int) -> tuple:
     return False, "Access Denied! You must be whitelisted by an admin or redeem a valid key first.", None
 
 
-def register_key(s_info: dict, key: str, mode: str = "PERM", expires_at: Optional[str] = None):
+def register_key(
+    s_info: dict,
+    key: str,
+    mode: str = "PERM",
+    expires_at: Optional[str] = None,
+    created_by: Optional[int] = None,
+):
     s_info.setdefault("valid_keys", set()).add(key)
     meta = s_info.setdefault("key_meta", {})
     meta[key] = {
@@ -995,10 +1060,19 @@ def register_key(s_info: dict, key: str, mode: str = "PERM", expires_at: Optiona
         "expires_at": expires_at,
         "disabled": False,
         "created_at": _iso_now(),
+        "created_by": int(created_by) if created_by is not None else None,
+        "kind": "key",
     }
 
 
-def grant_user_access(s_info: dict, user_id: int, key: str, mode: str = "PERM", expires_at: Optional[str] = None):
+def grant_user_access(
+    s_info: dict,
+    user_id: int,
+    key: str,
+    mode: str = "PERM",
+    expires_at: Optional[str] = None,
+    created_by: Optional[int] = None,
+):
     uid = int(user_id)
     s_info.setdefault("whitelisted_users", set()).add(uid)
     s_info.setdefault("user_keys", {})[uid] = key
@@ -1008,7 +1082,7 @@ def grant_user_access(s_info: dict, user_id: int, key: str, mode: str = "PERM", 
         "expires_at": expires_at,
         "granted_at": _iso_now(),
     }
-    register_key(s_info, key, mode, expires_at)
+    register_key(s_info, key, mode, expires_at, created_by=created_by)
 
 
 async def script_autocomplete(
@@ -1533,7 +1607,7 @@ async def generate_key_command(
         await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
         return
     new_key = generate_random_key()
-    register_key(scripts_data[script], new_key, mode, expires_at)
+    register_key(scripts_data[script], new_key, mode, expires_at, created_by=interaction.user.id)
     save_data()
     _quota_increment(interaction.user.id, "keys")
     when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
@@ -1573,7 +1647,7 @@ async def key_command(
         await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
         return
     new_key = generate_random_key()
-    register_key(scripts_data[script], new_key, mode, expires_at)
+    register_key(scripts_data[script], new_key, mode, expires_at, created_by=interaction.user.id)
     save_data()
     _quota_increment(interaction.user.id, "keys")
     when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
@@ -1616,7 +1690,7 @@ async def whitelist_command(
         return
     s_info = scripts_data[script]
     new_key = generate_random_key()
-    grant_user_access(s_info, user.id, new_key, mode, expires_at)
+    grant_user_access(s_info, user.id, new_key, mode, expires_at, created_by=interaction.user.id)
     save_data()
     _quota_increment(interaction.user.id, "keys")
     if s_info.get("buyer_role_id"):
@@ -1672,7 +1746,7 @@ async def whilst_command(
         return
     s_info = scripts_data[script]
     new_key_val = generate_random_key()
-    grant_user_access(s_info, user.id, new_key_val, mode, expires_at)
+    grant_user_access(s_info, user.id, new_key_val, mode, expires_at, created_by=interaction.user.id)
     save_data()
     _quota_increment(interaction.user.id, "keys")
     if s_info.get("buyer_role_id"):
@@ -1694,6 +1768,172 @@ async def whilst_command(
     except Exception:
         dm_status = "Could not send DM (user DMs closed)."
     await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}` ({when})! ({dm_status})", ephemeral=True)
+
+
+
+@bot.tree.command(name="see-keys", description="Show your active keys and whitelist grants")
+@app_commands.describe(script="Optional script to filter by")
+@app_commands.autocomplete(script=script_autocomplete)
+async def see_keys_command(interaction: discord.Interaction, script: str = None):
+    if script and script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        return
+
+    # Only show keys created by this user, grouped by the whitelisted person.
+    # Unassigned/generated keys are shown separately.
+    grouped = {}
+    unassigned = []
+    total = 0
+
+    selected = {script: scripts_data[script]} if script else scripts_data
+    for script_name, s_info in selected.items():
+        meta_map = s_info.get("key_meta") or {}
+        valid = s_info.get("valid_keys", set())
+        user_keys = s_info.get("user_keys", {}) or {}
+
+        for key in list(valid):
+            meta = meta_map.get(key, {})
+            if not isinstance(meta, dict):
+                meta = {}
+            if str(meta.get("created_by", "")) != str(interaction.user.id):
+                continue
+            if meta.get("disabled"):
+                continue
+
+            expires_at = meta.get("expires_at")
+            if expires_at:
+                try:
+                    if datetime.datetime.fromisoformat(expires_at) <= datetime.datetime.now(datetime.timezone.utc):
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            total += 1
+            owner_id = None
+            for uid, user_key in user_keys.items():
+                if user_key == key:
+                    owner_id = int(uid)
+                    break
+
+            mode = str(meta.get("mode", "PERM"))
+            when = "PERM"
+            if expires_at:
+                when = f"expires {format_remaining(expires_at)}"
+
+            entry = f"**{script_name}** — `{key}` ({mode}, {when})"
+            if owner_id is not None:
+                grouped.setdefault(owner_id, []).append(entry)
+            else:
+                unassigned.append(entry)
+
+    if total == 0:
+        msg = "🔑 You currently have no active keys or whitelist grants."
+    else:
+        chunks = [f"🔑 **Your Keys / Whitelist ({total})**"]
+        for uid, entries in grouped.items():
+            chunks.append(f"\n👤 <@{uid}>")
+            chunks.extend(f"  {entry}" for entry in entries)
+        if unassigned:
+            chunks.append("\n📌 **Generated Keys**")
+            chunks.extend(f"  {entry}" for entry in unassigned)
+        chunks.append("\nUse `/delete-key` to delete any key.")
+        chunks.append("Use `/unwhitelist` to remove a whitelist.")
+        msg = "\n".join(chunks)
+
+    # Discord message limit protection.
+    if len(msg) > 1900:
+        msg = msg[:1870] + "\n…\nUse `/see-keys script:<name>` to filter."
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="delete-key", description="Delete one of your active keys")
+@app_commands.describe(key="The exact key to delete")
+async def delete_key_command(interaction: discord.Interaction, key: str):
+    key = key.strip()
+    found = False
+    for script_name, s_info in scripts_data.items():
+        meta_map = s_info.get("key_meta") or {}
+        meta = meta_map.get(key)
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("created_by", "")) != str(interaction.user.id) and not is_admin_or_has_role(interaction, script_name):
+            continue
+
+        if key not in s_info.get("valid_keys", set()):
+            continue
+
+        s_info["valid_keys"].discard(key)
+        s_info.setdefault("key_meta", {}).pop(key, None)
+
+        # Remove any whitelist/access entry tied to this key.
+        for uid, user_key in list(s_info.get("user_keys", {}).items()):
+            if user_key == key:
+                s_info["user_keys"].pop(uid, None)
+                s_info.get("whitelisted_users", set()).discard(uid)
+                s_info.get("user_access", {}).pop(uid, None)
+
+        hwid_bindings.pop(key, None)
+        found = True
+        save_data()
+        save_hwid_bindings()
+        await interaction.response.send_message(
+            f"🗑️ Key `{key}` was deleted from `{script_name}`. The key/whitelist slot is free again.",
+            ephemeral=True
+        )
+        return
+
+    if not found:
+        await interaction.response.send_message(
+            "❌ Key not found, or you do not have permission to delete it.",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="unwhitelist", description="Remove a user from a script whitelist")
+@app_commands.describe(user="The whitelisted member", script="Target script")
+@app_commands.autocomplete(script=script_autocomplete)
+async def unwhitelist_command(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    script: str,
+):
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        return
+    if not is_admin_or_has_role(interaction, script):
+        await interaction.response.send_message(
+            "❌ You need the **Admin Editor** role (or script admin role) to remove whitelist access.",
+            ephemeral=True
+        )
+        return
+
+    s_info = scripts_data[script]
+    uid = int(user.id)
+    old_key = s_info.get("user_keys", {}).get(uid)
+    if uid not in s_info.get("whitelisted_users", set()) and not old_key:
+        await interaction.response.send_message(
+            f"❌ {user.mention} is not whitelisted for `{script}`.",
+            ephemeral=True
+        )
+        return
+
+    s_info.get("whitelisted_users", set()).discard(uid)
+    s_info.get("user_keys", {}).pop(uid, None)
+    s_info.get("user_access", {}).pop(uid, None)
+
+    # A whitelist grant owns its generated key, so remove that key too and free the shared slot.
+    if old_key:
+        s_info.get("valid_keys", set()).discard(old_key)
+        s_info.get("key_meta", {}).pop(old_key, None)
+        hwid_bindings.pop(old_key, None)
+
+    save_data()
+    save_hwid_bindings()
+    await interaction.response.send_message(
+        f"✅ Removed {user.mention} from the whitelist for `{script}`."
+        + (" Their whitelist key was deleted too." if old_key else ""),
+        ephemeral=True
+    )
 
 
 @bot.tree.command(name="trail", description="Enable or disable free Trail access for a script")
@@ -1876,6 +2116,103 @@ async def delete_script_command(interaction: discord.Interaction, script: str):
 
 
 # 4. ربط السورس
+class SourceObfuscationView(discord.ui.View):
+    def __init__(
+        self,
+        owner_id: int,
+        script: str,
+        file_content: str,
+        filename: str,
+        quota_already_checked: bool = False,
+    ):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.script = script
+        self.file_content = file_content
+        self.filename = filename
+        self.quota_already_checked = quota_already_checked
+        self.done = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "❌ Only the person who ran `/source-setup` can choose this option.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _finish(self, interaction: discord.Interaction, obfuscate: bool):
+        if self.done:
+            await interaction.response.send_message("❌ This setup was already completed.", ephemeral=True)
+            return
+
+        self.done = True
+        for child in self.children:
+            child.disabled = True
+
+        # Re-check the monthly source quota at the moment the user confirms.
+        quota_ok, quota_error = _quota_check(self.owner_id, "sources")
+        if not quota_ok:
+            await interaction.response.edit_message(
+                content="❌ " + quota_error,
+                view=self,
+            )
+            return
+
+        final_source = (
+            obfuscate_lua_source(self.file_content)
+            if obfuscate
+            else self.file_content
+        )
+
+        s_info = scripts_data.get(self.script)
+        if not s_info:
+            await interaction.response.edit_message(
+                content="❌ Selected script no longer exists.",
+                view=self,
+            )
+            return
+
+        s_info["source_code"] = final_source
+        s_info["source_obfuscated"] = bool(obfuscate)
+        ensure_file_id(self.script, s_info)
+        save_data()
+        _quota_increment(self.owner_id, "sources")
+
+        # Send the same resulting source file to the command user.
+        try:
+            download_name = self.filename or f"{self.script}.lua"
+            if obfuscate and not download_name.lower().endswith(".lua"):
+                download_name += ".lua"
+            dm_file = discord.File(
+                io.BytesIO(final_source.encode("utf-8")),
+                filename=download_name,
+            )
+            await interaction.user.send(file=dm_file)
+        except Exception as exc:
+            print(f"Source DM failed for user {self.owner_id}: {type(exc).__name__}")
+
+        mode_text = "obfuscated/protected" if obfuscate else "normal (not obfuscated)"
+        await interaction.response.edit_message(
+            content=(
+                f"✅ The file is decoded successfully and attached to the script "
+                f"`{self.script}`.\n"
+                f"🔐 Protection: **{mode_text}**\n\n"
+                f"{_quota_status(self.owner_id)}"
+            ),
+            view=self,
+        )
+
+    @discord.ui.button(label="Yes", emoji="🔐", style=discord.ButtonStyle.success)
+    async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, True)
+
+    @discord.ui.button(label="No", emoji="📄", style=discord.ButtonStyle.secondary)
+    async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, False)
+
+
 @bot.tree.command(name="source-setup", description="Attach source file to a script")
 @app_commands.describe(file="Upload the script file", script="Choose the target script")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -1894,24 +2231,22 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
         return
 
     content_bytes = await file.read()
-    file_content = content_bytes.decode('utf-8', errors='ignore')
-    scripts_data[script]["source_code"] = file_content
-    ensure_file_id(script, scripts_data[script])
-    save_data()
-    _quota_increment(interaction.user.id, "sources")
+    file_content = content_bytes.decode("utf-8", errors="ignore")
 
-    try:
-        dm_file = discord.File(io.BytesIO(content_bytes), filename=file.filename or f"{script}.lua")
-        await interaction.user.send(
-            file=dm_file
-        )
-    except Exception as exc:
-        # Do not expose delivery details in the public channel; report the attachment status privately.
-        print(f"Source DM failed for user {interaction.user.id}: {type(exc).__name__}")
+    view = SourceObfuscationView(
+        owner_id=interaction.user.id,
+        script=script,
+        file_content=file_content,
+        filename=file.filename or f"{script}.lua",
+    )
 
     await interaction.response.send_message(
-        f"✅ The file is decoded successfully and attached to the script `{script}`.",
-        ephemeral=True
+        "🔐 **Do you want to obfuscate/protect the script?**\n"
+        "If you choose **Yes**, the hosted source will be converted into an encoded "
+        "Lua loader so the original code is not shown directly.\n"
+        "If you choose **No**, the source will be stored normally.",
+        view=view,
+        ephemeral=True,
     )
 
 
