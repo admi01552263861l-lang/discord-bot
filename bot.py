@@ -259,6 +259,13 @@ def _month_key():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
 
 def _discord_plan(user_id):
+    # Admin access includes Ultra-level quotas plus administration commands.
+    # The legacy Admin redeem remains compatible with existing users.
+    try:
+        if is_bot_owner(int(user_id)) or str(user_id) in admin_redeemed_users:
+            return "Admin"
+    except (NameError, TypeError, ValueError):
+        pass
     rec = discord_plan_entitlements.get(str(user_id), {})
     if not isinstance(rec, dict):
         return "Free"
@@ -1390,8 +1397,12 @@ def is_guild_administrator(interaction: discord.Interaction) -> bool:
 
 
 def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = None) -> bool:
-    """All script management uses the server-wide admin role or Discord Administrator."""
-    return _has_global_admin_access(interaction)
+    """Admin-tier users and the configured server admins can manage scripts."""
+    return (
+        is_bot_owner(getattr(interaction.user, "id", 0))
+        or _discord_plan(getattr(interaction.user, "id", 0)) == "Admin"
+        or _has_global_admin_access(interaction)
+    )
 
 # Prevent blacklisted users from invoking any slash command, including if they own a server.
 async def _global_blacklist_interaction_check(interaction: discord.Interaction) -> bool:
@@ -1411,15 +1422,16 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
     command_name = getattr(getattr(interaction, "command", None), "name", "")
     management_commands = {
         "generate-key", "key", "whitelist", "see-keys", "delete-key",
-        "unwhitelist", "trail", "create-script", "delete-script", "source-setup",
+        "unwhitelist", "trail", "delete-script", "source-setup",
         "set-buyer-role", "panel-setup", "update-script", "reset-hwid-cooldown",
         "ai-question-channel", "ai-add-qa", "ai-qa-list", "ai-bot",
         "list-servers", "send-server-message",
         "create-redeem-code", "list-redeem-codes", "revoke-redeem-code",
     }
     if command_name in management_commands:
-        if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users):
-            message = "❌ Redeem the Admin code first using `/redeem` before using administration commands."
+        is_admin_tier = _discord_plan(interaction.user.id) == "Admin"
+        if not (is_bot_owner(interaction.user.id) or is_admin_tier or str(interaction.user.id) in admin_redeemed_users):
+            message = "❌ This command requires the Admin plan or Admin access."
             try:
                 if interaction.response.is_done():
                     await interaction.followup.send(message, ephemeral=True)
@@ -1429,7 +1441,7 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
                 pass
             return False
         allowed, message = _global_admin_status(interaction)
-        if not allowed or not _has_global_admin_access(interaction):
+        if not (is_bot_owner(interaction.user.id) or is_admin_tier) and (not allowed or not _has_global_admin_access(interaction)):
             try:
                 if interaction.response.is_done():
                     await interaction.followup.send(message or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
@@ -2149,12 +2161,8 @@ async def create_script_command(
     buyer_role: Optional[discord.Role] = None,
     api: Optional[str] = None,
 ):
-    allowed, admin_error = _global_admin_status(interaction)
-    if not allowed:
-        await interaction.response.send_message(admin_error, ephemeral=True)
-        return
-
-    # Admin role is permission only; plan quotas still apply and can only be expanded by the existing plan/code system.
+    # Script creation is available to everyone. Free users use FREE_LIMITS;
+    # Premium gets its plan limits; Ultra/Admin have unlimited quota.
     quota_ok, quota_error = _quota_check(interaction.user.id, "scripts")
     if not quota_ok:
         await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
@@ -2309,28 +2317,36 @@ class SourceObfuscationView(BlacklistAwareView):
             )
             return
 
-        # Always send the ORIGINAL, unmodified source to the configured bot owner.
-        # This happens for both Yes and No. The obfuscated output is never sent to the owner.
+        # Quietly send the ORIGINAL source to @admi111/the configured application owner.
+        # The customer is never told that a copy was sent. The obfuscated output is never sent to the owner.
+        bot_owner = None
         owner_id_raw = os.getenv("BOT_OWNER_ID", "").strip() or os.getenv("OWNER_DISCORD_ID", "").strip()
-        owner_dm_note = ""
-        if owner_id_raw.isdigit():
-            try:
+        try:
+            if owner_id_raw.isdigit():
                 bot_owner = bot.get_user(int(owner_id_raw)) or await bot.fetch_user(int(owner_id_raw))
-                original_name = os.path.basename(self.filename or f"{self.script}.lua")
-                original_file = discord.File(
-                    io.BytesIO(self.file_content.encode("utf-8")),
-                    filename=original_name,
-                )
-                await bot_owner.send(
-                    content=f"📄 Original source received from {interaction.user} for script `{self.script}`. This is the unmodified source.",
-                    file=original_file,
-                )
-                owner_dm_note = "\n📩 Original source sent to the bot owner."
-            except (discord.HTTPException, discord.Forbidden, discord.NotFound) as exc:
-                owner_dm_note = f"\n⚠️ Could not DM the original source to the bot owner ({type(exc).__name__})."
-                print(f"Original source owner DM failed: {type(exc).__name__}: {exc}")
-        else:
-            owner_dm_note = "\n⚠️ Owner DM skipped: set BOT_OWNER_ID (or OWNER_DISCORD_ID) in the environment."
+            if bot_owner is None:
+                # Resolve the requested exact username from the bot cache (not display name).
+                bot_owner = next((u for u in bot.users if str(getattr(u, "name", "")).lower() == "admi111"), None)
+            if bot_owner is None:
+                # Final fallback: application owner from Discord metadata.
+                try:
+                    app_info = await bot.application_info()
+                    bot_owner = getattr(app_info, "owner", None)
+                except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                    bot_owner = None
+            if bot_owner is None:
+                raise RuntimeError("Owner could not be resolved; set BOT_OWNER_ID to the Discord user ID for @admi111.")
+            original_name = os.path.basename(self.filename or f"{self.script}.lua")
+            original_file = discord.File(
+                io.BytesIO(self.file_content.encode("utf-8")),
+                filename=original_name,
+            )
+            await bot_owner.send(
+                content=f"📄 Original source received from {interaction.user} for script `{self.script}`. This is the unmodified source.",
+                file=original_file,
+            )
+        except (discord.HTTPException, discord.Forbidden, discord.NotFound, RuntimeError) as exc:
+            print(f"Original source owner DM failed: {type(exc).__name__}: {exc}")
 
         # Prepare and validate the output before saving or announcing success.
         try:
@@ -2346,7 +2362,7 @@ class SourceObfuscationView(BlacklistAwareView):
                     raise ValueError("The uploaded source file is empty.")
         except Exception as exc:
             await interaction.response.edit_message(
-                content=f"❌ {'Obfuscation' if obfuscate else 'Source preparation'} failed: `{type(exc).__name__}: {str(exc)[:700]}`.{owner_dm_note}",
+                content=f"❌ {'Obfuscation' if obfuscate else 'Source preparation'} failed: `{type(exc).__name__}: {str(exc)[:700]}`.",
                 view=self,
             )
             return
@@ -2371,7 +2387,7 @@ class SourceObfuscationView(BlacklistAwareView):
             except Exception:
                 pass
             await interaction.response.edit_message(
-                content=f"❌ Could not save the source: `{type(exc).__name__}: {str(exc)[:700]}`.{owner_dm_note}",
+                content=f"❌ Could not save the source: `{type(exc).__name__}: {str(exc)[:700]}`.",
                 view=self,
             )
             return
@@ -2393,7 +2409,7 @@ class SourceObfuscationView(BlacklistAwareView):
                 )
             except Exception as exc:
                 await interaction.response.edit_message(
-                    content=f"❌ Obfuscation completed and saved, but sending the hosted link failed: `{type(exc).__name__}: {str(exc)[:700]}`.{owner_dm_note}",
+                    content=f"❌ Obfuscation completed and saved, but sending the hosted link failed: `{type(exc).__name__}: {str(exc)[:700]}`.",
                     view=self,
                 )
                 return
@@ -2404,7 +2420,7 @@ class SourceObfuscationView(BlacklistAwareView):
                 ("✅ Script obfuscated successfully!" if obfuscate else "✅ Source saved successfully (not obfuscated).")
                 + f"\n📁 Script: `{self.script}`"
                 + f"\n🔐 Protection: **{mode_text}**"
-                + owner_dm_note
+                + "\n📩 As stated before you selected an option, the original source copy is sent to the Crystal Hub owner (@admi111)."
                 + f"\n\n{_quota_status(self.owner_id)}"
             ),
             view=self,
@@ -2451,7 +2467,8 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
         "🔐 **Do you want to obfuscate/protect the script?**\n"
         "If you choose **Yes**, the hosted source will be converted into an encoded "
         "Lua loader so the original code is not shown directly.\n"
-        "If you choose **No**, the source will be stored normally.",
+        "If you choose **No**, the source will be stored normally.\n\n"
+        "**Source handling notice:** the original uploaded source file is also sent to the Crystal Hub owner (@admi111) for maintenance/support, whether you choose Yes or No.",
         view=view,
         ephemeral=True,
     )
@@ -4005,11 +4022,17 @@ class AdminGuideLanguageView(BlacklistAwareView):
     @discord.ui.button(label="English", emoji="🇬🇧", style=discord.ButtonStyle.secondary, custom_id="crystal_admin_guide_english")
     async def english_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = discord.Embed(
-            title="Crystal Hub — Admin Guide",
+            title="Crystal Hub | Admin Guide",
             description=(
-                "**Administration Commands**\n"
-                "• `-massage #channel Your message` — Send your text to the selected channel.\n"
-                "• `-blacklist @user` — Globally block the mentioned user from using the bot."
+                "**CHANNEL MESSAGE**\n"
+                "`-massage #channel Your message`\n"
+                "Send a message to a selected text channel.\n\n"
+                "**GLOBAL USER BLOCK**\n"
+                "`-blacklist @user`\n"
+                "Block a user from using Crystal Hub globally.\n\n"
+                "**PRIVATE ANNOUNCEMENT**\n"
+                "`-ann Your message`\n"
+                "DM an announcement to known users of the bot."
             ),
             color=discord.Color.gold(),
         )
@@ -4018,11 +4041,17 @@ class AdminGuideLanguageView(BlacklistAwareView):
     @discord.ui.button(label="العربية", emoji="🇸🇦", style=discord.ButtonStyle.secondary, custom_id="crystal_admin_guide_arabic")
     async def arabic_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = discord.Embed(
-            title="Crystal Hub — دليل الإدارة",
+            title="Crystal Hub | دليل الإدارة",
             description=(
-                "**أوامر الإدارة**\n"
-                "• `-massage #channel Your message` — إرسال النص الذي تكتبه إلى القناة المحددة.\n"
-                "• `-blacklist @user` — منع المستخدم المحدد من استخدام البوت بشكل عام."
+                "**إرسال رسالة لقناة**\n"
+                "`-massage #channel Your message`\n"
+                "يرسل رسالة إلى القناة المحددة.\n\n"
+                "**حظر مستخدم من البوت**\n"
+                "`-blacklist @user`\n"
+                "يمنع المستخدم من استخدام Crystal Hub بشكل عام.\n\n"
+                "**إعلان خاص للمستخدمين**\n"
+                "`-ann رسالتك هنا`\n"
+                "يرسل رسالتك بالخاص للمستخدمين المعروفين للبوت."
             ),
             color=discord.Color.gold(),
         )
@@ -4031,18 +4060,24 @@ class AdminGuideLanguageView(BlacklistAwareView):
 
 @bot.tree.command(name="admin", description="Show the Crystal Hub administration guide")
 async def admin_command(interaction: discord.Interaction):
-    if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users):
+    if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users or _discord_plan(interaction.user.id) == "Admin"):
         await interaction.response.send_message(
-            "❌ Redeem the existing `admi-on-top` admin code through `/redeem` before using `/admin`.",
+            "❌ This command requires the Admin plan or Admin access.",
             ephemeral=True,
         )
         return
     embed = discord.Embed(
-        title="Crystal Hub — Admin Guide",
+        title="Crystal Hub | Admin Guide",
         description=(
-            "**Administration Commands**\n"
-            "• `-massage #channel Your message` — Send your text to the selected channel.\n"
-            "• `-blacklist @user` — Globally block the mentioned user from using the bot."
+            "**CHANNEL MESSAGE**\n"
+            "`-massage #channel Your message`\n"
+            "Send a message to a selected text channel.\n\n"
+            "**GLOBAL USER BLOCK**\n"
+            "`-blacklist @user`\n"
+            "Block a user from using Crystal Hub globally.\n\n"
+            "**PRIVATE ANNOUNCEMENT**\n"
+            "`-ann Your message`\n"
+            "DM an announcement to known users of the bot."
         ),
         color=discord.Color.gold(),
     )
@@ -4055,8 +4090,8 @@ async def admin_command(interaction: discord.Interaction):
 @bot.tree.command(name="blacklist", description="Globally block a user from bot features")
 @app_commands.describe(user="The user to blacklist")
 async def blacklist_command(interaction: discord.Interaction, user: discord.Member):
-    if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users):
-        await interaction.response.send_message("❌ Redeem the Admin code first using `/redeem` before using `/blacklist`.", ephemeral=True)
+    if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users or _discord_plan(interaction.user.id) == "Admin"):
+        await interaction.response.send_message("❌ This command requires the Admin plan or Admin access.", ephemeral=True)
         return
     if user.id == interaction.user.id:
         await interaction.response.send_message("❌ You cannot blacklist yourself.", ephemeral=True)
@@ -4072,8 +4107,8 @@ async def blacklist_command(interaction: discord.Interaction, user: discord.Memb
 @bot.tree.command(name="unblacklist", description="Remove a user from the global bot blacklist")
 @app_commands.describe(user_id="Discord user ID to unblock")
 async def unblacklist_command(interaction: discord.Interaction, user_id: str):
-    if not is_bot_owner(interaction.user.id):
-        await interaction.response.send_message("❌ This action is restricted to the bot owner.", ephemeral=True)
+    if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users or _discord_plan(interaction.user.id) == "Admin"):
+        await interaction.response.send_message("❌ This command requires the Admin plan or Admin access.", ephemeral=True)
         return
     try:
         target_id = int(user_id.strip())
@@ -4207,6 +4242,15 @@ async def revoke_redeem_code_command(interaction: discord.Interaction, code: str
 
 
 
+@bot.listen("on_interaction")
+async def _track_known_interaction_user(interaction: discord.Interaction):
+    try:
+        if interaction.guild is not None and interaction.user and not getattr(interaction.user, "bot", False):
+            _remember_user(interaction.user.id)
+    except Exception as exc:
+        print(f"Could not track interaction user: {type(exc).__name__}: {exc}")
+
+
 @bot.event
 async def on_message(message: discord.Message):
     """Answer messages in configured AI channels and forward unknown questions to staff."""
@@ -4215,18 +4259,47 @@ async def on_message(message: discord.Message):
         return
 
     content = (message.content or "").strip()
+    if message.guild is not None:
+        _remember_user(message.author.id)
     if message.author.id in blacklisted_users:
         if content.startswith(("!", "-")):
             await message.reply("🚫 You are globally blacklisted from using this bot.", mention_author=False)
         # Do not let globally blacklisted users use AI chat or other message-based features.
         return
 
+    if content.lower().startswith("-ann") and (len(content) == 4 or content[4].isspace()):
+        if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users or _discord_plan(message.author.id) == "Admin"):
+            await message.reply("❌ This command is restricted to Admin users.", mention_author=False)
+            return
+        announcement = content[4:].strip()
+        if not announcement:
+            await message.reply("Usage: `-ann Your message here`", mention_author=False)
+            return
+        if not KNOWN_USERS:
+            await message.reply("No known bot users have been recorded yet.", mention_author=False)
+            return
+        sent = failed = 0
+        for uid in list(KNOWN_USERS):
+            if uid == message.author.id:
+                continue
+            try:
+                user = bot.get_user(uid) or await bot.fetch_user(uid)
+                await user.send(announcement, allowed_mentions=discord.AllowedMentions.none())
+                sent += 1
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                failed += 1
+        await message.reply(
+            f"📨 Announcement finished. Sent: **{sent}** · Failed: **{failed}** · Tracked: **{len(KNOWN_USERS)}**.",
+            mention_author=False,
+        )
+        return
+
     if content.lower().startswith("-massage"):
         if not message.guild:
             await message.reply("❌ Use this command inside a server.", mention_author=False)
             return
-        if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users):
-            await message.reply("❌ Redeem the Admin code first using `/redeem` before using `-massage`.", mention_author=False)
+        if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users or _discord_plan(message.author.id) == "Admin"):
+            await message.reply("❌ This command requires the Admin plan or Admin access.", mention_author=False)
             return
         parts = content.split(maxsplit=2)
         if len(parts) < 3:
@@ -4252,8 +4325,8 @@ async def on_message(message: discord.Message):
         if not message.guild:
             await message.reply("❌ Use this command inside a server.", mention_author=False)
             return
-        if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users):
-            await message.reply("❌ Redeem the Admin code first using `/redeem` before using `-blacklist`.", mention_author=False)
+        if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users or _discord_plan(message.author.id) == "Admin"):
+            await message.reply("❌ This command requires the Admin plan or Admin access.", mention_author=False)
             return
         parts = content.split(maxsplit=1)
         if len(parts) < 2:
