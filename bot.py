@@ -1005,16 +1005,66 @@ async def script_autocomplete(
             choices.append(app_commands.Choice(name=script_name, value=script_name))
     return choices[:25]
 
-def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = None) -> bool:
-    if interaction.user.guild_permissions.administrator:
+# Only this Discord account may generate Premium/Ultra/Admin plan codes.
+CODE_CREATOR_USERNAMES = {"admi111"}
+
+
+def _user_name_matches(user, allowed_names) -> bool:
+    names = {
+        str(getattr(user, "name", "") or "").lower(),
+        str(getattr(user, "global_name", "") or "").lower(),
+        str(getattr(user, "display_name", "") or "").lower(),
+    }
+    allowed = {n.lower() for n in allowed_names}
+    return bool(names & allowed)
+
+
+def is_code_creator(user) -> bool:
+    """Plan code creation (/redeem create_plan, -createcode) — only admi111 (or BOT_OWNER_ID)."""
+    if is_bot_owner(getattr(user, "id", 0)):
         return True
-    if script_name and script_name in scripts_data:
+    return _user_name_matches(user, CODE_CREATOR_USERNAMES)
+
+
+def has_admin_editor_role(interaction: discord.Interaction) -> bool:
+    """Server rank named like 'Admin Editor' can manage whitelist/keys/trail/panels."""
+    member = interaction.user
+    if not interaction.guild or not isinstance(member, discord.Member):
+        return False
+    for role in member.roles:
+        name = " ".join(str(role.name).lower().split())
+        compact = name.replace(" ", "").replace("-", "").replace("_", "")
+        if "admin editor" in name or compact in ("admineditor", "editoradmin"):
+            return True
+    return False
+
+
+def is_guild_administrator(interaction: discord.Interaction) -> bool:
+    """Discord Administrator permission (typical server owner / full admin)."""
+    try:
+        return bool(interaction.user.guild_permissions.administrator)
+    except AttributeError:
+        return False
+
+
+def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = None) -> bool:
+    """Manage scripts: code creator, Admin Editor rank, or script admin role — NOT bare Administrator."""
+    if is_code_creator(interaction.user):
+        return True
+    if has_admin_editor_role(interaction):
+        return True
+    if script_name and script_name in scripts_data and interaction.guild:
         admin_role_id = scripts_data[script_name].get("admin_role_id")
         if admin_role_id:
             role = interaction.guild.get_role(admin_role_id)
-            if role and role in interaction.user.roles:
+            if role and isinstance(interaction.user, discord.Member) and role in interaction.user.roles:
                 return True
     return False
+
+
+def can_set_admin_role(interaction: discord.Interaction) -> bool:
+    """Changing script admin role: code creator or Discord Administrator."""
+    return is_code_creator(interaction.user) or is_guild_administrator(interaction)
 
 # Prevent blacklisted users from invoking any slash command, including if they own a server.
 async def _global_blacklist_interaction_check(interaction: discord.Interaction) -> bool:
@@ -1428,11 +1478,8 @@ async def generate_key_command(
     duration_type: app_commands.Choice[str] = None,
     duration: str = None,
 ):
-    if interaction.user.name != "Admi2853":
-        await interaction.response.send_message("❌ Only the authorized Discord account Admi2853 can generate keys.", ephemeral=True)
-        return
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to generate keys.", ephemeral=True)
         return
     if script not in scripts_data:
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
@@ -1471,11 +1518,8 @@ async def key_command(
     duration_type: app_commands.Choice[str],
     duration: str = None,
 ):
-    if interaction.user.name != "Admi2853":
-        await interaction.response.send_message("❌ Only the authorized Discord account Admi2853 can generate keys.", ephemeral=True)
-        return
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to generate keys.", ephemeral=True)
         return
     if script not in scripts_data:
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
@@ -1516,11 +1560,8 @@ async def whitelist_command(
     duration_type: app_commands.Choice[str] = None,
     duration: str = None,
 ):
-    if interaction.user.name != "Admi2853":
-        await interaction.response.send_message("❌ Only the authorized Discord account Admi2853 can create whitelist keys.", ephemeral=True)
-        return
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to whitelist users.", ephemeral=True)
         return
     if script not in scripts_data:
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
@@ -1575,11 +1616,8 @@ async def whilst_command(
     duration_type: app_commands.Choice[str],
     duration: str = None,
 ):
-    if interaction.user.name != "Admi2853":
-        await interaction.response.send_message("❌ Only the authorized Discord account Admi2853 can create whitelist keys.", ephemeral=True)
-        return
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to whitelist users.", ephemeral=True)
         return
     if script not in scripts_data:
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
@@ -1641,7 +1679,7 @@ async def trail_command(
     duration: str = None,
 ):
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to manage Trail.", ephemeral=True)
         return
     if script not in scripts_data:
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
@@ -1847,8 +1885,8 @@ async def set_buyer_role_command(interaction: discord.Interaction, script: str, 
 @app_commands.describe(script="Choose the script", admin_role="Select the new admin role")
 @app_commands.autocomplete(script=script_autocomplete)
 async def set_admin_role_command(interaction: discord.Interaction, script: str, admin_role: discord.Role):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You must be an administrator to change admin roles.", ephemeral=True)
+    if not can_set_admin_role(interaction):
+        await interaction.response.send_message("❌ You need **Administrator** permission (or be the bot code owner) to change admin roles.", ephemeral=True)
         return
 
     if script not in scripts_data:
@@ -2103,9 +2141,8 @@ async def redeem_command(
 ):
     # Owner/authorized can generate a plan code without redeeming one.
     if create_plan is not None and not (code and str(code).strip()):
-        allowed = interaction.user.name == "Admi2853" or is_bot_owner(interaction.user.id)
-        if not allowed:
-            await interaction.response.send_message("❌ Only the bot owner can generate plan codes.", ephemeral=True)
+        if not is_code_creator(interaction.user):
+            await interaction.response.send_message("❌ Only **admi111** can generate plan codes (create_plan).", ephemeral=True)
             return
         plan = create_plan.value
         if plan == "Admin":
@@ -2231,8 +2268,8 @@ async def on_message(message: discord.Message):
 
     content = message.content.strip()
     if content.lower().startswith("-createcode"):
-        if message.author.name != "Admi2853":
-            await message.reply("❌ Only the authorized Discord account Admi2853 can create Crystal Hub codes.")
+        if not is_code_creator(message.author):
+            await message.reply("❌ Only **admi111** can create Crystal Hub plan codes.")
             return
         if not message.guild or not message.author.guild_permissions.administrator:
             await message.reply("❌ The authorized account must also have server administrator permission to create Crystal Hub codes.")
@@ -2279,8 +2316,8 @@ async def on_message(message: discord.Message):
     if content.lower().startswith("-blacklist"):
         if not message.guild:
             return
-        if message.author.name != "Admi2853":
-            await message.reply("❌ هذا الأمر مخصص لحساب Admi2853 فقط.")
+        if not is_code_creator(message.author):
+            await message.reply("❌ This command is restricted to **admi111**.")
             return
         parts = content.split()
         target_id = None
@@ -2384,8 +2421,8 @@ async def on_message(message: discord.Message):
 
 @bot.tree.command(name="admin", description="Show Crystal Hub admin command guide")
 async def admin_command(interaction: discord.Interaction):
-    if interaction.user.name != "Admi2853" and not is_bot_owner(interaction.user.id):
-        await interaction.response.send_message("❌ هذا الأمر مخصص لمالك البوت.", ephemeral=True)
+    if not is_code_creator(interaction.user):
+        await interaction.response.send_message("❌ This command is restricted to **admi111**.", ephemeral=True)
         return
     guide = (
         "## Crystal Hub — Admin Commands\\n"
@@ -2545,4 +2582,4 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("Error: DISCORD_TOKEN environment variable is missing!")   
+    print("Error: DISCORD_TOKEN environment variable is missing!")  
