@@ -1755,21 +1755,22 @@ class PanelControlView(discord.ui.View):
 
 @bot.event
 async def on_ready():
-    # Global slash-command updates can take a while to appear in Discord.
-    # Also sync the command tree to each joined guild so new commands show up quickly.
+    # Remove old guild-specific copies first; registering the same commands
+    # globally and per-guild made Discord show duplicate slash commands.
+    for guild in bot.guilds:
+        try:
+            bot.tree.clear_commands(guild=guild)
+            await bot.tree.sync(guild=guild)
+            print(f"Cleared old guild-specific slash commands for {guild.id} ({guild.name}).")
+        except Exception as e:
+            print(f"Could not clear old guild commands for {guild.id}: {type(e).__name__}: {e}")
+
+    # Register commands globally only, so each command is listed once.
     try:
         global_synced = await bot.tree.sync()
         print(f"Synced {len(global_synced)} global slash commands successfully.")
     except Exception as e:
         print(f"Error syncing global slash commands: {type(e).__name__}: {e}")
-
-    for guild in bot.guilds:
-        try:
-            bot.tree.copy_global_to(guild=guild)
-            guild_synced = await bot.tree.sync(guild=guild)
-            print(f"Synced {len(guild_synced)} slash commands to guild {guild.id} ({guild.name}).")
-        except Exception as e:
-            print(f"Error syncing slash commands to guild {guild.id} ({guild.name}): {type(e).__name__}: {e}")
 
     print(f"Bot connected successfully as: {bot.user}")
 
@@ -2913,7 +2914,7 @@ def _parse_massage_target(guild: discord.Guild, target: str):
 
 
 
-# AI chat can be enabled/disabled per text channel with /ai-bot.
+# AI chat reply channels and unanswered-question channel are configured with /ai-bot.
 AI_CHANNEL_CONFIG_FILE = "crystal_ai_channel.json"
 AI_CHAT_CHANNELS = set()
 _AI_CHAT_HISTORY = {}
@@ -3499,32 +3500,6 @@ class AIQuestionReviewView(discord.ui.View):
         await interaction.response.send_modal(AIAnswerModal(self.original_question))
 
 
-@bot.tree.command(name="ai-question-channel", description="Choose where unanswered AI questions are sent")
-@app_commands.describe(channel="Channel where the bot will ask staff to provide an answer")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def ai_question_channel_command(interaction: discord.Interaction, channel: discord.TextChannel):
-    global AI_QUESTION_CHANNEL_ID
-    AI_QUESTION_CHANNEL_ID = channel.id
-    _save_ai_question_channel()
-    await interaction.response.send_message(
-        f"Unanswered questions will be sent to {channel.mention}. Staff can press **Add answer** to save the correct answer.",
-        ephemeral=True,
-    )
-
-
-@ai_question_channel_command.error
-async def ai_question_channel_command_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.errors.MissingPermissions):
-        msg = "You need **Manage Server** permission to configure the AI question channel."
-    else:
-        print(f"/ai-question-channel error: {type(error).__name__}: {error}")
-        msg = "Could not configure the question channel. Check bot permissions and logs."
-    if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
-    else:
-        await interaction.response.send_message(msg, ephemeral=True)
-
-
 @bot.tree.command(name="ai-add-qa", description="Add a question and answer to the AI knowledge base")
 @app_commands.describe(question="Question or phrasing to recognize", answer="Correct answer to send")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -3562,28 +3537,72 @@ async def ai_qa_list_command(interaction: discord.Interaction):
     await interaction.response.send_message(f"Saved Q&A entries: **{len(AI_KNOWLEDGE)}**\\n{preview}", ephemeral=True)
 
 
-@bot.tree.command(name="ai-bot", description="Turn AI chat on or off in this channel")
-@app_commands.describe(mode="Turn AI chat on or off in the channel where you run this command")
-@app_commands.choices(mode=[app_commands.Choice(name="On", value="on"), app_commands.Choice(name="Off", value="off")])
+@bot.tree.command(name="ai-bot", description="Set AI reply and unanswered-question channels")
+@app_commands.describe(
+    mode="Turn AI replies on or off",
+    reply_channel="Channel where members can ask the bot and receive replies",
+    questions_channel="Staff channel where unanswered questions are sent",
+)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="On", value="on"),
+    app_commands.Choice(name="Off", value="off"),
+])
 @app_commands.checks.has_permissions(manage_guild=True)
-async def ai_bot_command(interaction: discord.Interaction, mode: app_commands.Choice[str]):
-    if not interaction.guild or not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
-        await interaction.response.send_message("Use this command in a server text channel.", ephemeral=True)
+async def ai_bot_command(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str],
+    reply_channel: Optional[discord.TextChannel] = None,
+    questions_channel: Optional[discord.TextChannel] = None,
+):
+    global AI_QUESTION_CHANNEL_ID
+
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
         return
-    channel_id = interaction.channel_id
+
     if mode.value == "on":
-        AI_CHAT_CHANNELS.add(channel_id)
-        _AI_CHAT_HISTORY[channel_id] = []
+        if reply_channel is None or questions_channel is None:
+            await interaction.response.send_message(
+                "To turn AI on, choose both **Reply Channel** (where members talk to the bot) "
+                "and **Questions Channel** (where unanswered questions are sent to staff).",
+                ephemeral=True,
+            )
+            return
+
+        AI_CHAT_CHANNELS.add(reply_channel.id)
+        _AI_CHAT_HISTORY[reply_channel.id] = []
+        AI_QUESTION_CHANNEL_ID = questions_channel.id
         _save_ai_chat_channels()
+        _save_ai_question_channel()
         await interaction.response.send_message(
-            f"AI chat is now **ON** in {interaction.channel.mention}. You can chat normally in this channel and the bot will reply. Run `/ai-bot` with **Off** here to stop it.",
+            f"AI replies are now **ON** in {reply_channel.mention}. "
+            f"Unanswered questions will be sent to {questions_channel.mention}.",
             ephemeral=True,
         )
     else:
-        AI_CHAT_CHANNELS.discard(channel_id)
-        _AI_CHAT_HISTORY.pop(channel_id, None)
-        _save_ai_chat_channels()
-        await interaction.response.send_message(f"AI chat is now **OFF** in {interaction.channel.mention}.", ephemeral=True)
+        target_channel = reply_channel
+        if target_channel is None and isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+            target_channel = interaction.channel
+
+        if target_channel is not None:
+            AI_CHAT_CHANNELS.discard(target_channel.id)
+            _AI_CHAT_HISTORY.pop(target_channel.id, None)
+            _save_ai_chat_channels()
+
+        if questions_channel is not None:
+            AI_QUESTION_CHANNEL_ID = questions_channel.id
+            _save_ai_question_channel()
+
+        if target_channel is not None:
+            await interaction.response.send_message(
+                f"AI replies are now **OFF** in {target_channel.mention}.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "Choose a Reply Channel to turn AI off in that channel.",
+                ephemeral=True,
+            )
 
 
 @ai_bot_command.error
@@ -3597,237 +3616,9 @@ async def ai_bot_command_error(interaction: discord.Interaction, error):
     else:
         print(f"/ai-bot command error: {type(error).__name__}: {error}")
         if not interaction.response.is_done():
-            await interaction.response.send_message("Could not change AI chat settings. Check the bot logs.", ephemeral=True)
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    # The bot has a custom on_message handler, so explicitly dispatch prefix commands.
-    await bot.process_commands(message)
-    content = message.content.strip()
-
-    # AI replies only in channels explicitly enabled with /ai-bot On.
-    if message.guild and message.channel.id in AI_CHAT_CHANNELS and content and not content.startswith(("/", "!", "-")):
-        now = time.time()
-        cooldown_key = (message.channel.id, message.author.id)
-        if now - _AI_LAST_REPLY.get(cooldown_key, 0) >= 3:
-            _AI_LAST_REPLY[cooldown_key] = now
-            history = _AI_CHAT_HISTORY.setdefault(message.channel.id, [])
-            history.append({"role": "user", "content": f"{message.author.display_name}: {content[:1000]}"})
-            history = history[-8:]
-            is_arabic = bool(re.search(r"[\u0600-\u06FF]", content))
-            if _crystal_purchase_intent(content):
-                answer = _crystal_purchase_reply(is_arabic)
-            else:
-                saved_item, saved_score = _find_saved_answer(content)
-                if saved_item:
-                    answer = str(saved_item.get("answer", "")).strip()
-                else:
-                    answer = await _crystal_ai_answer(content, history)
-                if not answer:
-                    faq_kind = _crystal_faq_kind(content)
-                    if faq_kind:
-                        _crystal_faq_embed._reply_arabic = is_arabic
-                        faq_embed = _crystal_faq_embed(faq_kind)
-                        if faq_embed is not None:
-                            await message.reply(embed=faq_embed, mention_author=False)
-                            return
-                    # If no saved answer/AI answer is available, ask staff in the configured channel.
-                    if AI_QUESTION_CHANNEL_ID:
-                        target = message.guild.get_channel(AI_QUESTION_CHANNEL_ID) if message.guild else None
-                        if isinstance(target, discord.TextChannel):
-                            try:
-                                await target.send(
-                                    f"❓ **Question needs an answer**\\n"
-                                    f"**Asked by:** {message.author.mention} in {message.channel.mention}\\n"
-                                    f"**Question:** {content[:1000]}",
-                                    view=AIQuestionReviewView(content),
-                                )
-                            except discord.Forbidden:
-                                print("Missing permission to send unanswered question to configured channel.")
-                    answer = ("ما عندي إجابة مؤكدة للحين، سألت فريق الدعم يضيف الإجابة." if is_arabic
-                              else "I don't have a confirmed answer yet; I've asked staff to add one.")
-            if answer:
-                await message.reply(answer, mention_author=False)
-                history.append({"role": "assistant", "content": answer[:1000]})
-                _AI_CHAT_HISTORY[message.channel.id] = history[-8:]
-                return
-
-    # Do not auto-answer in other channels; existing bot commands continue below.
-    if content.lower().startswith("-createcode"):
-        if not is_code_creator(message.author):
-            await message.reply("❌ Only **admi111** can create Crystal Hub plan codes.")
-            return
-        if not message.guild or not message.author.guild_permissions.administrator:
-            await message.reply("❌ The authorized account must also have server administrator permission to create Crystal Hub codes.")
-            return
-        parts = content.split(maxsplit=3)
-        if len(parts) < 2 or parts[1].lower() not in ("premium", "ultra"):
-            await message.reply("Usage: `-createcode premium [lifetime|days] [custom-code]` or `-createcode ultra [lifetime|days] [custom-code]`")
-            return
-        plan = parts[1].capitalize()
-        duration_arg = parts[2].lower() if len(parts) >= 3 else "lifetime"
-        custom_code = parts[3].strip() if len(parts) >= 4 else None
-        if duration_arg == "lifetime":
-            days = 0
-        else:
-            try:
-                days = int(duration_arg)
-                if days < 1 or days > 3650:
-                    raise ValueError
-            except ValueError:
-                await message.reply("❌ اكتب lifetime أو عدد أيام من 1 إلى 3650.")
-                return
-        if custom_code and (len(custom_code) < 4 or len(custom_code) > 120 or any(ch.isspace() for ch in custom_code)):
-            await message.reply("❌ الكود المخصص يجب أن يكون 4–120 حرفًا/رقمًا بدون مسافات.")
-            return
-        try:
-            raw = _make_discord_plan_code(plan, days, custom_code)
-        except ValueError as exc:
-            await message.reply(f"❌ {exc}")
-            return
-        except OSError:
-            await message.reply("❌ Could not save the code.")
-            return
-        duration = "Lifetime" if days == 0 else f"{days} days"
-        # Never post the actual redeem code in the public server channel.
-        try:
-            await message.author.send(
-                f"✅ Crystal Hub **{plan}** code created ({duration}).\nYour private redeem code: ` {raw} `\nUse the panel's **Redeem Key** button and paste the code."
+            await interaction.response.send_message(
+                "Could not change AI chat settings. Check the bot logs.", ephemeral=True
             )
-            await message.reply("✅ تم إنشاء الكود وإرساله لك بالخاص فقط.", mention_author=False)
-        except discord.Forbidden:
-            await message.reply("❌ ما قدرت أرسل لك الكود بالخاص. افتح الرسائل الخاصة من أعضاء السيرفر ثم أعد المحاولة. لم أعرض الكود هنا حفاظًا على خصوصيته.")
-        return
-
-    if content.lower().startswith("-blacklist"):
-        if not message.guild:
-            return
-        if not is_code_creator(message.author):
-            await message.reply("❌ This command is restricted to **admi111**.")
-            return
-        parts = content.split()
-        target_id = None
-        if message.mentions:
-            target_id = message.mentions[0].id
-        elif len(parts) >= 2:
-            raw_id = parts[1].strip("<@!>")
-            if raw_id.isdigit():
-                target_id = int(raw_id)
-        if target_id is None:
-            await message.reply("الاستخدام: `-blacklist @user` أو `-blacklist USER_ID`")
-            return
-        blacklisted_users.add(target_id)
-        save_data()
-        await message.reply(f"🚫 تم حظر المستخدم `{target_id}` من استخدام ميزات البوت عالميًا.")
-        return
-
-    if content.lower().startswith("-massage"):
-        if not message.guild:
-            return
-
-        if str(message.author.id) not in admin_redeemed_users:
-            await message.reply(
-                "❌ You must redeem the admin code first using `/redeem`."
-            )
-            return
-
-        args = content[len("-massage"):].strip()
-
-        if not args:
-            await message.reply(
-                "❌ Usage: `-massage #channel Your message`\n"
-                "You can also use a Discord channel link."
-            )
-            return
-
-        # Split target from message. Channel mentions/URLs contain no spaces,
-        # so the first whitespace-separated item is the target.
-        parts = args.split(maxsplit=1)
-        if len(parts) < 2:
-            await message.reply(
-                "❌ Usage: `-massage #channel Your message`"
-            )
-            return
-
-        target_text, text_to_send = parts
-        channel = _parse_massage_target(message.guild, target_text)
-
-        if channel is None:
-            await message.reply(
-                "❌ Channel not found. Use a channel mention like `#general`, "
-                "a Discord channel link, or a channel ID."
-            )
-            return
-
-        if not isinstance(channel, discord.TextChannel):
-            await message.reply(
-                "❌ That is not a normal text channel I can message."
-            )
-            return
-
-        permissions = channel.permissions_for(message.guild.me)
-        if not permissions.send_messages:
-            await message.reply(
-                "❌ I don't have permission to send messages in that channel."
-            )
-            return
-
-        text_to_send = text_to_send.strip()
-        if not text_to_send:
-            await message.reply("❌ Message cannot be empty.")
-            return
-
-        if len(text_to_send) > 2000:
-            await message.reply(
-                "❌ The message is too long. Discord allows up to 2000 characters."
-            )
-            return
-
-        try:
-            await channel.send(
-                text_to_send,
-                allowed_mentions=discord.AllowedMentions.none()
-            )
-            await message.reply(
-                f"✅ Message sent to {channel.mention}."
-            )
-        except discord.Forbidden:
-            await message.reply(
-                "❌ I don't have permission to send messages there."
-            )
-        except discord.HTTPException:
-            await message.reply(
-                "❌ Discord could not send the message."
-            )
-        return
-
-    # Keep any existing prefix commands working.
-    await bot.process_commands(message)
-
-
-class AdminGuideLanguageView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.button(label="العربية 🇸🇦", style=discord.ButtonStyle.secondary)
-    async def arabic_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="Crystal Hub — دليل أوامر الإدارة",
-            description=(
-                "**أوامر الإدارة**\\n"
-                "• `-massage #channel Your message` — إرسال رسالة إلى قناة.\\n"
-                "• `-massage CHANNEL_LINK Your message` — يمكن استخدام رابط القناة أو المعرّف بدل المنشن.\\n"
-                "• `/blacklist @user` — حظر المستخدم من ميزات البوت عالميًا.\\n"
-                "• `/unblacklist user_id` — إزالة الحظر العالمي.\\n\\n"
-                "**ملاحظة:** استخدم الأوامر فقط في القنوات التي يملك البوت صلاحية الإرسال فيها."
-            ),
-            color=discord.Color.gold()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="admin", description="Show the Crystal Hub administration guide")
