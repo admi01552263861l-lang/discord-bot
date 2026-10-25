@@ -2584,6 +2584,47 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
 
 
 # 7. إعداد البانل
+@bot.tree.command(name="bypass", description="Open a LootLabs link in BypassTools")
+@app_commands.describe(url="Paste the full LootLabs URL")
+async def bypass_link(interaction: discord.Interaction, url: str):
+    """Create a safe external BypassTools link for supported LootLabs URLs."""
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            await interaction.response.send_message(
+                "أرسل رابطًا كاملًا يبدأ بـ https://", ephemeral=True
+            )
+            return
+
+        host = parsed.hostname.lower().rstrip(".")
+        lootlabs_hosts = {
+            "loot-link.com", "loot-links.com", "lootdest.com", "lootdest.org",
+            "lootdest.info", "lootlinks.co", "lootlinks.com", "lootlabs.gg",
+            "links.lootlabs.gg", "loot-labs.com", "lootlabs.com", "lootlink.org",
+            "lootboost.net", "best-links.org", "fast-links.org", "ultra-links.net",
+        }
+        if not any(host == allowed or host.endswith("." + allowed) for allowed in lootlabs_hosts):
+            await interaction.response.send_message(
+                "الأمر يدعم روابط LootLabs فقط حاليًا. تأكد أن الرابط من نطاق معروف مثل `links.lootlabs.gg`.",
+                ephemeral=True,
+            )
+            return
+
+        target = "https://bypass.tools/bypass?url=" + urllib.parse.quote(url.strip(), safe="")
+        await interaction.response.send_message(
+            "جهزت لك الرابط. افتحه لإكمال المعالجة على موقع BypassTools الخارجي، ولا تدخل كلمة مرور أو معلومات حساسة هناك.\n"
+            + target,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except Exception as exc:
+        print(f"/bypass command failed: {type(exc).__name__}: {exc}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "صار خطأ أثناء تجهيز الرابط. جرّب مرة ثانية.", ephemeral=True
+            )
+
+
 @bot.tree.command(name="my-plan", description="Show your Crystal Hub plan and monthly usage")
 async def my_plan_command(interaction: discord.Interaction):
     await interaction.response.send_message(_quota_status(interaction.user.id), ephemeral=True)
@@ -4734,7 +4775,8 @@ async def on_message(message: discord.Message):
         if message.guild is not None and message.channel.id in AI_CHAT_CHANNELS:
             content = (message.content or "").strip()
             if content and not content.startswith(("/", "-", "!")):
-                if _discord_plan(message.author.id) not in ("Ultra", "Admin"):
+                # The configured bot owner can test and use AI chat even without an Ultra/Admin plan.
+                if _discord_plan(message.author.id) not in ("Ultra", "Admin") and not is_bot_owner(message.author.id):
                     await message.reply("You need the Ultra or Admin role from the owner of this bot to use AI chat.", mention_author=False)
                     return
                 now = asyncio.get_running_loop().time()
