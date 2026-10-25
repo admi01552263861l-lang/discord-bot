@@ -1467,7 +1467,7 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
         "generate-key", "key", "whitelist", "see-keys", "delete-key",
         "unwhitelist", "trail", "delete-script",
         "set-buyer-role", "update-script", "reset-hwid-cooldown",
-        "ai-question-channel", "ai-add-qa", "ai-qa-list", "ai-bot",
+        "ai-question-channel", "ai-bot",
         "list-servers", "send-server-message",
     }
     if command_name in management_commands:
@@ -3077,7 +3077,6 @@ def _backup_snapshot(backup_type):
         "data": main_data,
         "security_state": security_state,
         "hwid_bindings": hwid_bindings,
-        "ai_knowledge": AI_KNOWLEDGE,
         "ai_chat_channels": sorted(int(x) for x in AI_CHAT_CHANNELS),
         "ai_question_channel_id": AI_QUESTION_CHANNEL_ID,
         "site_redeem_codes": site_redeem_codes,
@@ -3116,7 +3115,7 @@ def _has_admin_backup_access(user_id):
 
 def _restore_settings_backup(snapshot, backup_type, guild_id=None):
     global scripts_data, blacklisted_users, security_state, hwid_bindings
-    global AI_KNOWLEDGE, AI_QUESTION_CHANNEL_ID
+    global AI_QUESTION_CHANNEL_ID
     global site_redeem_codes, site_entitlements, monthly_usage
     global AI_CHAT_CHANNELS, GLOBAL_ADMIN_ROLE_IDS
     global admin_redeemed_users, discord_plan_codes, discord_plan_entitlements
@@ -3166,9 +3165,6 @@ def _restore_settings_backup(snapshot, backup_type, guild_id=None):
         hwid_bindings = snapshot["hwid_bindings"]
         save_hwid_bindings()
 
-    if isinstance(snapshot.get("ai_knowledge"), list):
-        AI_KNOWLEDGE = snapshot["ai_knowledge"]
-        _save_ai_knowledge()
     if isinstance(snapshot.get("ai_chat_channels"), list):
         AI_CHAT_CHANNELS = {int(x) for x in snapshot["ai_chat_channels"] if str(x).isdigit()}
         _save_ai_chat_channels()
@@ -3466,29 +3462,12 @@ def _save_ai_chat_channels():
 
 AI_CHAT_CHANNELS = _load_ai_chat_channels()
 
-# Knowledge base: saved questions/answers and the staff channel for unanswered questions.
-AI_KNOWLEDGE_FILE = "crystal_ai_knowledge.json"
-AI_KNOWLEDGE_CHANNEL_FILE = "crystal_ai_question_channel.json"
-
-def _load_ai_knowledge():
-    try:
-        with open(AI_KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        rows = raw.get("items", [])
-        return [x for x in rows if isinstance(x, dict) and x.get("question") and x.get("answer")]
-    except (OSError, ValueError, TypeError):
-        return []
-
-def _save_ai_knowledge():
-    try:
-        with open(AI_KNOWLEDGE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"items": AI_KNOWLEDGE}, f, ensure_ascii=False, indent=2)
-    except OSError as exc:
-        print(f"Could not save AI knowledge: {exc}")
+# The AI uses live API responses only. No saved-question/answer knowledge base is loaded.
+AI_QUESTION_CHANNEL_FILE = "crystal_ai_question_channel.json"
 
 def _load_ai_question_channel():
     try:
-        with open(AI_KNOWLEDGE_CHANNEL_FILE, "r", encoding="utf-8") as f:
+        with open(AI_QUESTION_CHANNEL_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
         return int(raw.get("channel_id")) if raw.get("channel_id") else None
     except (OSError, ValueError, TypeError):
@@ -3496,12 +3475,11 @@ def _load_ai_question_channel():
 
 def _save_ai_question_channel():
     try:
-        with open(AI_KNOWLEDGE_CHANNEL_FILE, "w", encoding="utf-8") as f:
+        with open(AI_QUESTION_CHANNEL_FILE, "w", encoding="utf-8") as f:
             json.dump({"channel_id": AI_QUESTION_CHANNEL_ID}, f, indent=2)
     except OSError as exc:
         print(f"Could not save AI question channel: {exc}")
 
-AI_KNOWLEDGE = _load_ai_knowledge()
 AI_QUESTION_CHANNEL_ID = _load_ai_question_channel()
 
 
@@ -3605,63 +3583,6 @@ async def get_admin_files_backup(ctx: commands.Context, item: str = ""):
     except Exception as exc:
         print(f"Admin full export failed: {type(exc).__name__}: {exc}")
         await ctx.reply("❌ Could not create the full backup. Check the bot logs.", mention_author=False)
-
-
-@bot.command(name="Ai")
-async def ai_backup_or_restore(ctx: commands.Context, action: str = ""):
-    """-Ai file exports the FAQ; attach that JSON to -Ai to restore it."""
-    if not _is_server_admin(ctx):
-        await ctx.reply(_admin_role_setup_message(ctx), mention_author=False)
-        return
-
-    if action.strip().lower() == "file":
-        payload = json.dumps({"format": "crystal_hub_ai_knowledge_v1", "items": AI_KNOWLEDGE},
-                             ensure_ascii=False, indent=2).encode("utf-8")
-        await ctx.reply(
-            content=f"AI questions and answers backup — **{len(AI_KNOWLEDGE)}** entries. Save this file before updating the bot.",
-            file=discord.File(io.BytesIO(payload), filename="crystal_hub_ai_knowledge.json"),
-            mention_author=False,
-        )
-        return
-
-    attachment = ctx.message.attachments[0] if ctx.message.attachments else None
-    if not attachment:
-        await ctx.reply(
-            "To export: `-Ai file`\\nTo import: attach the saved JSON file to a message containing `-Ai`.",
-            mention_author=False,
-        )
-        return
-
-    try:
-        if attachment.size and attachment.size > 8 * 1024 * 1024:
-            raise ValueError("File is larger than 8 MB.")
-        raw = await attachment.read()
-        backup = json.loads(raw.decode("utf-8-sig"))
-        rows = backup.get("items") if isinstance(backup, dict) else backup
-        if not isinstance(rows, list):
-            raise ValueError("This file does not contain an AI questions/answers list.")
-        clean_rows = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            question = str(row.get("question", "")).strip()
-            answer = str(row.get("answer", "")).strip()
-            aliases = row.get("aliases", [])
-            if question and answer:
-                if not isinstance(aliases, list):
-                    aliases = []
-                clean_rows.append({"question": question[:1000], "answer": answer[:4000],
-                                   "aliases": [str(x)[:1000] for x in aliases[:30] if str(x).strip()]})
-        if not clean_rows:
-            raise ValueError("No valid question/answer entries were found.")
-        AI_KNOWLEDGE[:] = clean_rows
-        _save_ai_knowledge()
-        await ctx.reply(f"Imported **{len(clean_rows)}** AI questions and answers successfully.", mention_author=False)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
-        await ctx.reply(f"Could not import that file: {exc}", mention_author=False)
-    except Exception as exc:
-        print(f"AI knowledge import failed: {type(exc).__name__}: {exc}")
-        await ctx.reply("Import failed. Check the bot logs and make sure the attached file is a valid backup.", mention_author=False)
 
 
 @bot.command(name="script")
@@ -3776,49 +3697,6 @@ async def script_backup_or_restore(ctx: commands.Context, action: str = ""):
         print(f"Script import failed: {type(exc).__name__}: {exc}")
         await ctx.reply("Import failed. Check the bot logs and make sure this is a valid script backup.", mention_author=False)
 
-
-def _normalize_qa_text(text: str) -> str:
-    text = (text or "").lower().strip()
-    # Normalize common Arabic letter variants and remove diacritics/punctuation.
-    text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
-    text = text.translate(str.maketrans({"أ":"ا", "إ":"ا", "آ":"ا", "ى":"ي", "ة":"ه", "ؤ":"و", "ئ":"ي"}))
-    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-def _qa_similarity(a: str, b: str) -> float:
-    a_norm, b_norm = _normalize_qa_text(a), _normalize_qa_text(b)
-    if not a_norm or not b_norm:
-        return 0.0
-    sequence_score = difflib.SequenceMatcher(None, a_norm, b_norm).ratio()
-    a_words, b_words = set(a_norm.split()), set(b_norm.split())
-    union = a_words | b_words
-    word_score = len(a_words & b_words) / len(union) if union else 0.0
-    # Blend character and word overlap to tolerate minor phrasing changes.
-    return max(sequence_score, 0.65 * sequence_score + 0.35 * word_score)
-
-def _find_saved_answer(question: str):
-    best_item, best_score = None, 0.0
-    for item in AI_KNOWLEDGE:
-        candidates = [item.get("question", "")] + list(item.get("aliases", []))
-        score = max((_qa_similarity(question, candidate) for candidate in candidates), default=0.0)
-        if score > best_score:
-            best_item, best_score = item, score
-    # Without an AI model, similarity is approximate, not true semantic understanding.
-    return (best_item, best_score) if best_score >= 0.52 else (None, best_score)
-
-
-# AI FAQ support (OpenRouter primary, then Gemini/OpenAI if configured). Keep all API keys in host environment variables.
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
-OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://crystal-hub67.netlify.app/").strip()
-OPENROUTER_SITE_NAME = os.getenv("OPENROUTER_SITE_NAME", "Crystal Hub").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-CRYSTAL_DISCORD_INVITE = "https://discord.gg/DsQ2sQkBW3"
-_ai_last_reply_by_user = {}
 
 
 def _crystal_ai_context():
@@ -3963,252 +3841,11 @@ async def _crystal_ai_answer(content: str, history=None) -> str:
     return ""
 
 
-def _crystal_faq_kind(content: str):
-    """Match common English/Arabic phrasings to FAQ topics without requiring exact wording."""
-    text = re.sub(r"[^\w\s]", " ", (content or "").lower(), flags=re.UNICODE)
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text or text.startswith(("/", "-", "!")):
-        return None
-
-    # Keep commands and very short unrelated messages out of the FAQ matcher.
-    words = set(text.split())
-
-    free_terms = (
-        "free", "freebie", "pricing", "price", "prices", "cost", "costs",
-        "subscription", "subscriptions", "plan", "plans", "paid", "premium",
-        "مجاني", "مجانية", "مجانا", "ببلاش", "فلوس", "السعر", "اسعار",
-        "أسعار", "بكم", "كم السعر", "اشتراك", "مدفوع", "مدفوعة", "بريميوم"
-    )
-    crystal_terms = ("crystal", "hub", "bot", "كريستال", "كريستل", "كريستال هب", "البوت")
-    free_question = (
-        ("free" in words or any(x in text for x in free_terms))
-        and (any(x in text for x in crystal_terms) or len(words) >= 2)
-    )
-    if free_question:
-        return "plans"
-
-    script_terms = (
-        "script", "scripts", "panel", "panels", "feature", "features",
-        "available", "list", "what does", "what do", "which", "show me",
-        "سكربت", "سكربتات", "السكربت", "السكربتات", "بانل", "بانلات",
-        "لوحة", "لوحات", "مميزات", "المميزات", "ميزات", "وش يسوي",
-        "وش تسوي", "ايش يسوي", "ايش تسوي", "وش عندكم", "المتوفر",
-        "الموجود", "وظيفة", "وظيفته", "وظيفتها", "شرح"
-    )
-    if any(term in text for term in script_terms):
-        # Avoid interpreting a simple question about free pricing as a script list.
-        if not free_question:
-            return "scripts"
-
-    start_terms = (
-        "how to start", "how do i use", "how to use", "getting started",
-        "how can i use", "setup", "set up", "start using", "help me start",
-        "كيف استخدم", "كيف أستخدم", "كيف استعمل", "كيف ابدأ", "كيف أبدأ",
-        "طريقة الاستخدام", "كيف اشغل", "كيف أشغل", "كيف افعل", "كيف أفعل",
-        "شرح الاستخدام", "ابدأ من وين", "من وين ابدأ"
-    )
-    if any(term in text for term in start_terms):
-        return "start"
-
-    # Generic intent patterns: match natural variations such as "do I have to pay?"
-    if any(term in text for term in ("do i have to pay", "have to pay", "need to pay",
-                                     "is there a free", "got a free", "any free",
-                                     "is there premium", "is premium", "what plans",
-                                     "في مجاني", "فيه مجاني", "لازم ادفع", "لازم أدفع",
-                                     "هل ادفع", "هل أدفع", "عندكم مجاني", "في اشتراك",
-                                     "فيه اشتراك", "وش الباقات", "ايش الباقات")):
-        return "plans"
-
-    return None
-
-
-def _crystal_faq_embed(kind: str):
-    """Build factual FAQ answers from the bot's current configured limits/scripts."""
-    if kind == "plans":
-        # The caller's message language determines the response language.
-        # This state is set by the message handler immediately before building the embed.
-        is_arabic = bool(getattr(_crystal_faq_embed, "_reply_arabic", False))
-        if is_arabic:
-            title = "Crystal Hub — الخطط والحدود"
-            description = (
-                "إيه، فيه خطة **مجانية** في Crystal Hub، وتقدر ترقي إذا احتجت حدودًا أعلى.\n\n"
-                "**الخطة المجانية**\n"
-                "• حتى **5 سكربتات نشطة**\n"
-                "• حتى **5 لوحات نشطة**\n"
-                "• **20 عملية مصدر شهريًا**\n"
-                "• حتى **100 مفتاح/مكان Whitelist نشط**\n"
-                "• تغييرات الأفاتار غير مشمولة ضمن حد الخطة المجانية\n\n"
-                "**خطة Premium — 1 دولار للأبد**\n"
-                "• حتى **10 سكربتات نشطة**\n"
-                "• حتى **10 لوحات نشطة**\n"
-                "• **100 عملية مصدر شهريًا**\n"
-                "• حتى **500 مفتاح/مكان Whitelist نشط**\n"
-                "• **5 تغييرات أفاتار شهريًا**\n\n"
-                "**خطة Ultra — 2 دولار للأبد**\n"
-                "• حدود الاستخدام غير محدودة حسب إعدادات البوت الحالية.\n\n"
-                "للشراء، ادخل سيرفر Crystal Hub وروح لقناة **#buy** وافتح تكت: https://discord.gg/DsQ2sQkBW3"
-            )
-            footer = "الحدود المعروضة مأخوذة من إعدادات البوت الحالية."
-        else:
-            title = "Crystal Hub — Plans & Limits"
-            description = (
-                "Yes! **Crystal Hub has a Free plan**. You can start for free, "
-                "and upgrade if you need higher limits.\n\n"
-                "**Free plan**\n"
-                "• Up to **5 active scripts**\n"
-                "• Up to **5 active panels**\n"
-                "• **20 source operations per month**\n"
-                "• Up to **100 active keys/whitelist slots**\n"
-                "• Avatar changes are not included in the Free quota\n\n"
-                "**Premium plan — $1 USD, lifetime**\n"
-                "• Up to **10 active scripts**\n"
-                "• Up to **10 active panels**\n"
-                "• **100 source operations per month**\n"
-                "• Up to **500 active keys/whitelist slots**\n"
-                "• **5 avatar changes per month**\n\n"
-                "**Ultra plan — $2 USD, lifetime**\n"
-                "• Unlimited usage according to the current bot quota logic.\n\n"
-                "To purchase, join the Crystal Hub server, go to **#buy**, and open a ticket: https://discord.gg/DsQ2sQkBW3"
-            )
-            footer = "Limits shown are the bot's current configured quotas."
-        embed = discord.Embed(title=title, color=0x5865F2, description=description)
-        embed.set_footer(text=footer)
-        return embed
-
-    if kind == "scripts":
-        embed = discord.Embed(
-            title="Crystal Hub — Available Scripts",
-            color=0x5865F2,
-            description=(
-                "Here are the scripts currently configured in Crystal Hub. "
-                "Descriptions are shown only when staff have added them."
-            )
-        )
-        listed = 0
-        for name, info in list(scripts_data.items())[:20]:
-            if not isinstance(info, dict):
-                continue
-            description = str(
-                info.get("panel_description")
-                or info.get("description")
-                or info.get("script_description")
-                or ""
-            ).strip()
-            panel_name = str(info.get("panel_name") or name).strip()
-            value = description[:900] if description else (
-                "No description has been added yet. Please ask staff for details."
-            )
-            embed.add_field(name=panel_name[:256], value=value, inline=False)
-            listed += 1
-
-        if listed == 0:
-            embed.description = (
-                "There are no scripts configured in the bot right now, "
-                "or none are available to display. Please ask staff for the current list."
-            )
-        elif len(scripts_data) > 20:
-            embed.set_footer(text="Showing the first 20 configured scripts.")
-        return embed
-
-    if kind == "start":
-        return discord.Embed(
-            title="Crystal Hub — Getting Started",
-            color=0x5865F2,
-            description=(
-                "1. Check the server's script/panel information and choose the feature you need.\n"
-                "2. Use the relevant panel buttons to redeem your key or request access.\n"
-                "3. Follow the script's instructions and keep your key private.\n"
-                "4. If you see an HWID/device error, use the panel's Reset HWID option if available, "
-                "or contact staff.\n\n"
-                "If you need exact instructions for a specific script, ask staff for its description."
-            )
-        )
-    return None
-
-
-
-class AIAnswerModal(BlacklistAwareModal, title="Save Crystal Hub answer"):
-    question = discord.ui.TextInput(label="Question", placeholder="The question the member asked", max_length=300)
-    answer = discord.ui.TextInput(label="Correct answer", style=discord.TextStyle.paragraph, placeholder="Write the approved answer here", max_length=1800)
-
-    def __init__(self, original_question: str):
-        super().__init__()
-        self.question.default = original_question[:300]
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("You need Manage Server permission to save answers.", ephemeral=True)
-            return
-        q = str(self.question.value).strip()
-        a = str(self.answer.value).strip()
-        if not q or not a:
-            await interaction.response.send_message("Please provide both a question and an answer.", ephemeral=True)
-            return
-        existing, score = _find_saved_answer(q)
-        if existing and score >= 0.88:
-            existing["answer"] = a
-            existing["question"] = q
-        else:
-            AI_KNOWLEDGE.append({"question": q, "answer": a, "aliases": []})
-        _save_ai_knowledge()
-        await interaction.response.send_message(f"Saved. The bot now has **{len(AI_KNOWLEDGE)}** knowledge entries and will match similar wording.", ephemeral=True)
-
-
-class AIQuestionReviewView(BlacklistAwareView):
-    def __init__(self, original_question: str):
-        super().__init__(timeout=86400)
-        self.original_question = original_question
-
-    @discord.ui.button(label="Add answer / حفظ الإجابة", style=discord.ButtonStyle.primary)
-    async def add_answer(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("Only staff with Manage Server permission can add answers.", ephemeral=True)
-            return
-        await interaction.response.send_modal(AIAnswerModal(self.original_question))
-
-
-@bot.tree.command(name="ai-add-qa", description="Add a question and answer to the AI knowledge base")
-@app_commands.describe(question="Question or phrasing to recognize", answer="Correct answer to send")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def ai_add_qa_command(interaction: discord.Interaction, question: str, answer: str):
-    existing, score = _find_saved_answer(question)
-    if existing and score >= 0.88:
-        existing["question"] = question.strip()
-        existing["answer"] = answer.strip()
-    else:
-        AI_KNOWLEDGE.append({"question": question.strip(), "answer": answer.strip(), "aliases": []})
-    _save_ai_knowledge()
-    await interaction.response.send_message(
-        f"Saved question and answer. Knowledge base now contains **{len(AI_KNOWLEDGE)}** entries. Similar wording will be matched approximately.",
-        ephemeral=True,
-    )
-
-
-@ai_add_qa_command.error
-async def ai_add_qa_command_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.errors.MissingPermissions):
-        msg = "You need **Manage Server** permission to add saved answers."
-    else:
-        print(f"/ai-add-qa error: {type(error).__name__}: {error}")
-        msg = "Could not save the question and answer."
-    if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
-    else:
-        await interaction.response.send_message(msg, ephemeral=True)
-
-
-@bot.tree.command(name="ai-qa-list", description="Show how many saved AI questions and answers exist")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def ai_qa_list_command(interaction: discord.Interaction):
-    preview = "\\n".join(f"• {x['question'][:100]}" for x in AI_KNOWLEDGE[:15]) or "No saved questions yet."
-    await interaction.response.send_message(f"Saved Q&A entries: **{len(AI_KNOWLEDGE)}**\\n{preview}", ephemeral=True)
-
-
-@bot.tree.command(name="ai-bot", description="Set AI reply and unanswered-question channels")
+@bot.tree.command(name="ai-bot", description="Configure the AI reply channel")
 @app_commands.describe(
     mode="Turn AI replies on or off",
     reply_channel="Channel where members can ask the bot and receive replies",
-    questions_channel="Staff channel where unanswered questions are sent",
+    questions_channel="Legacy optional channel setting; saved-answer features are disabled",
 )
 @app_commands.choices(mode=[
     app_commands.Choice(name="On", value="on"),
@@ -4228,22 +3865,20 @@ async def ai_bot_command(
         return
 
     if mode.value == "on":
-        if reply_channel is None or questions_channel is None:
+        if reply_channel is None:
             await interaction.response.send_message(
-                "To turn AI on, choose both **Reply Channel** (where members talk to the bot) "
-                "and **Questions Channel** (where unanswered questions are sent to staff).",
+                "To turn AI on, choose a **Reply Channel**. The Questions Channel is optional.",
                 ephemeral=True,
             )
             return
 
         AI_CHAT_CHANNELS.add(reply_channel.id)
         _AI_CHAT_HISTORY[reply_channel.id] = []
-        AI_QUESTION_CHANNEL_ID = questions_channel.id
+        AI_QUESTION_CHANNEL_ID = questions_channel.id if questions_channel else None
         _save_ai_chat_channels()
         _save_ai_question_channel()
         await interaction.response.send_message(
-            f"AI replies are now **ON** in {reply_channel.mention}. "
-            f"Unanswered questions will be sent to {questions_channel.mention}.",
+            f"AI replies are now **ON** in {reply_channel.mention}. Every new question will use the live AI API.",
             ephemeral=True,
         )
     else:
@@ -4702,70 +4337,18 @@ async def on_message(message: discord.Message):
                 last = _ai_last_reply_by_user.get(message.author.id, 0)
                 if now - last >= 2:
                     _ai_last_reply_by_user[message.author.id] = now
-                    saved_item, score = _find_saved_answer(content)
-                    if saved_item:
-                        await message.reply(str(saved_item["answer"])[:1900], mention_author=False)
+                    history = _AI_CHAT_HISTORY.setdefault(message.channel.id, [])
+                    answer = await _crystal_ai_answer(content, history=history)
+                    history.append({"role": "user", "content": content[:1000]})
+                    if answer:
+                        history.append({"role": "assistant", "content": answer[:1500]})
+                        del history[:-12]
+                        await message.reply(answer[:1900], mention_author=False)
                     else:
-                        faq_kind = _crystal_faq_kind(content)
-                        if faq_kind:
-                            _crystal_faq_embed._reply_arabic = bool(
-                                re.search(r"[\u0600-\u06FF]", content)
-                            )
-                            embed = _crystal_faq_embed(faq_kind)
-                            if embed is not None:
-                                await message.reply(embed=embed, mention_author=False)
-                        else:
-                            history = _AI_CHAT_HISTORY.setdefault(message.channel.id, [])
-                            answer = await _crystal_ai_answer(content, history=history)
-                            history.append({"role": "user", "content": content[:1000]})
-                            if answer:
-                                history.append({"role": "assistant", "content": answer[:1500]})
-                                del history[:-12]
-                                await message.reply(answer[:1900], mention_author=False)
-                            elif AI_QUESTION_CHANNEL_ID:
-                                staff_channel = bot.get_channel(AI_QUESTION_CHANNEL_ID)
-                                if staff_channel is None:
-                                    try:
-                                        staff_channel = await bot.fetch_channel(AI_QUESTION_CHANNEL_ID)
-                                    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-                                        print(f"Could not access AI question channel: {type(exc).__name__}: {exc}")
-                                        staff_channel = None
-
-                                if staff_channel is not None:
-                                    question_embed = discord.Embed(
-                                        title="New unanswered AI question",
-                                        description=content[:3500],
-                                        color=discord.Color.orange(),
-                                    )
-                                    question_embed.add_field(
-                                        name="Asked by",
-                                        value=f"{message.author.mention} (`{message.author.id}`)",
-                                        inline=False,
-                                    )
-                                    question_embed.add_field(
-                                        name="Source channel",
-                                        value=f"{message.channel.mention}",
-                                        inline=False,
-                                    )
-                                    await staff_channel.send(
-                                        embed=question_embed,
-                                        view=AIQuestionReviewView(content[:1000]),
-                                        allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
-                                    )
-                                    await message.reply(
-                                        "ما عندي إجابة محفوظة لهذا السؤال، أرسلته لفريق الدعم عشان يضيفون الإجابة.",
-                                        mention_author=False,
-                                    )
-                                else:
-                                    await message.reply(
-                                        "ما قدرت أجاوب، وقناة الأسئلة غير متاحة حاليًا. تأكد من إعداد `/ai-bot` وصلاحيات البوت.",
-                                        mention_author=False,
-                                    )
-                            else:
-                                await message.reply(
-                                    "ما عندي إجابة لهذا السؤال حتى الآن. تأكد من اختيار Questions Channel في `/ai-bot`.",
-                                    mention_author=False,
-                                )
+                        await message.reply(
+                            "The AI service is temporarily unavailable. Please try again in a moment.",
+                            mention_author=False,
+                        )
     except Exception as exc:
         print(f"AI message handler failed: {type(exc).__name__}: {exc}")
 
