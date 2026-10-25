@@ -78,7 +78,7 @@ def _global_admin_status(interaction):
 
 # Discord admin redeem access
 ADMIN_REDEEM_FILE = "discord_admin_redeems.json"
-ADMIN_REDEEM_CODE = os.getenv("ADMIN_REDEEM_CODE", "admi-on-top").strip().upper()
+ADMIN_REDEEM_CODE = os.getenv("ADMIN_REDEEM_CODE", "").strip().upper()
 
 def load_admin_redeems():
     try:
@@ -252,8 +252,17 @@ MONTHLY_USAGE_FILE = "discord_monthly_usage.json"
 discord_plan_codes = _load_json_dict(DISCORD_PLAN_CODES_FILE)
 discord_plan_entitlements = _load_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE)
 monthly_usage = _load_json_dict(MONTHLY_USAGE_FILE)
-FREE_LIMITS = {"scripts": 5, "panels": 5, "sources": 20, "keys": 100, "avatars": 0}
-PREMIUM_LIMITS = {"scripts": 10, "panels": 10, "sources": 100, "keys": 1000, "avatars": 5}
+# Subscription limits are embedded directly in this bot file so Render deployments
+# do not depend on a separate plan-limits JSON file. Edit these values here.
+# Monthly usage counters and redeemed plan entitlements are persisted separately.
+PLAN_LIMITS = {
+    "Free": {"scripts": 5, "panels": 5, "sources": 20, "keys": 100, "avatars": 0},
+    "Premium": {"scripts": 10, "panels": 10, "sources": 100, "keys": 500, "avatars": 5},
+    "Ultra": {"scripts": None, "panels": None, "sources": None, "keys": None, "avatars": None},
+}
+FREE_LIMITS = PLAN_LIMITS["Free"]
+PREMIUM_LIMITS = PLAN_LIMITS["Premium"]
+ULTRA_LIMITS = PLAN_LIMITS["Ultra"]
 
 def _month_key():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
@@ -280,6 +289,57 @@ def _discord_plan(user_id):
             return "Free"
     return str(rec.get("plan", "Free"))
 
+def _active_owned_key_count(user_id):
+    """Count current active key/whitelist grants; deleting one frees a slot."""
+    count = 0
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for s_info in scripts_data.values():
+        for key, meta in (s_info.get("key_meta") or {}).items():
+            if not isinstance(meta, dict) or str(meta.get("created_by", "")) != str(user_id):
+                continue
+            if key not in s_info.get("valid_keys", set()) or meta.get("disabled"):
+                continue
+            expires_at = meta.get("expires_at")
+            if expires_at:
+                try:
+                    expiry = datetime.datetime.fromisoformat(expires_at)
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=datetime.timezone.utc)
+                    if expiry <= now:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            count += 1
+    return count
+
+
+def _active_owned_script_count(user_id):
+    return sum(1 for item in scripts_data.values()
+               if str(item.get("created_by", "")) == str(user_id))
+
+
+def _active_owned_panel_count(user_id):
+    return sum(
+        1 for item in scripts_data.values()
+        for panel in (item.get("panel_instances") or ([{
+            "message_id": item.get("panel_message_id"),
+            "created_by": item.get("panel_created_by", item.get("created_by", "")),
+        }] if item.get("panel_message_id") else []))
+        if str(panel.get("created_by", item.get("panel_created_by", item.get("created_by", "")))) == str(user_id)
+        and panel.get("message_id")
+    )
+
+
+def _usage_record(user_id):
+    month = _month_key()
+    rec = monthly_usage.setdefault(str(user_id), {})
+    if rec.get("month") != month:
+        rec.clear()
+        rec["month"] = month
+        _save_json_dict(MONTHLY_USAGE_FILE, monthly_usage)
+    return rec
+
+
 def _quota_check(user_id, category):
     plan = _discord_plan(user_id)
     if plan in ("Ultra", "Admin"):
@@ -289,94 +349,61 @@ def _quota_check(user_id, category):
     if limit is None:
         return True, None
 
-    # Scripts/panels are active inventory limits. Deleting an item frees a slot.
-    # "keys" is one shared active pool: a generated key OR a whitelist grant
-    # consumes exactly one slot. Deleting the key frees that slot.
+    # Inventory quotas count currently active items, not lifetime creations.
     if category == "keys":
-        owned_keys = 0
-        for s_info in scripts_data.values():
-            for key, meta in (s_info.get("key_meta") or {}).items():
-                if not isinstance(meta, dict):
-                    continue
-                if str(meta.get("created_by", "")) != str(user_id):
-                    continue
-                if key not in s_info.get("valid_keys", set()):
-                    continue
-                if meta.get("disabled"):
-                    continue
-                expires_at = meta.get("expires_at")
-                if expires_at:
-                    try:
-                        if datetime.datetime.fromisoformat(expires_at) <= datetime.datetime.now(datetime.timezone.utc):
-                            continue
-                    except (ValueError, TypeError):
-                        pass
-                owned_keys += 1
-        if owned_keys >= limit:
-            return False, f"{plan} key/whitelist limit reached: {limit} active slots. Delete a key to free a slot."
-        return True, None
-
-    if category == "scripts":
-        owned = sum(1 for item in scripts_data.values()
-                    if str(item.get("created_by", "")) == str(user_id))
+        owned = _active_owned_key_count(user_id)
         if owned >= limit:
-            return False, f"{plan} limit reached: {limit} active scripts. Delete one to free a slot."
+            return False, f"{plan} key/whitelist limit reached: {owned}/{limit} active slots used. Delete a key or whitelist grant to free a slot."
+        return True, None
+    if category == "scripts":
+        if _active_owned_script_count(user_id) >= limit:
+            return False, f"{plan} script limit reached: { _active_owned_script_count(user_id)}/{limit} active slots used. Delete one to free a slot."
         return True, None
     if category == "panels":
-        owned = sum(
-            1 for item in scripts_data.values()
-            for panel in (item.get("panel_instances") or ([{
-                "message_id": item.get("panel_message_id"),
-                "created_by": item.get("panel_created_by", item.get("created_by", "")),
-            }] if item.get("panel_message_id") else []))
-            if str(panel.get("created_by", item.get("panel_created_by", item.get("created_by", "")))) == str(user_id)
-            and panel.get("message_id")
-        )
-        if owned >= limit:
-            return False, f"{plan} limit reached: {limit} active panels. Delete one to free a slot."
+        if _active_owned_panel_count(user_id) >= limit:
+            return False, f"{plan} panel limit reached: { _active_owned_panel_count(user_id)}/{limit} active slots used. Delete one to free a slot."
         return True, None
 
-    month = _month_key()
-    rec = monthly_usage.setdefault(str(user_id), {})
-    if rec.get("month") != month:
-        rec.clear()
-        rec["month"] = month
+    # Source and avatar operations use independent monthly counters.
+    rec = _usage_record(user_id)
     if int(rec.get(category, 0)) >= limit:
-        return False, f"{plan} monthly limit reached: {limit} {category}. Your usage resets next month."
+        return False, f"{plan} monthly limit reached: {limit} {category}. Your usage resets at the start of next month (UTC)."
     return True, None
 
+
 def _quota_increment(user_id, category):
-    month = _month_key()
-    rec = monthly_usage.setdefault(str(user_id), {})
-    if rec.get("month") != month:
-        rec.clear()
-        rec["month"] = month
+    plan = _discord_plan(user_id)
+    if plan in ("Ultra", "Admin"):
+        return
+    rec = _usage_record(user_id)
     rec[category] = int(rec.get(category, 0)) + 1
     _save_json_dict(MONTHLY_USAGE_FILE, monthly_usage)
 
+
 def _quota_status(user_id):
     plan = _discord_plan(user_id)
-    limits = PREMIUM_LIMITS if plan == "Premium" else FREE_LIMITS
     if plan in ("Ultra", "Admin"):
-        return f"{plan} — unlimited"
-    rec = monthly_usage.setdefault(str(user_id), {})
-    if rec.get("month") != _month_key():
-        rec = {"month": _month_key()}
-    names = {"scripts": "active scripts", "panels": "active panels", "sources": "sources this month", "keys": "active keys/whitelists", "avatars": "avatar changes this month"}
-    active_scripts = sum(1 for item in scripts_data.values() if str(item.get("created_by", "")) == str(user_id))
-    active_panels = sum(
-        1 for item in scripts_data.values()
-        for panel in (item.get("panel_instances") or ([{
-            "message_id": item.get("panel_message_id"),
-            "created_by": item.get("panel_created_by", item.get("created_by", "")),
-        }] if item.get("panel_message_id") else []))
-        if str(panel.get("created_by", item.get("panel_created_by", item.get("created_by", "")))) == str(user_id)
-        and panel.get("message_id")
-    )
+        return "All usage limits bypassed."
+    limits = PREMIUM_LIMITS if plan == "Premium" else FREE_LIMITS
+    rec = _usage_record(user_id)
+    names = {
+        "scripts": "active scripts",
+        "panels": "active panels",
+        "sources": "sources this month",
+        "keys": "active keys/whitelists",
+        "avatars": "avatar changes this month",
+    }
+    active = {
+        "scripts": _active_owned_script_count(user_id),
+        "panels": _active_owned_panel_count(user_id),
+        "keys": _active_owned_key_count(user_id),
+    }
     parts = []
     for category, limit in limits.items():
-        if limit is not None:
-            used = active_scripts if category == "scripts" else active_panels if category == "panels" else int(rec.get(category, 0))
+        if limit is None:
+            parts.append(f"{names[category]}: unlimited")
+        else:
+            used = active[category] if category in active else int(rec.get(category, 0))
             parts.append(f"{names[category]}: {used}/{limit}")
     return f"{plan} plan — " + " • ".join(parts)
 
@@ -643,12 +670,12 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             label = str(payload.get("codeLabel", ""))[:60]
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             self._send_text(400, json.dumps({"error": "Invalid request."})); return
-        expected = os.getenv("ADMIN_ACCESS_CODE", "admi-on-top")
+        expected = os.getenv("ADMIN_ACCESS_CODE", "").strip()
         if not expected or not secrets.compare_digest(supplied, expected):
             self._send_text(403, json.dumps({"error": "Admin authorization failed. Set ADMIN_ACCESS_CODE in Render and unlock again."})); return
-        if plan not in ("Premium", "Ultra", "Admin"):
-            self._send_text(400, json.dumps({"error": "Choose Premium, Ultra, or Admin."})); return
-        prefix = {"Premium": "PREM", "Ultra": "ULTRA", "Admin": "ADMIN"}[plan]
+        if plan not in ("Premium", "Ultra"):
+            self._send_text(400, json.dumps({"error": "Choose Premium or Ultra."})); return
+        prefix = {"Premium": "PREM", "Ultra": "ULTRA"}[plan]
         raw = "CH-" + prefix + "-" + secrets.token_hex(6).upper()
         days = 30 if plan == "Premium" else 0
         key = _hash_redeem_code(raw)
@@ -669,7 +696,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict): raise ValueError("invalid body")
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             self._send_text(400, json.dumps({"error": "Invalid request."})); return
-        expected = os.getenv("ADMIN_ACCESS_CODE", "admi-on-top")
+        expected = os.getenv("ADMIN_ACCESS_CODE", "").strip()
         supplied = str(payload.get("adminCode", ""))
         if not expected or not secrets.compare_digest(supplied, expected):
             self._send_text(403, json.dumps({"error": "Admin authorization failed."})); return
@@ -718,18 +745,13 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             self._send_text(401, json.dumps({"error": "Your session could not be verified. Sign in again."})); return
         key = _hash_redeem_code(code)
         record = site_redeem_codes.get(key)
-        # Allow the configured admin access code to be redeemed from Subscriptions too.
-        # It is still treated as a one-time code and grants the Admin entitlement.
-        admin_redeem_code = os.getenv("ADMIN_ACCESS_CODE", "admi-on-top")
-        if admin_redeem_code and secrets.compare_digest(code.upper(), admin_redeem_code.strip().upper()):
-            if record is None:
-                record = {"plan": "Admin", "duration_days": 0, "created_by": "configured-admin-code", "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "redeemed_by": None, "redeemed_at": None, "revoked": False}
-                site_redeem_codes[key] = record
         if not record or record.get("revoked"):
             self._send_text(404, json.dumps({"error": "Invalid or expired redeem code."})); return
         if record.get("redeemed_by"):
             self._send_text(409, json.dumps({"error": "This code has already been used."})); return
         plan = record.get("plan", "Premium")
+        if plan not in ("Premium", "Ultra"):
+            self._send_text(403, json.dumps({"error": "This code does not grant a customer subscription."})); return
         days = int(record.get("duration_days", 30))
         expires_at = None if days <= 0 else (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)).isoformat()
         entitlement = {"plan": plan, "redeemed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "expires_at": expires_at, "code_hash": key}
@@ -1354,7 +1376,7 @@ async def script_autocomplete(
             choices.append(app_commands.Choice(name=script_name, value=script_name))
     return choices[:25]
 
-# Only this Discord account may generate Premium/Ultra/Admin plan codes.
+# Only this Discord account may generate Premium/Ultra plan codes.
 CODE_CREATOR_USERNAMES = {"admi111"}
 
 
@@ -1423,7 +1445,7 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
     management_commands = {
         "generate-key", "key", "whitelist", "see-keys", "delete-key",
         "unwhitelist", "trail", "delete-script", "source-setup",
-        "set-buyer-role", "panel-setup", "update-script", "reset-hwid-cooldown",
+        "set-buyer-role", "panel-setup", "panel-delete", "update-script", "reset-hwid-cooldown",
         "ai-question-channel", "ai-add-qa", "ai-qa-list", "ai-bot",
         "list-servers", "send-server-message",
         "create-redeem-code", "list-redeem-codes", "revoke-redeem-code",
@@ -1431,7 +1453,7 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
     if command_name in management_commands:
         is_admin_tier = _discord_plan(interaction.user.id) == "Admin"
         if not (is_bot_owner(interaction.user.id) or is_admin_tier or str(interaction.user.id) in admin_redeemed_users):
-            message = "❌ This command requires the Admin plan or Admin access."
+            message = "❌ This command requires internal bot authorization."
             try:
                 if interaction.response.is_done():
                     await interaction.followup.send(message, ephemeral=True)
@@ -1550,17 +1572,39 @@ class ObfuscateConfirmView(BlacklistAwareView):
 
     @discord.ui.button(label="Yes ✅", style=discord.ButtonStyle.success)
     async def yes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.script_name not in scripts_data:
+            await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+            return
+        quota_ok, quota_error = _quota_check(interaction.user.id, "sources")
+        if not quota_ok:
+            await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+            return
+        old_source = scripts_data[self.script_name].get("source_code")
         scripts_data[self.script_name]["source_code"] = self.file_content
-        save_data()
+        if save_data() is False:
+            scripts_data[self.script_name]["source_code"] = old_source
+            await interaction.response.send_message("❌ Could not save the source.", ephemeral=True)
+            return
         _quota_increment(interaction.user.id, "sources")
-        await interaction.response.send_message(f"⚡ Source file saved & protected for `{self.script_name}`!", ephemeral=True)
+        await interaction.response.send_message(f"⚡ Source file saved & protected for `{self.script_name}`!\\n{_quota_status(interaction.user.id)}", ephemeral=True)
 
     @discord.ui.button(label="No ❌", style=discord.ButtonStyle.danger)
     async def no_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.script_name not in scripts_data:
+            await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+            return
+        quota_ok, quota_error = _quota_check(interaction.user.id, "sources")
+        if not quota_ok:
+            await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+            return
+        old_source = scripts_data[self.script_name].get("source_code")
         scripts_data[self.script_name]["source_code"] = self.file_content
-        save_data()
+        if save_data() is False:
+            scripts_data[self.script_name]["source_code"] = old_source
+            await interaction.response.send_message("❌ Could not save the source.", ephemeral=True)
+            return
         _quota_increment(interaction.user.id, "sources")
-        await interaction.response.send_message(f"✅ Source file attached for `{self.script_name}`!", ephemeral=True)
+        await interaction.response.send_message(f"✅ Source file attached for `{self.script_name}`!\\n{_quota_status(interaction.user.id)}", ephemeral=True)
 
 
 class AddSourceModal(BlacklistAwareModal, title="Crystal Hub — Add Source"):
@@ -1584,9 +1628,22 @@ class AddSourceModal(BlacklistAwareModal, title="Crystal Hub — Add Source"):
         if self.script_name not in scripts_data:
             await interaction.response.send_message("❌ Script not found.", ephemeral=True)
             return
-        scripts_data[self.script_name]["source_code"] = str(self.source.value)
-        save_data()
-        await interaction.response.send_message(f"✅ Source added to `{self.script_name}`.", ephemeral=True)
+        quota_ok, quota_error = _quota_check(self.owner_id, "sources")
+        if not quota_ok:
+            await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+            return
+        s_info = scripts_data[self.script_name]
+        old_source = s_info.get("source_code")
+        s_info["source_code"] = str(self.source.value)
+        if save_data() is False:
+            s_info["source_code"] = old_source
+            await interaction.response.send_message("❌ Could not save the source. Please try again.", ephemeral=True)
+            return
+        _quota_increment(self.owner_id, "sources")
+        await interaction.response.send_message(
+            f"✅ Source added to `{self.script_name}`.\\n{_quota_status(self.owner_id)}",
+            ephemeral=True
+        )
 
 
 class CreateScriptActionsView(BlacklistAwareView):
@@ -1991,7 +2048,7 @@ async def generate_key_command(
     _quota_increment(interaction.user.id, "keys")
     when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
     await interaction.response.send_message(
-        f"🔑 **New Key Generated for `{script}`** ({mode} — {when}):\n```text\n{new_key}\n```",
+        f"🔑 **New Key Generated for `{script}`** ({mode} — {when}):\n```text\n{new_key}\n```\n\n{_quota_status(interaction.user.id)}",
         ephemeral=True
     )
 
@@ -2031,7 +2088,7 @@ async def key_command(
     _quota_increment(interaction.user.id, "keys")
     when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
     await interaction.response.send_message(
-        f"🔑 **New Key Generated for `{script}`** ({mode} — {when}):\n```text\n{new_key}\n```",
+        f"🔑 **New Key Generated for `{script}`** ({mode} — {when}):\n```text\n{new_key}\n```\n\n{_quota_status(interaction.user.id)}",
         ephemeral=True
     )
 
@@ -2090,7 +2147,7 @@ async def whitelist_command(
         dm_status = "DM sent successfully."
     except Exception:
         dm_status = "Could not send DM (user DMs closed)."
-    await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}` ({when})! ({dm_status})", ephemeral=True)
+    await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}` ({when})! ({dm_status})\n\n{_quota_status(interaction.user.id)}", ephemeral=True)
 
 
 # Removed duplicate whitelist alias `/whilst`; `/whitelist` is the canonical command.
@@ -2234,7 +2291,7 @@ async def create_script_command(
             f"📜 **Script Name:** `{name_script}`\n"
             f"👤 **Buyer Role:** {f'<@&{buyer_role_id}>' if buyer_role_id else 'Not configured'}\n"
             f"🛡️ **Admin Role:** {f'<@&{admin_role_id}>' if admin_role_id else 'Not configured'}\n"
-            f"🔗 **Source:** {'Imported from API' if imported else 'Created manually'}"
+            f"🔗 **Source:** {'Imported from API' if imported else 'Created manually'}\n\n{_quota_status(interaction.user.id)}"
         ),
         color=0x00ff00
     )
@@ -2777,9 +2834,63 @@ async def panel_setup_command(
     save_data()
 
     await interaction.response.send_message(
-        f"✅ Panel ready in {target_channel.mention}. This panel is saved and will be refreshed after the bot restarts/updates.",
+        f"✅ Panel ready in {target_channel.mention}. This panel is saved and will be refreshed after the bot restarts/updates.\n\n{_quota_status(interaction.user.id)}",
         ephemeral=True
     )
+
+
+@bot.tree.command(name="panel-delete", description="Delete one of your configured panels and free its quota slot")
+@app_commands.describe(script="Script whose panel should be deleted", channel="Channel containing the panel")
+@app_commands.autocomplete(script=script_autocomplete)
+async def panel_delete_command(
+    interaction: discord.Interaction,
+    script: str,
+    channel: discord.TextChannel,
+):
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        return
+    if not is_admin_or_has_role(interaction, script):
+        await interaction.response.send_message("❌ You do not have permission to delete this panel.", ephemeral=True)
+        return
+    s_info = scripts_data[script]
+    instances = s_info.get("panel_instances")
+    if not isinstance(instances, list):
+        instances = []
+        s_info["panel_instances"] = instances
+    target = next((p for p in instances
+                   if str(p.get("channel_id")) == str(channel.id)
+                   and str(p.get("created_by", s_info.get("panel_created_by", s_info.get("created_by", "")))) == str(interaction.user.id)), None)
+    if target is None and str(s_info.get("panel_channel_id")) == str(channel.id) and str(s_info.get("panel_created_by", s_info.get("created_by", ""))) == str(interaction.user.id):
+        target = {
+            "guild_id": s_info.get("panel_guild_id"),
+            "channel_id": s_info.get("panel_channel_id"),
+            "message_id": s_info.get("panel_message_id"),
+            "created_by": s_info.get("panel_created_by", s_info.get("created_by", "")),
+        }
+        instances.append(target)
+    if target is None:
+        await interaction.response.send_message("❌ No panel you own was found in that channel.", ephemeral=True)
+        return
+    message_id = target.get("message_id")
+    if message_id:
+        try:
+            message = await channel.fetch_message(int(message_id))
+            await message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+            pass
+    instances.remove(target)
+    s_info["panel_instances"] = instances
+    if str(s_info.get("panel_message_id")) == str(message_id):
+        latest = instances[-1] if instances else {}
+        s_info["panel_guild_id"] = latest.get("guild_id")
+        s_info["panel_channel_id"] = latest.get("channel_id")
+        s_info["panel_message_id"] = latest.get("message_id")
+        s_info["panel_name"] = latest.get("name")
+        s_info["panel_description"] = latest.get("description", "")
+        s_info["panel_created_by"] = latest.get("created_by")
+    save_data()
+    await interaction.response.send_message(f"✅ Panel deleted from the saved inventory. Its quota slot is now free.\n\n{_quota_status(interaction.user.id)}", ephemeral=True)
 
 
 # 8. تحديث السكربت
@@ -3156,11 +3267,10 @@ async def setting_command(
 
 @bot.tree.command(name="redeem", description="Redeem a code, or generate a plan code (owner only)")
 @app_commands.describe(
-    code="Optional: redeem an existing code (e.g. admi-on-top)",
-    create_plan="Optional (owner/authorized only): generate Admin, Premium, or Ultra code"
+    code="Optional: redeem an existing Crystal Hub code",
+    create_plan="Optional (authorized only): generate a Premium or Ultra code"
 )
 @app_commands.choices(create_plan=[
-    app_commands.Choice(name="Admin", value="Admin"),
     app_commands.Choice(name="Premium", value="Premium"),
     app_commands.Choice(name="Ultra", value="Ultra"),
 ])
@@ -3173,7 +3283,7 @@ async def redeem_command(
     if create_plan is not None and not (code and str(code).strip()):
         if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users):
             await interaction.response.send_message(
-                "❌ Redeem the existing `admi-on-top` admin code first to unlock plan-code creation.",
+                "❌ This action requires internal authorization from the bot owner.",
                 ephemeral=True
             )
             return
@@ -3232,7 +3342,7 @@ async def redeem_command(
             admin_redeemed_users.discard(user_id)
             await interaction.response.send_message("❌ Could not save redemption. Try again later.", ephemeral=True)
             return
-        await interaction.response.send_message("✅ Admin code redeemed. You can now use `-massage`.", ephemeral=True)
+        await interaction.response.send_message("✅ Internal authorization activated.", ephemeral=True)
         return
 
     code_hash = _hash_redeem_code(supplied)
@@ -3242,6 +3352,9 @@ async def redeem_command(
         return
 
     plan = str(rec.get("plan", "Premium"))
+    if plan not in ("Premium", "Ultra"):
+        await interaction.response.send_message("❌ This code does not grant a customer subscription.", ephemeral=True)
+        return
     days = int(rec.get("duration_days", 30))
     now = datetime.datetime.now(datetime.timezone.utc)
     expires_at = None if days <= 0 else (now + datetime.timedelta(days=days)).isoformat()
@@ -3374,6 +3487,90 @@ def _admin_role_setup_message(ctx: commands.Context) -> str:
     if ctx.guild and not _global_admin_role_id(ctx.guild.id):
         return "Set the server-wide admin role first using `/set-admin-role`, then try again."
     return "This command requires the configured admin role or Discord Administrator permission."
+
+
+@bot.command(name="files")
+async def import_all_user_files(ctx: commands.Context):
+    """Admin-only full import: attach a Crystal Hub Admin backup after the prompt."""
+    user_id = int(ctx.author.id)
+    if not (is_bot_owner(user_id) or str(user_id) in admin_redeemed_users or _discord_plan(user_id) == "Admin"):
+        await ctx.reply("❌ This command is for the internal Admin rank only.", mention_author=False)
+        return
+
+    def valid_upload(message):
+        return (
+            message.author.id == ctx.author.id
+            and message.channel.id == ctx.channel.id
+            and bool(message.attachments)
+        )
+
+    attachment = ctx.message.attachments[0] if ctx.message.attachments else None
+    if attachment is None:
+        await ctx.reply(
+            "📁 **Send the full Crystal Hub backup file now** (JSON). I'll wait up to 2 minutes.\n"
+            "Get the file using `-g files`. Import replaces the saved bot data with the backup, "
+            "including users' plans, usage, scripts, keys, whitelist, and settings.",
+            mention_author=False,
+        )
+        try:
+            upload_message = await bot.wait_for("message", check=valid_upload, timeout=120)
+            attachment = upload_message.attachments[0]
+        except asyncio.TimeoutError:
+            await ctx.reply("⌛ Import cancelled: no file was received within 2 minutes.", mention_author=False)
+            return
+
+    try:
+        if attachment.size and attachment.size > 8 * 1024 * 1024:
+            raise ValueError("File is larger than 8 MB.")
+        raw = await attachment.read()
+        snapshot = json.loads(raw.decode("utf-8-sig"))
+        # Validate the Admin backup and its signature before changing any live data.
+        if not isinstance(snapshot, dict) or snapshot.get("backup_type") != "admin":
+            raise ValueError("Use the full Admin backup created by `-g files`.")
+        _restore_settings_backup(snapshot, "admin", ctx.guild.id if ctx.guild else None)
+        users_count = len(KNOWN_USERS)
+        scripts_count = len(scripts_data)
+        await ctx.reply(
+            f"✅ Full backup imported successfully. Restored **{users_count}** known users and **{scripts_count}** scripts, "
+            "including saved plan entitlements, monthly usage, keys, whitelist, panels, and settings.",
+            mention_author=False,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        await ctx.reply(f"❌ Could not import this backup: {exc}", mention_author=False)
+    except Exception as exc:
+        print(f"Admin full import failed: {type(exc).__name__}: {exc}")
+        await ctx.reply("❌ Import failed. The current data may be unchanged; check the bot logs.", mention_author=False)
+
+
+@bot.command(name="g")
+async def get_admin_files_backup(ctx: commands.Context, item: str = ""):
+    """Admin-only full export invoked as `-g files`."""
+    user_id = int(ctx.author.id)
+    if not (is_bot_owner(user_id) or str(user_id) in admin_redeemed_users or _discord_plan(user_id) == "Admin"):
+        await ctx.reply("❌ This command is for the internal Admin rank only.", mention_author=False)
+        return
+    if item.strip().lower() != "files":
+        await ctx.reply("Use `-g files` to export the full user and bot data backup.", mention_author=False)
+        return
+
+    try:
+        payload = _backup_snapshot("admin")
+        raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        users_count = len(set(KNOWN_USERS) | {int(uid) for uid in discord_plan_entitlements if str(uid).isdigit()})
+        scripts_count = len(scripts_data)
+        key_count = sum(len(info.get("valid_keys", set())) for info in scripts_data.values())
+        whitelist_count = sum(len(info.get("whitelisted_users", set())) for info in scripts_data.values())
+        await ctx.reply(
+            f"📦 Full Admin backup: **{users_count}** known/entitled users, **{scripts_count}** scripts, "
+            f"**{key_count}** stored keys, and **{whitelist_count}** script whitelist entries. "
+            "Includes saved plans, monthly usage, source/config, panels, keys, whitelist/access records, redeem records, "
+            "and settings. It includes sensitive data; keep it private.",
+            file=discord.File(io.BytesIO(raw), filename="crystal_hub_all_users_admin_backup.json"),
+            mention_author=False,
+        )
+    except Exception as exc:
+        print(f"Admin full export failed: {type(exc).__name__}: {exc}")
+        await ctx.reply("❌ Could not create the full backup. Check the bot logs.", mention_author=False)
 
 
 @bot.command(name="Ai")
@@ -3598,7 +3795,7 @@ def _crystal_ai_context():
     return {
         "plans": {
             "Free": {"price": "Free", "duration": "free tier", "active_scripts": 5, "active_panels": 5, "source_operations_per_month": 20, "active_keys_or_whitelist_slots": 100, "avatar_changes": "not included"},
-            "Premium": {"price": "$1 USD", "duration": "lifetime", "active_scripts": 10, "active_panels": 10, "source_operations_per_month": 100, "active_keys_or_whitelist_slots": 1000, "avatar_changes_per_month": 5},
+            "Premium": {"price": "$1 USD", "duration": "lifetime", "active_scripts": 10, "active_panels": 10, "source_operations_per_month": 100, "active_keys_or_whitelist_slots": 500, "avatar_changes_per_month": 5},
             "Ultra": {"price": "$2 USD", "duration": "lifetime", "limits": "unlimited according to the current bot quota logic"}
         },
         "configured_scripts": scripts,
@@ -3768,7 +3965,7 @@ def _crystal_faq_embed(kind: str):
                 "• حتى **10 سكربتات نشطة**\n"
                 "• حتى **10 لوحات نشطة**\n"
                 "• **100 عملية مصدر شهريًا**\n"
-                "• حتى **1,000 مفتاح/مكان Whitelist نشط**\n"
+                "• حتى **500 مفتاح/مكان Whitelist نشط**\n"
                 "• **5 تغييرات أفاتار شهريًا**\n\n"
                 "**خطة Ultra — 2 دولار للأبد**\n"
                 "• حدود الاستخدام غير محدودة حسب إعدادات البوت الحالية.\n\n"
@@ -3790,7 +3987,7 @@ def _crystal_faq_embed(kind: str):
                 "• Up to **10 active scripts**\n"
                 "• Up to **10 active panels**\n"
                 "• **100 source operations per month**\n"
-                "• Up to **1,000 active keys/whitelist slots**\n"
+                "• Up to **500 active keys/whitelist slots**\n"
                 "• **5 avatar changes per month**\n\n"
                 "**Ultra plan — $2 USD, lifetime**\n"
                 "• Unlimited usage according to the current bot quota logic.\n\n"
@@ -4062,7 +4259,7 @@ class AdminGuideLanguageView(BlacklistAwareView):
 async def admin_command(interaction: discord.Interaction):
     if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users or _discord_plan(interaction.user.id) == "Admin"):
         await interaction.response.send_message(
-            "❌ This command requires the Admin plan or Admin access.",
+            "❌ This command requires internal bot authorization.",
             ephemeral=True,
         )
         return
@@ -4091,7 +4288,7 @@ async def admin_command(interaction: discord.Interaction):
 @app_commands.describe(user="The user to blacklist")
 async def blacklist_command(interaction: discord.Interaction, user: discord.Member):
     if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users or _discord_plan(interaction.user.id) == "Admin"):
-        await interaction.response.send_message("❌ This command requires the Admin plan or Admin access.", ephemeral=True)
+        await interaction.response.send_message("❌ This command requires internal bot authorization.", ephemeral=True)
         return
     if user.id == interaction.user.id:
         await interaction.response.send_message("❌ You cannot blacklist yourself.", ephemeral=True)
@@ -4108,7 +4305,7 @@ async def blacklist_command(interaction: discord.Interaction, user: discord.Memb
 @app_commands.describe(user_id="Discord user ID to unblock")
 async def unblacklist_command(interaction: discord.Interaction, user_id: str):
     if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users or _discord_plan(interaction.user.id) == "Admin"):
-        await interaction.response.send_message("❌ This command requires the Admin plan or Admin access.", ephemeral=True)
+        await interaction.response.send_message("❌ This command requires internal bot authorization.", ephemeral=True)
         return
     try:
         target_id = int(user_id.strip())
@@ -4185,12 +4382,12 @@ async def send_server_message_command(interaction: discord.Interaction, server_i
 
 @bot.tree.command(name="create-redeem-code", description="Create a one-time Crystal Hub website subscription code")
 @app_commands.describe(plan="Plan granted by the code")
-@app_commands.choices(plan=[app_commands.Choice(name="Premium (30 days)", value="Premium"), app_commands.Choice(name="Ultra (Lifetime)", value="Ultra"), app_commands.Choice(name="Admin (Lifetime)", value="Admin")])
+@app_commands.choices(plan=[app_commands.Choice(name="Premium (30 days)", value="Premium"), app_commands.Choice(name="Ultra (Lifetime)", value="Ultra")])
 async def create_redeem_code_command(interaction: discord.Interaction, plan: app_commands.Choice[str]):
     if not is_bot_owner(interaction.user.id):
         await interaction.response.send_message("❌ This command is restricted to the configured bot owner.", ephemeral=True)
         return
-    raw = "CH-" + {"Premium":"PREM", "Ultra":"ULTRA", "Admin":"ADMIN"}[plan.value] + "-" + secrets.token_hex(6).upper()
+    raw = "CH-" + {"Premium":"PREM", "Ultra":"ULTRA"}[plan.value] + "-" + secrets.token_hex(6).upper()
     days = 30 if plan.value == "Premium" else 0
     site_redeem_codes[_hash_redeem_code(raw)] = {"plan": plan.value, "duration_days": days, "created_by": str(interaction.user.id), "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "redeemed_by": None, "redeemed_at": None, "revoked": False}
     try:
@@ -4299,7 +4496,7 @@ async def on_message(message: discord.Message):
             await message.reply("❌ Use this command inside a server.", mention_author=False)
             return
         if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users or _discord_plan(message.author.id) == "Admin"):
-            await message.reply("❌ This command requires the Admin plan or Admin access.", mention_author=False)
+            await message.reply("❌ This command requires internal bot authorization.", mention_author=False)
             return
         parts = content.split(maxsplit=2)
         if len(parts) < 3:
@@ -4326,7 +4523,7 @@ async def on_message(message: discord.Message):
             await message.reply("❌ Use this command inside a server.", mention_author=False)
             return
         if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users or _discord_plan(message.author.id) == "Admin"):
-            await message.reply("❌ This command requires the Admin plan or Admin access.", mention_author=False)
+            await message.reply("❌ This command requires internal bot authorization.", mention_author=False)
             return
         parts = content.split(maxsplit=1)
         if len(parts) < 2:
