@@ -1830,6 +1830,7 @@ class ViewMobileResponseView(BlacklistAwareView):
 
     @discord.ui.button(label="View Mobile 📱", style=discord.ButtonStyle.secondary)
     async def view_mobile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _track_user_activity(interaction.user.id, f"View Mobile: {self.script_name}")
         s_info = scripts_data.get(self.script_name)
         if not s_info:
             await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
@@ -1882,6 +1883,7 @@ class PanelControlView(BlacklistAwareView):
 
     @discord.ui.button(label="📜 Get Script", style=discord.ButtonStyle.primary, row=1)
     async def view_script_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _track_user_activity(interaction.user.id, f"Get Script: {self.script_name}")
         s_info = scripts_data.get(self.script_name)
         if not s_info:
             await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
@@ -1905,6 +1907,7 @@ class PanelControlView(BlacklistAwareView):
 
     @discord.ui.button(label="📊 Get Stats", style=discord.ButtonStyle.secondary, row=3)
     async def stats_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _track_user_activity(interaction.user.id, f"Get Stats: {self.script_name}")
         # Stats is the original button, now updated to show the user's current state.
         s_info = scripts_data.get(self.script_name)
         if not s_info:
@@ -1952,6 +1955,7 @@ class PanelControlView(BlacklistAwareView):
 
     @discord.ui.button(label="⚙️ Reset HWID", style=discord.ButtonStyle.secondary, row=2)
     async def reset_hwid_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _track_user_activity(interaction.user.id, f"Reset HWID: {self.script_name}")
         s_info = scripts_data.get(self.script_name)
         user_id = interaction.user.id
         if not s_info or user_id not in s_info.get("user_keys", {}):
@@ -1977,10 +1981,12 @@ class PanelControlView(BlacklistAwareView):
 
     @discord.ui.button(label="🔑 Redeem Key", style=discord.ButtonStyle.success, row=0)
     async def redeem_key_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _track_user_activity(interaction.user.id, f"Redeem Key: {self.script_name}")
         await interaction.response.send_modal(ScriptRedeemModal(self.script_name))
 
     @discord.ui.button(label="👤 Get Role", style=discord.ButtonStyle.primary, row=1)
     async def get_buyer_role_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _track_user_activity(interaction.user.id, f"Get Role: {self.script_name}")
         s_info = scripts_data.get(self.script_name)
         if not s_info or not s_info.get("buyer_role_id"):
             await interaction.response.send_message("❌ Buyer role is not configured for this script.", ephemeral=True)
@@ -2718,7 +2724,7 @@ async def bypass_link(interaction: discord.Interaction, url: str):
     try:
         parsed = urllib.parse.urlparse(url.strip())
         if parsed.scheme.lower() != "https" or not parsed.hostname:
-            await interaction.response.send_message("أرسل رابطًا كاملًا يبدأ بـ `https://`.", ephemeral=True)
+            await interaction.response.send_message("Send a full URL starting with `https://`.", ephemeral=True)
             return
 
         host = parsed.hostname.lower().rstrip(".")
@@ -2730,25 +2736,25 @@ async def bypass_link(interaction: discord.Interaction, url: str):
         }
         if not any(host == allowed or host.endswith("." + allowed) for allowed in lootlabs_hosts):
             await interaction.response.send_message(
-                "الأمر يدعم روابط LootLabs فقط حاليًا، مثل `links.lootlabs.gg`.", ephemeral=True
+                "This command currently supports LootLabs URLs only, such as `links.lootlabs.gg`.", ephemeral=True
             )
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         final_url, history, status, content_type = await _resolve_standard_redirects(url.strip())
         if history and final_url != url.strip():
-            message = "✅ **تم تتبّع التحويلات العادية للرابط.**\n"
-            message += f"**الرابط الناتج:** {final_url}\n"
-            message += f"**عدد التحويلات:** {len(history)}"
+            message = "Tracked the standard HTTP redirects.\n"
+            message += f"**Final URL:** {final_url}\n"
+            message += f"**Redirect count:** {len(history)}"
             if status is not None:
                 message += f" • **HTTP:** {status}"
             await interaction.followup.send(message, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
         else:
             await interaction.followup.send(
-                "ما ظهر تحويل HTTP عادي يمكن تتبّعه تلقائيًا. قد تحتاج الصفحة إلى JavaScript أو إكمال خطوات العرض؛ "
-                "الأمر لا يتجاوز الإعلانات أو متطلبات العروض.\n"
-                f"**الحالة:** {status if status is not None else 'غير معروفة'}\n"
-                f"**الرابط:** {final_url}",
+                "No standard HTTP redirect could be followed automatically. The page may require JavaScript or completing an offer step; "
+                "this command does not bypass ads or offer requirements.\n"
+                f"**Status:** {status if status is not None else 'unknown'}\n"
+                f"**URL:** {final_url}",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -2761,9 +2767,9 @@ async def bypass_link(interaction: discord.Interaction, url: str):
     except Exception as exc:
         print(f"/bypass command failed: {type(exc).__name__}: {exc}")
         if interaction.response.is_done():
-            await interaction.followup.send("صار خطأ أثناء فحص التحويلات. جرّب مرة ثانية.", ephemeral=True)
+            await interaction.followup.send("An error occurred while checking redirects. Please try again.", ephemeral=True)
         else:
-            await interaction.response.send_message("صار خطأ أثناء فحص التحويلات. جرّب مرة ثانية.", ephemeral=True)
+            await interaction.response.send_message("An error occurred while checking redirects. Please try again.", ephemeral=True)
 
 
 # Panel messages can be deleted manually in Discord; no panel-delete slash command is registered.
@@ -3439,38 +3445,38 @@ async def upload_script_file_and_refresh_panel(ctx: commands.Context):
     """Upload a Lua/Luau file, update the matching script, and replace its old panel in-place."""
     user_id = int(ctx.author.id)
     if not (is_bot_owner(user_id) or str(user_id) in admin_redeemed_users or _discord_plan(user_id) == "Admin"):
-        await ctx.reply("❌ هذا الأمر مخصص للإدارة فقط.", mention_author=False)
+        await ctx.reply("This command is restricted to the bot Admin.", mention_author=False)
         return
     if not ctx.guild or not isinstance(ctx.author, discord.Member):
-        await ctx.reply("❌ استخدم الأمر داخل السيرفر.", mention_author=False)
+        await ctx.reply("Use this command inside a server.", mention_author=False)
         return
 
     attachment = ctx.message.attachments[0] if ctx.message.attachments else None
     if attachment is None:
-        await ctx.reply("📎 أرسل ملف `.lua` أو `.luau` أو `.txt` مع الأمر `-files`، أو أرسل الملف في الرسالة التالية خلال دقيقتين.", mention_author=False)
+        await ctx.reply("Attach a `.lua`, `.luau`, or `.txt` file to `-files`, or send the file in your next message within 2 minutes.", mention_author=False)
         def valid_upload(message):
             return message.author.id == ctx.author.id and message.channel.id == ctx.channel.id and bool(message.attachments)
         try:
             upload_message = await bot.wait_for("message", check=valid_upload, timeout=120)
             attachment = upload_message.attachments[0]
         except asyncio.TimeoutError:
-            await ctx.reply("⌛ انتهى الوقت ولم يصل ملف.", mention_author=False)
+            await ctx.reply("Timed out: no file was received.", mention_author=False)
             return
 
     filename = str(attachment.filename or "script.lua")
     if not filename.lower().endswith((".lua", ".luau", ".txt")):
-        await ctx.reply("❌ ارفع ملف Lua/Luau أو TXT فقط.", mention_author=False)
+        await ctx.reply("Upload a Lua, Luau, or TXT file only.", mention_author=False)
         return
     if attachment.size and attachment.size > 2 * 1024 * 1024:
-        await ctx.reply("❌ حجم الملف أكبر من 2MB.", mention_author=False)
+        await ctx.reply("The file is larger than 2 MB.", mention_author=False)
         return
     try:
         source = (await attachment.read()).decode("utf-8-sig")
     except (UnicodeDecodeError, discord.HTTPException):
-        await ctx.reply("❌ تعذر قراءة الملف؛ تأكد أنه نص UTF-8.", mention_author=False)
+        await ctx.reply("Could not read the file. Make sure it is UTF-8 text.", mention_author=False)
         return
     if not source.strip():
-        await ctx.reply("❌ الملف فارغ.", mention_author=False)
+        await ctx.reply("The file is empty.", mention_author=False)
         return
 
     script_name = re.sub(r"[^A-Za-z0-9 _.-]", "", filename.rsplit(".", 1)[0]).strip()[:80]
@@ -3506,51 +3512,91 @@ async def upload_script_file_and_refresh_panel(ctx: commands.Context):
         }
         scripts_data[script_name] = s_info
 
-    # Reuse each old panel's exact channel/title/description. For a new script,
-    # publish the first panel in the channel where -files was run.
+    # Refresh every saved panel instance for this script across all servers.
+    # Each replacement is posted in the original channel, with the new controls bound
+    # to the updated script. Unreachable locations are retained in the database.
     panel_targets = []
     for panel in old_instances:
-        if str(panel.get("guild_id")) == str(ctx.guild.id) and panel.get("channel_id"):
-            channel = ctx.guild.get_channel(int(panel["channel_id"]))
-            if channel is not None and hasattr(channel, "send"):
-                panel_targets.append((channel, panel))
-    if not panel_targets:
-        panel_targets = [(ctx.channel, {"name": script_name, "description": f"Crystal Hub • Script Management\n\nScript: **{script_name}**"})]
+        try:
+            guild_id = int(panel.get("guild_id"))
+            channel_id = int(panel.get("channel_id"))
+        except (TypeError, ValueError):
+            continue
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            continue
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                channel = None
+        if channel is not None and hasattr(channel, "send") and hasattr(channel, "fetch_message"):
+            panel_targets.append((channel, panel))
+
+    # If this is a brand-new script, create its first panel where the command was used.
+    if not old_instances:
+        panel_targets = [(ctx.channel, {"guild_id": ctx.guild.id, "name": script_name,
+                         "description": f"Crystal Hub • Script Management\n\nScript: **{script_name}**"})]
+    elif not panel_targets:
+        await ctx.reply(
+            "The script source was read, but none of its saved panel channels are reachable. "
+            "No new panel was posted; check the bot's server/channel permissions and try again.",
+            mention_author=False,
+        )
+        return
 
     ensure_file_id(script_name, s_info)
     s_info.setdefault("panel_instances", [])
     if not save_data():
-        await ctx.reply("❌ ما قدرت أحفظ السكربت. تأكد من إعدادات التخزين الدائم في Render.", mention_author=False)
+        await ctx.reply("❌ Could not save the script. Check Render persistent storage settings.", mention_author=False)
         return
 
     new_instances = []
+    preserved_instances = []
     replaced = 0
+    failed_channels = 0
     for channel, panel in panel_targets:
+        title = str(panel.get("name") or script_name)[:256]
+        description = str(panel.get("description") or f"Crystal Hub • Script Management\n\nScript: **{script_name}**")[:4000]
+        embed = discord.Embed(title=title, description=description, color=0xd4af37)
+        if bot.user:
+            embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
+        # Send the working replacement first. If sending fails, preserve the old panel.
+        try:
+            new_message = await channel.send(embed=embed, view=PanelControlView(script_name=script_name))
+        except (discord.Forbidden, discord.HTTPException):
+            failed_channels += 1
+            preserved_instances.append(dict(panel))
+            continue
         old_message_id = panel.get("message_id")
         if old_message_id:
             try:
                 old_message = await channel.fetch_message(int(old_message_id))
                 await old_message.delete()
                 replaced += 1
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+            except discord.NotFound:
                 pass
-        title = str(panel.get("name") or script_name)[:256]
-        description = str(panel.get("description") or f"Crystal Hub • Script Management\n\nScript: **{script_name}**")[:4000]
-        embed = discord.Embed(title=title, description=description, color=0xd4af37)
-        if bot.user:
-            embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
-        new_message = await channel.send(embed=embed, view=PanelControlView(script_name=script_name))
-        new_instances.append({"guild_id": ctx.guild.id, "channel_id": channel.id, "message_id": new_message.id,
-                              "name": title, "description": description, "created_by": str(user_id)})
-    s_info["panel_instances"] = new_instances
+            except (discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+                # Replacement is live; the stale old message may remain if delete permission is missing.
+                pass
+        new_instances.append({"guild_id": int(getattr(getattr(channel, "guild", None), "id", panel.get("guild_id", ctx.guild.id))),
+                              "channel_id": channel.id, "message_id": new_message.id,
+                              "name": title, "description": description,
+                              "created_by": str(panel.get("created_by") or user_id)})
+    s_info["panel_instances"] = preserved_instances + new_instances
     if new_instances:
         latest = new_instances[-1]
         s_info.update({"panel_guild_id": latest["guild_id"], "panel_channel_id": latest["channel_id"],
                        "panel_message_id": latest["message_id"], "panel_name": latest["name"],
-                       "panel_description": latest["description"], "panel_created_by": str(user_id)})
+                       "panel_description": latest["description"], "panel_created_by": latest["created_by"]})
     save_data()
-    _track_user_activity(user_id, "-files: upload/update script and refresh panel")
-    await ctx.reply(f"✅ تم رفع/تحديث السكربت **{script_name}** وإنشاء البانل الجديد في نفس مكان القديم.\nالرسائل القديمة التي حذفت: **{replaced}** · البانلات الجديدة: **{len(new_instances)}**", mention_author=False)
+    _track_user_activity(user_id, "-files: upload/update script and refresh all saved panels")
+    await ctx.reply(
+        f"Updated script **{script_name}**. Old panel messages deleted: **{replaced}**; new panels posted: **{len(new_instances)}**; "
+        f"channels that could not be updated: **{failed_channels}**. Panels are connected to the updated script.",
+        mention_author=False,
+    )
 
 
 @bot.command(name="restore-files")
@@ -3592,11 +3638,13 @@ async def import_all_user_files(ctx: commands.Context):
         if not isinstance(snapshot, dict) or snapshot.get("backup_type") != "admin":
             raise ValueError("Use the full Admin backup created by `-g files` with `-restore-files`.")
         _restore_settings_backup(snapshot, "admin", ctx.guild.id if ctx.guild else None)
+        # Rebuild every saved panel in its original channel and remove the old message after replacement.
+        await _refresh_saved_panels_after_startup()
         users_count = len(KNOWN_USERS)
         scripts_count = len(scripts_data)
         await ctx.reply(
-            f"✅ Full backup imported successfully. Restored **{users_count}** known users and **{scripts_count}** scripts, "
-            "including saved plan entitlements, monthly usage, keys, whitelist, panels, and settings.",
+            f"Full backup imported successfully. Restored **{users_count}** known users and **{scripts_count}** scripts. "
+            "Saved panels were refreshed across reachable servers; old panel messages are deleted when the bot has permission.",
             mention_author=False,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
@@ -3667,7 +3715,31 @@ async def get_admin_files_backup(ctx: commands.Context, item: str = ""):
     try:
         payload = _backup_snapshot("admin")
         # Human-readable user report: names, ID, plan, activity counters, and timestamps.
-        all_user_ids = sorted(set(KNOWN_USERS) | {int(uid) for uid in discord_plan_entitlements if str(uid).isdigit()} | {int(uid) for uid in USER_ACTIVITY if str(uid).isdigit()})
+        tracked_ids = set(KNOWN_USERS)
+        tracked_ids.update(int(uid) for uid in discord_plan_entitlements if str(uid).isdigit())
+        tracked_ids.update(int(uid) for uid in USER_ACTIVITY if str(uid).isdigit())
+        # Include users referenced by script ownership, panels, access, keys, and whitelist records.
+        for script_info in scripts_data.values():
+            for candidate in (script_info.get("created_by"), script_info.get("panel_created_by")):
+                if str(candidate).isdigit():
+                    tracked_ids.add(int(candidate))
+            for mapping_name in ("user_access", "user_keys"):
+                mapping = script_info.get(mapping_name) or {}
+                if isinstance(mapping, dict):
+                    tracked_ids.update(int(uid) for uid in mapping if str(uid).isdigit())
+            tracked_ids.update(int(uid) for uid in (script_info.get("whitelisted_users") or set()) if str(uid).isdigit())
+            for panel in script_info.get("panel_instances") or []:
+                candidate = panel.get("created_by") if isinstance(panel, dict) else None
+                if str(candidate).isdigit():
+                    tracked_ids.add(int(candidate))
+        for registry in (site_entitlements, monthly_usage):
+            if isinstance(registry, dict):
+                tracked_ids.update(int(uid) for uid in registry if str(uid).isdigit())
+        for script_info in scripts_data.values():
+            for meta in (script_info.get("key_meta") or {}).values():
+                if isinstance(meta, dict) and str(meta.get("user_id", "")).isdigit():
+                    tracked_ids.add(int(meta["user_id"]))
+        all_user_ids = sorted(tracked_ids)
         user_report = []
         for uid in all_user_ids:
             try:
@@ -3685,53 +3757,131 @@ async def get_admin_files_backup(ctx: commands.Context, item: str = ""):
             user_report.append({"username": uname, "user_id": str(uid), "plan": _discord_plan(uid),
                                 "last_seen": activity.get("last_seen"), "actions": activity.get("actions", {})})
         payload["user_report"] = user_report
-        # Re-sign after attaching the readable report so -restore-files validates the exact export.
-        if payload.get("backup_type") == "admin":
-            payload.pop("signature", None)
-            payload["signature"] = _backup_signature(dict(payload))
-        raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         report_lines = [
-            "CRYSTAL HUB — FULL ADMIN REPORT",
+            "CRYSTAL HUB - FULL ADMIN REPORT",
             f"Generated: {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
             "",
-            "==================== USERS / USAGE ====================",
+            "This readable report complements the JSON backup. The JSON contains the complete restorable data.",
+            "==================== USER-BY-USER ACTIVITY AND DATA ====================",
+            "",
         ]
         for entry in user_report:
+            uid = str(entry["user_id"])
             report_lines.append(f"USER: {entry['username']}")
-            report_lines.append(f"Discord ID: {entry['user_id']} | Plan: {entry['plan']} | Last seen: {entry.get('last_seen') or 'Not recorded'}")
+            report_lines.append(f"Discord ID: {uid} | Plan: {entry['plan']} | Last seen: {entry.get('last_seen') or 'Not recorded'}")
             actions = entry.get("actions") or {}
+            report_lines.append("Actions / commands used:")
             if actions:
                 for action_name, action_info in sorted(actions.items()):
                     report_lines.append(f"  - {action_name}: used {action_info.get('count', 0)} time(s); last: {action_info.get('last_used') or 'unknown'}")
             else:
                 report_lines.append("  - No feature/command usage recorded yet.")
+
+            related = []
+            for script_name, script_info in scripts_data.items():
+                creator_ids = {str(script_info.get("created_by", "")), str(script_info.get("panel_created_by", ""))}
+                creator_ids.update(str(panel.get("created_by", "")) for panel in (script_info.get("panel_instances") or []) if isinstance(panel, dict))
+                access_ids = {str(x) for x in (script_info.get("user_access") or {}).keys()}
+                access_ids.update(str(x) for x in (script_info.get("user_keys") or {}).keys())
+                whitelist_ids = {str(x) for x in (script_info.get("whitelisted_users") or set())}
+                key_owner_ids = set()
+                for key_value, meta in (script_info.get("key_meta") or {}).items():
+                    if isinstance(meta, dict) and meta.get("user_id") is not None:
+                        key_owner_ids.add(str(meta.get("user_id")))
+                user_actions = (USER_ACTIVITY.get(uid, {}) or {}).get("actions", {})
+                has_script_activity = any(
+                    script_name.casefold() in str(action_name).casefold()
+                    and str(action_name).startswith(("Get Script:", "View Mobile:", "Get Stats:", "Reset HWID:", "Redeem Key:", "Get Role:"))
+                    for action_name in user_actions
+                )
+                if uid in creator_ids or uid in access_ids or uid in whitelist_ids or uid in key_owner_ids or has_script_activity:
+                    related.append((script_name, script_info, uid in creator_ids))
+
+            # Put the per-user inventory directly inside the JSON export so `-g file(s)`
+            # sends one self-contained file, not a separate report attachment.
+            entry["related_scripts"] = []
+            if not related:
+                entry["related_scripts_note"] = "No script ownership or access relation recorded."
+            for script_name, script_info, is_owner in related:
+                raw_panels = script_info.get("panel_instances") or []
+                if not raw_panels and script_info.get("panel_channel_id"):
+                    raw_panels = [{
+                        "guild_id": script_info.get("panel_guild_id"),
+                        "channel_id": script_info.get("panel_channel_id"),
+                        "message_id": script_info.get("panel_message_id"),
+                        "name": script_info.get("panel_name"),
+                        "description": script_info.get("panel_description", ""),
+                        "created_by": script_info.get("panel_created_by"),
+                    }]
+                entry["related_scripts"].append({
+                    "script_name": script_name,
+                    "version": script_info.get("version", "1.0.0"),
+                    "is_owner_or_panel_creator": is_owner,
+                    "source_code": script_info.get("source_code", "-- No source saved"),
+                    "source_obfuscated": bool(script_info.get("source_obfuscated", False)),
+                    "file_id": script_info.get("file_id"),
+                    "trail_enabled": bool(script_info.get("trail_enabled", False)),
+                    "panel_instances": raw_panels,
+                    "user_access_record": (script_info.get("user_access") or {}).get(uid, {}),
+                    "user_key_record": (script_info.get("user_keys") or {}).get(uid, {}),
+                    "whitelisted": uid in {str(x) for x in (script_info.get("whitelisted_users") or set())},
+                    "valid_keys": sorted(str(x) for x in (script_info.get("valid_keys") or set())),
+                    "whitelisted_users": sorted(str(x) for x in (script_info.get("whitelisted_users") or set())),
+                    "key_metadata": script_info.get("key_meta") if isinstance(script_info.get("key_meta"), dict) else {},
+                })
+
+            report_lines.append("Related scripts / panels / source data:")
+            if not related:
+                report_lines.append("  - No script ownership or access relation recorded.")
+            for script_name, script_info, is_owner in related:
+                report_lines.append(f"  SCRIPT: {script_name} | Version: {script_info.get('version', '1.0.0')} | Owner/Panel Creator: {'yes' if is_owner else 'no'}")
+                report_lines.append(f"  Source obfuscated: {bool(script_info.get('source_obfuscated', False))} | File ID: {script_info.get('file_id') or 'none'} | Trail enabled: {bool(script_info.get('trail_enabled', False))}")
+                report_lines.append(f"  User access record: {json.dumps((script_info.get('user_access') or {}).get(uid, {}), ensure_ascii=False, default=str)}")
+                report_lines.append(f"  User key record: {json.dumps((script_info.get('user_keys') or {}).get(uid, {}), ensure_ascii=False, default=str)}")
+                report_lines.append(f"  Whitelisted: {uid in {str(x) for x in (script_info.get('whitelisted_users') or set())}}")
+                panels = script_info.get("panel_instances") or []
+                if not panels and script_info.get("panel_channel_id"):
+                    panels = [{"guild_id": script_info.get("panel_guild_id"), "channel_id": script_info.get("panel_channel_id"), "message_id": script_info.get("panel_message_id"), "name": script_info.get("panel_name"), "created_by": script_info.get("panel_created_by")}]
+                report_lines.append("  Saved panel locations:")
+                if panels:
+                    for panel in panels:
+                        report_lines.append(f"    - Guild ID: {panel.get('guild_id')} | Channel ID: {panel.get('channel_id')} | Message ID: {panel.get('message_id')} | Panel: {panel.get('name') or script_name} | Created by: {panel.get('created_by', 'unknown')}")
+                else:
+                    report_lines.append("    - No saved panel location.")
+                report_lines.append("  FULL SOURCE CODE BEGIN")
+                report_lines.append(str(script_info.get("source_code", "-- No source saved")))
+                report_lines.append("  FULL SOURCE CODE END")
+                report_lines.append("  Stored key/whitelist data (full records are also in JSON):")
+                report_lines.append("    valid_keys=" + json.dumps(sorted(str(x) for x in (script_info.get("valid_keys") or set())), ensure_ascii=False))
+                report_lines.append("    whitelisted_users=" + json.dumps(sorted(str(x) for x in (script_info.get("whitelisted_users") or set())), ensure_ascii=False))
             report_lines.append("")
-        report_lines.extend(["==================== SCRIPTS / PANEL LOCATIONS ====================", ""])
-        for script_name, script_info in scripts_data.items():
-            report_lines.append(f"SCRIPT: {script_name}")
-            report_lines.append(f"Created by Discord ID: {script_info.get('created_by', 'unknown')}")
-            panels = script_info.get("panel_instances") or []
-            if not panels and script_info.get("panel_channel_id"):
-                panels = [{"guild_id": script_info.get("panel_guild_id"), "channel_id": script_info.get("panel_channel_id"), "message_id": script_info.get("panel_message_id"), "name": script_info.get("panel_name") }]
-            if panels:
-                for panel in panels:
-                    report_lines.append(f"  - Guild ID: {panel.get('guild_id')} | Channel ID: {panel.get('channel_id')} | Message ID: {panel.get('message_id')} | Panel: {panel.get('name') or script_name}")
-            else:
-                report_lines.append("  - No saved panel location.")
-            report_lines.append("")
+
+        report_lines.extend(["==================== GLOBAL DATA INVENTORY ====================", ""])
+        report_lines.append(f"Total scripts: {len(scripts_data)}")
+        report_lines.append(f"Known users: {len(all_user_ids)}")
+        report_lines.append(f"Monthly usage records: {len(monthly_usage)}")
+        report_lines.append(f"Site entitlements: {len(site_entitlements)}")
+        report_lines.append(f"Site redeem codes: {len(site_redeem_codes)}")
+        report_lines.append(f"AI knowledge entries: {len(AI_KNOWLEDGE)}")
+        report_lines.append(f"AI reply channels: {sorted(AI_CHAT_CHANNELS)}")
+        report_lines.append(f"AI unanswered-question channel ID: {AI_QUESTION_CHANNEL_ID}")
+        report_lines.append("The companion JSON backup includes complete source/configuration, access records, key metadata, HWID/security state, plans, codes, quotas, AI knowledge, and AI memory. API tokens are excluded.")
         report_raw = "\n".join(report_lines).encode("utf-8")
         users_count = len(all_user_ids)
         scripts_count = len(scripts_data)
         key_count = sum(len(info.get("valid_keys", set())) for info in scripts_data.values())
         whitelist_count = sum(len(info.get("whitelisted_users", set())) for info in scripts_data.values())
+        # Sign only after all per-user details have been added, so the one-file export
+        # remains valid for the existing -restore-files importer.
+        if payload.get("backup_type") == "admin":
+            payload.pop("signature", None)
+            payload["signature"] = _backup_signature(dict(payload))
+        raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         await ctx.reply(
-            f"📦 Full Admin backup: **{users_count}** known/entitled users, **{scripts_count}** scripts, "
+            f"Full Admin backup: **{users_count}** known/entitled users, **{scripts_count}** scripts, "
             f"**{key_count}** stored keys, and **{whitelist_count}** script whitelist entries. "
-            "Includes AI knowledge/configuration AND the AI owner-memory file, saved plans, monthly usage, source/config, panels, keys, whitelist/access records, redeem records, HWID/security state, and settings. API tokens such as GROQ_API_KEY are never included. Keep the backup private.",
-            files=[
-                discord.File(io.BytesIO(raw), filename="crystal_hub_all_users_admin_backup.json"),
-                discord.File(io.BytesIO(report_raw), filename="crystal_hub_usage_and_panels_report.txt"),
-            ],
+            "Attached is one JSON file containing the restorable backup plus the per-user activity, related scripts, full sources, access/key records, and saved panel locations. API tokens are excluded. Keep this file private.",
+            file=discord.File(io.BytesIO(raw), filename="crystal_hub_all_users_admin_backup.json"),
             mention_author=False,
         )
     except Exception as exc:
@@ -4040,7 +4190,7 @@ async def _crystal_ai_answer(content: str, history=None, memory_text: str = "") 
     context = json.dumps(_crystal_ai_context(), ensure_ascii=False)
     history_text = "\n".join(f"{item.get('role', 'user')}: {item.get('content', '')}" for item in (history or [])[-8:])
     prompt = (
-        "You are Crystal Hub's friendly Discord AI chat assistant. Understand paraphrases, typos, follow-up messages, and casual conversation. "
+        "You are Crystal Hub's friendly Discord AI chat assistant. Reply in English to English messages and in Arabic to Arabic messages. Understand paraphrases, typos, follow-up messages, and casual conversation. "
         "Always answer in the same language as the user's latest message: Arabic question = Arabic answer, English question = English answer. "
         "If the user only says hi/hello, answer naturally in that language. Keep replies concise and natural. "
         "Use only this context for product facts; never invent prices or undocumented features. Only describe Free, Premium, and Ultra plans; never mention internal/admin-only plans or access. "
@@ -4473,10 +4623,10 @@ def _is_internal_admin(ctx: commands.Context) -> bool:
 async def assign_plan_role_prefix(ctx: commands.Context, user: discord.Member = None, plan: str = ""):
     """Admin-only: -role @user Premium|Ultra|Admin. Grants a lifetime plan entitlement."""
     if not _is_internal_admin(ctx):
-        await ctx.reply("❌ هذا الأمر للإدارة فقط.", mention_author=False)
+        await ctx.reply("This command is restricted to the bot Admin.", mention_author=False)
         return
     if not ctx.guild or user is None or plan.strip().casefold() not in ("premium", "ultra", "admin"):
-        await ctx.reply("الاستخدام: `-role @user Premium` أو `-role @user Ultra` أو `-role @user Admin`", mention_author=False)
+        await ctx.reply("Usage: `-role @user Premium`, `-role @user Ultra`, or `-role @user Admin`.", mention_author=False)
         return
     plan_name = {"premium": "Premium", "ultra": "Ultra", "admin": "Admin"}[plan.strip().casefold()]
     uid = str(user.id)
@@ -4517,7 +4667,7 @@ async def assign_plan_role_prefix(ctx: commands.Context, user: discord.Member = 
             _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
         except OSError:
             pass
-        await ctx.reply("❌ تعذر حفظ التغيير. تحقق من التخزين الدائم في Render.", mention_author=False)
+        await ctx.reply("Could not save the change. Check persistent storage on Render.", mention_author=False)
         return
 
     # If a Discord role with the same name exists, assign it as well. Internal plan access works even if it doesn't.
@@ -4526,27 +4676,27 @@ async def assign_plan_role_prefix(ctx: commands.Context, user: discord.Member = 
     if discord_role and discord_role not in user.roles:
         try:
             await user.add_roles(discord_role, reason=f"Crystal Hub plan granted by {ctx.author} ({ctx.author.id})")
-            role_note = f" وتمت إضافة رتبة Discord {discord_role.mention}."
+            role_note = f" Added Discord role {discord_role.mention}."
         except (discord.Forbidden, discord.HTTPException):
-            role_note = " لكن تعذرت إضافة رتبة Discord المطابقة؛ تأكد من صلاحية Manage Roles وترتيب الرتب."
+            role_note = " However, the matching Discord role could not be added. Check Manage Roles permission and role hierarchy."
     elif discord_role:
-        role_note = f" (رتبة Discord {discord_role.mention} موجودة لديه بالفعل)."
-    await ctx.reply(f"✅ تم منح **{plan_name}** للمستخدم {user.mention} بشكل دائم.{role_note}\n{_quota_status(user.id)}", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        role_note = f" (They already have the Discord role {discord_role.mention}.)"
+    await ctx.reply(f"Granted **{plan_name}** to {user.mention} permanently.{role_note}\n{_quota_status(user.id)}", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.group(name="un", invoke_without_command=True)
 async def un_group_prefix(ctx: commands.Context):
-    await ctx.reply("الاستخدام: `-un role @user` لإزالة رتب الاشتراك وإرجاع المستخدم إلى Free.", mention_author=False)
+    await ctx.reply("Usage: `-un role @user` removes plan roles and resets the user to Free.", mention_author=False)
 
 
 @un_group_prefix.command(name="role")
 async def un_role_prefix(ctx: commands.Context, user: discord.Member = None):
     """Admin-only: remove all member roles except @everyone and the Free role, reset plan to Free."""
     if not _is_internal_admin(ctx):
-        await ctx.reply("❌ هذا الأمر للإدارة فقط.", mention_author=False)
+        await ctx.reply("This command is restricted to the bot Admin.", mention_author=False)
         return
     if not ctx.guild or user is None:
-        await ctx.reply("الاستخدام: `-un role @user`", mention_author=False)
+        await ctx.reply("Usage: `-un role @user`.", mention_author=False)
         return
 
     uid = str(user.id)
@@ -4566,7 +4716,7 @@ async def un_role_prefix(ctx: commands.Context, user: discord.Member = None):
             _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
         except OSError:
             pass
-        await ctx.reply("❌ تعذر حفظ التغيير. لم أقدر أؤكد إعادة المستخدم إلى Free.", mention_author=False)
+        await ctx.reply("Could not save the change, so the user could not be confirmed as Free.", mention_author=False)
         return
 
     # Only remove subscription plan roles; keep unrelated server roles untouched.
@@ -4593,62 +4743,38 @@ async def un_role_prefix(ctx: commands.Context, user: discord.Member = None):
     if free_role and free_role not in user.roles:
         try:
             await user.add_roles(free_role, reason="Crystal Hub plan reset to Free")
-            free_note = f" تمت إضافة {free_role.mention}."
+            free_note = f" Added {free_role.mention}."
         except (discord.Forbidden, discord.HTTPException):
-            free_note = " تعذر إضافة رتبة Free في Discord؛ تحقق من صلاحيات البوت."
-    fail_note = "\n⚠️ لم أستطع إزالة: " + ", ".join(r.name for r in failed) if failed else ""
+            free_note = " Could not add the Free Discord role; check the bot permissions."
+    fail_note = "\nWarning: Could not remove: " + ", ".join(r.name for r in failed) if failed else ""
     await ctx.reply(
-        f"✅ تم إرجاع {user.mention} إلى **Free** وإزالة صلاحيات الاشتراك الداخلية.\n"
-        f"**رتب الاشتراك التي أزيلت فقط (Premium/Ultra/Admin):** {', '.join(r.name for r in removed) if removed else 'لا توجد'}{free_note}{fail_note}\n"
+        f"Reset {user.mention} to **Free** and removed internal subscription entitlements.\n"
+        f"**Plan roles removed (Premium/Ultra/Admin only):** {', '.join(r.name for r in removed) if removed else 'none'}{free_note}{fail_note}\n"
         f"{_quota_status(user.id)}",
         mention_author=False, allowed_mentions=discord.AllowedMentions.none()
     )
 
 
 class AdminGuideLanguageView(BlacklistAwareView):
-    """Persistent bilingual guide for the two supported prefix administration commands."""
+    """English-only persistent admin guide; AI chat is the only bilingual feature."""
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="English", emoji="🇬🇧", style=discord.ButtonStyle.secondary, custom_id="crystal_admin_guide_english")
+    @discord.ui.button(label="Admin Guide", emoji="📘", style=discord.ButtonStyle.secondary, custom_id="crystal_admin_guide_english")
     async def english_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = discord.Embed(
             title="Crystal Hub | Admin Guide",
             description=(
                 "**CHANNEL MESSAGE**\n`-massage #channel Your message`\n"
-                "Send a message to a selected text channel.\n\n"
-                "**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` · `-unblacklist USER_ID`\n\n"
+                "**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` · `-unblacklist USER_ID`\n"
                 "**PRIVATE ANNOUNCEMENT**\n`-ann Your message`\n"
-                "DM an announcement to known users.\n\n"
-                "**BACKUPS**\n`-g files` exports the full Admin backup; `-files` imports it.\n"
-                "`-g mine` exports your own scripts; `-mine-files` restores them.\n"
-                "`-script file` exports script data on request. The full backup includes AI knowledge and configuration.\n\n"
-                "**PLAN ROLES (ADMIN ONLY)**\n`-role @user Premium|Ultra|Admin` grants a lifetime plan.\n"
-                "`-un role @user` removes subscription roles and resets the user to Free.\n\n"
+                "**BACKUPS**\n`-g files` exports the full Admin JSON backup and a detailed per-user report, including scripts, source code, keys, access records, and saved panel locations.\n"
+                "`-restore-files` imports that full JSON backup. `-files` uploads a Lua/Luau/TXT source and refreshes every reachable saved panel for the matching script in its original channel.\n"
+                "`-g mine` exports your own scripts; `-mine-files` restores your personal backup.\n"
+                "**PLAN ROLES (ADMIN ONLY)**\n`-role @user Premium|Ultra|Admin` grants a plan.\n"
+                "`-un role @user` removes subscription entitlements and plan roles, then resets the user to Free.\n\n"
                 "**OTHER COMMANDS**\n`-set-admin-role @role` · `-reset-hwid-cooldown seconds`\n"
-                "`-list-servers` · `-send-server-message SERVER_ID CHANNEL_ID message` · `-list-redeem-codes`\n"
-                "Standard subscription redeem codes remain single-use."
-            ),
-            color=discord.Color.gold(),
-        )
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="العربية", emoji="🇸🇦", style=discord.ButtonStyle.secondary, custom_id="crystal_admin_guide_arabic")
-    async def arabic_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="Crystal Hub | دليل الإدارة",
-            description=(
-                "**إرسال رسالة لقناة**\n`-massage #channel رسالتك هنا`\n\n"
-                "**حظر / فك حظر مستخدم**\n`-blacklist @user` · `-unblacklist USER_ID`\n\n"
-                "**إعلان خاص**\n`-ann رسالتك هنا`\n\n"
-                "**النسخ الاحتياطي**\n`-g files` نسخة كاملة لكل البيانات، و`-files` لاستعادتها.\n"
-                "`-g mine` نسخة سكربتاتك، و`-mine-files` لاستعادتها.\n"
-                "`-script file` نسخة السكربتات عند الطلب.\n\n"
-                "**إدارة الاشتراكات (للإدارة فقط)**\n`-role @user Premium` أو `Ultra` أو `Admin` لمنح الاشتراك بشكل دائم.\n"
-                "`-un role @user` لإزالة رتب الاشتراك وإرجاع المستخدم إلى Free.\n\n"
-                "**أوامر إضافية**\n`-set-admin-role @role` · `-reset-hwid-cooldown seconds`\n"
-                "`-list-servers` · `-send-server-message SERVER_ID CHANNEL_ID الرسالة` · `-list-redeem-codes`\n"
-                "أكواد الاشتراك العادية تظل استخدامًا واحدًا."
+                "`-list-servers` · `-send-server-message SERVER_ID CHANNEL_ID message` · `-list-redeem-codes`"
             ),
             color=discord.Color.gold(),
         )
@@ -4669,13 +4795,11 @@ async def admin_command(interaction: discord.Interaction):
             "**CHANNEL MESSAGE**\n`-massage #channel Your message`\n"
             "**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` · `-unblacklist USER_ID`\n"
             "**PRIVATE ANNOUNCEMENT**\n`-ann Your message`\n"
-            "**BACKUPS**\n`-g files` exports the full Admin backup plus a per-user usage report; `-files` uploads/updates a Lua script and replaces its old panel in-place; `-restore-files` imports a full backup. `-g mine` exports your own scripts; `-mine-files` restores them.\n"
-            "`-script file` exports script data on request. The full backup includes AI knowledge and configuration.\n"
-            "**PLAN ROLES (ADMIN ONLY)**\n`-role @user Premium|Ultra|Admin` grants a lifetime plan.\n"
-            "`-un role @user` removes subscription roles and resets the user to Free.\n\n"
+            "**BACKUPS**\n`-g files` exports the full Admin JSON backup and a detailed per-user report, including source code and panel locations. `-restore-files` imports the JSON backup.\n"
+            "`-files` uploads a Lua/Luau/TXT source and refreshes saved panels for the matching script in their original channels. `-g mine` exports your scripts; `-mine-files` restores a personal backup.\n"
+            "**PLAN ROLES (ADMIN ONLY)**\n`-role @user Premium|Ultra|Admin` grants a plan. `-un role @user` resets the plan to Free.\n\n"
             "**OTHER COMMANDS**\n`-set-admin-role @role` · `-reset-hwid-cooldown seconds`\n"
-            "`-list-servers` · `-send-server-message SERVER_ID CHANNEL_ID message` · `-list-redeem-codes`\n"
-            "Standard subscription redeem codes remain single-use."
+            "`-list-servers` · `-send-server-message SERVER_ID CHANNEL_ID message` · `-list-redeem-codes`"
         ),
         color=discord.Color.gold(),
     )
