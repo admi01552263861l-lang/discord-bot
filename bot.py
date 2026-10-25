@@ -921,10 +921,13 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             self._send_text(403, "denied: " + reason)
             return
 
+        is_trail_key = user_key.casefold() == "trail" and trail_is_active(s_info)
         binding_key = f"{script_name}:{user_key}"
-        existing_binding = hwid_bindings.get(binding_key)
+        existing_binding = None if is_trail_key else hwid_bindings.get(binding_key)
         existing_hwid = existing_binding.get("hwid") if isinstance(existing_binding, dict) else existing_binding
-        if existing_hwid is None:
+        if is_trail_key:
+            pass  # Trail is intentionally shared and does not bind to one device.
+        elif existing_hwid is None:
             hwid_bindings[binding_key] = {"hwid": reported_hwid, "device": reported_device, "last_seen": _iso_now()}
             try:
                 save_hwid_bindings()
@@ -1392,6 +1395,9 @@ def key_is_usable(s_info: dict, key: str) -> tuple:
     key = str(key or "")
     if not key:
         return False, "Key is empty."
+    # Shared free-trial token: valid only while this script's Trail is enabled.
+    if key.casefold() == "trail":
+        return (True, "") if trail_is_active(s_info) else (False, "Trail is not enabled for this script.")
     meta = (s_info.get("key_meta") or {}).get(key, {})
     if meta.get("disabled"):
         return False, "This key has been disabled."
@@ -1829,10 +1835,13 @@ class ViewMobileResponseView(BlacklistAwareView):
             await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
             return
 
-        ok, reason, current_key = user_access_ok(s_info, interaction.user.id)
-        if not ok or not current_key:
-            await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
-            return
+        if trail_is_active(s_info):
+            current_key = "Trail"
+        else:
+            ok, reason, current_key = user_access_ok(s_info, interaction.user.id)
+            if not ok or not current_key:
+                await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
+                return
 
         # Keep the same script URL/key format, but expose it as the mobile option.
         file_id = ensure_file_id(self.script_name, s_info)
@@ -1878,10 +1887,13 @@ class PanelControlView(BlacklistAwareView):
             await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
             return
 
-        user_key, reason = self._get_user_key(s_info, interaction.user.id)
-        if not user_key:
-            await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
-            return
+        if trail_is_active(s_info):
+            user_key = "Trail"
+        else:
+            user_key, reason = self._get_user_key(s_info, interaction.user.id)
+            if not user_key:
+                await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
+                return
 
         code = self._script_message(s_info, user_key)
         # The Mobile button is attached to THIS script message, not the main panel.
@@ -2279,7 +2291,7 @@ async def trail_command(
     save_data()
     when = "permanent" if mode == "PERM" else f"TIME — ends in {format_remaining(expires_at)}"
     await interaction.response.send_message(
-        f"✅ Trail **ON** for `{script}` ({when}).\nTrail is free and does not require Robux.\n\n{_quota_status(interaction.user.id)}",
+        f"✅ Trail **ON** for `{script}` ({when}).\n\n{_quota_status(interaction.user.id)}",
         ephemeral=True
     )
 
@@ -2754,419 +2766,6 @@ async def bypass_link(interaction: discord.Interaction, url: str):
             await interaction.response.send_message("صار خطأ أثناء فحص التحويلات. جرّب مرة ثانية.", ephemeral=True)
 
 
-class UnroleSelect(discord.ui.Select):
-    def __init__(self, target: discord.Member, removable_roles: list[discord.Role]):
-        self.target_id = target.id
-        options = [discord.SelectOption(label=role.name[:100], value=str(role.id), description=f"Remove {role.name[:90]}")
-                   for role in removable_roles[:25]]
-        super().__init__(placeholder="Choose a role to remove", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        target = interaction.guild.get_member(self.target_id) if interaction.guild else None
-        if target is None:
-            await interaction.response.send_message("❌ That member is no longer in this server.", ephemeral=True)
-            return
-        try:
-            role_id = int(self.values[0])
-        except (ValueError, IndexError):
-            await interaction.response.send_message("❌ Invalid role selection.", ephemeral=True)
-            return
-        role = interaction.guild.get_role(role_id)
-        if role is None or role not in target.roles:
-            await interaction.response.send_message("❌ The selected role is no longer assigned to that member.", ephemeral=True)
-            return
-        if role.is_default() or role.name.strip().casefold() == "free":
-            await interaction.response.send_message("❌ The @everyone/Free role cannot be removed.", ephemeral=True)
-            return
-        try:
-            await target.remove_roles(role, reason=f"Crystal Hub /unrole by {interaction.user} ({interaction.user.id})")
-        except discord.Forbidden:
-            await interaction.response.send_message("❌ I cannot remove that role. Check the bot's role hierarchy and Manage Roles permission.", ephemeral=True)
-            return
-        except discord.HTTPException:
-            await interaction.response.send_message("❌ Discord could not remove that role. Try again.", ephemeral=True)
-            return
-        await interaction.response.send_message(f"✅ Removed {role.mention} from {target.mention}.", ephemeral=True)
-
-
-class UnroleView(BlacklistAwareView):
-    def __init__(self, target: discord.Member, removable_roles: list[discord.Role]):
-        super().__init__(timeout=120)
-        self.add_item(UnroleSelect(target, removable_roles))
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not await super().interaction_check(interaction):
-            return False
-        if not _has_server_admin_or_configured_role(interaction):
-            await interaction.response.send_message(_server_admin_denial(interaction), ephemeral=True)
-            return False
-        return True
-
-
-@bot.tree.command(name="unrole", description="Choose and remove a role from a member (Free is protected)")
-@app_commands.describe(user="Member whose role you want to remove")
-async def unrole_command(interaction: discord.Interaction, user: discord.Member):
-    if not _has_server_admin_or_configured_role(interaction):
-        await interaction.response.send_message(_server_admin_denial(interaction), ephemeral=True)
-        return
-    roles = [role for role in user.roles if not role.is_default() and role.name.strip().casefold() != "free"]
-    if not roles:
-        await interaction.response.send_message(f"ℹ️ {user.mention} has no removable roles. The Free role is protected.", ephemeral=True)
-        return
-    role_text = ", ".join(role.mention for role in roles[:20])
-    extra = f"\n…and {len(roles)-20} more." if len(roles) > 20 else ""
-    await interaction.response.send_message(
-        f"**Roles held by {user.mention}:**\n{role_text}{extra}\n\nChoose one role below to remove. The Free role cannot be removed.",
-        view=UnroleView(user, roles), ephemeral=True
-    )
-
-
-@bot.tree.command(name="delete-key", description="Delete a key/whitelist grant and revoke its linked role")
-@app_commands.describe(key="The exact key to delete")
-async def delete_key_command(interaction: discord.Interaction, key: str):
-    if not _has_server_admin_or_configured_role(interaction):
-        await interaction.response.send_message(_server_admin_denial(interaction), ephemeral=True)
-        return
-    key = key.strip()
-    if not key:
-        await interaction.response.send_message("❌ Enter the exact key.", ephemeral=True)
-        return
-    found = False
-    revoked_users = set()
-    affected_scripts = []
-    for script_name, info in scripts_data.items():
-        valid_keys = info.setdefault("valid_keys", set())
-        key_meta = info.setdefault("key_meta", {})
-        user_keys = info.setdefault("user_keys", {})
-        user_access = info.setdefault("user_access", {})
-        matched = key in valid_keys or key in key_meta
-        linked_ids = set()
-        for uid, user_key in list(user_keys.items()):
-            if str(user_key) == key:
-                linked_ids.add(int(uid))
-        for uid, access in list(user_access.items()):
-            if isinstance(access, dict) and str(access.get("key", "")) == key:
-                try:
-                    linked_ids.add(int(uid))
-                except (ValueError, TypeError):
-                    pass
-        if not matched and not linked_ids:
-            continue
-        found = True
-        affected_scripts.append(script_name)
-        valid_keys.discard(key)
-        key_meta.pop(key, None)
-        for uid in linked_ids:
-            revoked_users.add(uid)
-            info.get("whitelisted_users", set()).discard(uid)
-            user_keys.pop(uid, None)
-            user_access.pop(uid, None)
-        # Older data may only have the key in whitelist/user_keys; remove all matching traces.
-        for uid, user_key in list(user_keys.items()):
-            if str(user_key) == key:
-                user_keys.pop(uid, None)
-        for uid, access in list(user_access.items()):
-            if isinstance(access, dict) and str(access.get("key", "")) == key:
-                user_access.pop(uid, None)
-    if not found:
-        await interaction.response.send_message("❌ No active key or whitelist grant matches that exact key.", ephemeral=True)
-        return
-    save_data()
-    removed_roles = 0
-    if interaction.guild:
-        for uid in revoked_users:
-            member = interaction.guild.get_member(uid)
-            if member is None:
-                continue
-            for script_name in affected_scripts:
-                info = scripts_data.get(script_name, {})
-                role_id = info.get("buyer_role_id")
-                role = interaction.guild.get_role(int(role_id)) if role_id else None
-                if role and role in member.roles and not role.is_default() and role.name.strip().casefold() != "free":
-                    try:
-                        await member.remove_roles(role, reason=f"Crystal Hub key revoked by {interaction.user} ({interaction.user.id})")
-                        removed_roles += 1
-                    except (discord.Forbidden, discord.HTTPException, ValueError, TypeError):
-                        pass
-    await interaction.response.send_message(
-        f"✅ Key deleted and access revoked.\n**Affected scripts:** {', '.join(f'`{x}`' for x in affected_scripts)}\n"
-        f"**Linked users:** {len(revoked_users)} • **Roles removed:** {removed_roles}\n\n{_quota_status(interaction.user.id, 'keys')}",
-        ephemeral=True
-    )
-
-
-@bot.tree.command(name="my-plan", description="Show your Crystal Hub plan and monthly usage")
-async def my_plan_command(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=_plan_embed(interaction.user.id), ephemeral=True)
-
-
-@bot.tree.command(name="avatar-bot", description="Change the bot profile for this server")
-@app_commands.describe(
-    avatar_url="Direct public URL to a PNG/JPG/GIF image (server avatar only)",
-    nickname="Optional nickname for this server only",
-    bio="Text to append to the bot's existing server bio"
-)
-async def avatar_bot_command(
-    interaction: discord.Interaction,
-    avatar_url: Optional[str] = None,
-    nickname: Optional[str] = None,
-    bio: Optional[str] = None
-):
-    """Customize the bot's profile in this server only.
-
-    Avatar and bio use Discord's Modify Current Member endpoint, so they do not
-    change the bot's global profile. When bio text is supplied, the current
-    server bio is preserved and the new text is appended after the requested
-    separator.
-    """
-    # Avatar/profile customization is a Premium/Ultra feature assigned by the bot owner.
-    # The denial is ephemeral so only the requesting user can see it.
-    if _discord_plan(interaction.user.id) not in ("Premium", "Ultra", "Admin"):
-        await interaction.response.send_message(
-            "❌ Avatar Bot requires Premium, Ultra, or Admin plan.\n"
-            f"Join the Crystal Hub server to get access: {CRYSTAL_DISCORD_INVITE}",
-            ephemeral=True,
-        )
-        return
-    if not interaction.guild:
-        await interaction.response.send_message(
-            "❌ This feature can only be used inside a server.", ephemeral=True
-        )
-        return
-    if not avatar_url and not nickname and bio is None:
-        await interaction.response.send_message(
-            "❌ Provide an avatar URL, a nickname, or bio text.", ephemeral=True
-        )
-        return
-
-    quota_ok, quota_error = _quota_check(interaction.user.id, "avatars")
-    if not quota_ok:
-        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
-        return
-
-    # The avatar quota is charged only after at least one requested change succeeds.
-    changes = []
-    payload = {}
-
-    if nickname is not None:
-        payload["nick"] = nickname[:32] if nickname else None
-
-    if avatar_url:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    avatar_url,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    allow_redirects=True,
-                ) as response:
-                    if response.status != 200:
-                        await interaction.response.send_message(
-                            "❌ Could not download the image URL. Use a direct public image URL.",
-                            ephemeral=True,
-                        )
-                        return
-                    image_bytes = await response.read()
-                    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
-
-            if len(image_bytes) > 8 * 1024 * 1024:
-                await interaction.response.send_message("❌ Image must be under 8 MB.", ephemeral=True)
-                return
-
-            # Discord expects a data URI for the current guild member avatar.
-            if content_type not in {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"}:
-                guessed = "image/png"
-                if image_bytes.startswith(b"\x89PNG"):
-                    guessed = "image/png"
-                elif image_bytes.startswith(b"\xff\xd8\xff"):
-                    guessed = "image/jpeg"
-                elif image_bytes.startswith((b"GIF87a", b"GIF89a")):
-                    guessed = "image/gif"
-                elif image_bytes.startswith(b"RIFF") and b"WEBP" in image_bytes[:16]:
-                    guessed = "image/webp"
-                content_type = guessed
-
-            payload["avatar"] = f"data:{content_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
-        except Exception:
-            await interaction.response.send_message(
-                "❌ Could not download the image URL. Check that it is a direct public image URL.",
-                ephemeral=True,
-            )
-            return
-
-    if bio is not None:
-        bio = bio.strip()
-        if not bio:
-            await interaction.response.send_message("❌ Bio text cannot be empty.", ephemeral=True)
-            return
-
-        # Discord does not expose GET /guilds/{guild.id}/members/@me. An empty
-        # Modify Current Member request returns the current member object, which
-        # includes the bot's current guild bio on supported Discord API versions.
-        try:
-            current_member = await bot.http.request(
-                Route("PATCH", f"/guilds/{interaction.guild.id}/members/@me"),
-                json={},
-            )
-            original_bio = str(current_member.get("bio") or "").strip()
-        except Exception as exc:
-            print(f"Could not read current guild bio: {exc}")
-            original_bio = ""
-
-        separator = "_ _ _ _ _ _ _ _ _ _ _"
-        combined = f"{original_bio}\n{separator}\n{bio}" if original_bio else f"{separator}\n{bio}"
-        if len(combined) > 190:
-            await interaction.response.send_message(
-                f"❌ The final server bio is {len(combined)}/190 characters. "
-                "Shorten the new bio so the original bio and separator can be preserved.",
-                ephemeral=True,
-            )
-            return
-        payload["bio"] = combined
-
-    try:
-        await bot.http.request(
-            Route("PATCH", f"/guilds/{interaction.guild.id}/members/@me"),
-            json=payload,
-        )
-    except discord.HTTPException as exc:
-        if exc.status == 403:
-            await interaction.response.send_message(
-                "❌ Discord rejected the server profile update. Make sure the bot can change its nickname/profile in this server.",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                f"❌ Discord could not update the server profile (HTTP {exc.status}).",
-                ephemeral=True,
-            )
-        return
-    except Exception as exc:
-        print(f"avatar-bot server profile update failed: {exc}")
-        await interaction.response.send_message(
-            "❌ Could not update the bot's server profile.", ephemeral=True
-        )
-        return
-
-    if nickname is not None:
-        changes.append("server nickname updated")
-    if avatar_url:
-        changes.append("server avatar updated")
-    if bio is not None:
-        changes.append("server bio updated")
-
-    _quota_increment(interaction.user.id, "avatars")
-    await interaction.response.send_message(
-        "✅ Crystal Hub: " + ", ".join(changes) +
-        f".\nThe avatar and bio changes apply to this server only.\n{_quota_status(interaction.user.id, 'avatars')}",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="panel-setup", description="Create or update the single script management panel")
-@app_commands.describe(
-    script="Choose the script",
-    channel="Optional target channel; if empty, use the channel where this command is run",
-    name_panel="Enter panel title",
-    description="Optional panel description"
-)
-@app_commands.autocomplete(script=script_autocomplete)
-async def panel_setup_command(
-    interaction: discord.Interaction,
-    script: str,
-    name_panel: str,
-    channel: Optional[discord.TextChannel] = None,
-    description: Optional[str] = None
-):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    if not _has_server_admin_or_configured_role(interaction):
-        await interaction.followup.send(_server_admin_denial(interaction), ephemeral=True)
-        return
-
-    # If no channel was selected, use the channel where /panel-setup was executed.
-    target_channel = channel or interaction.channel
-    if not isinstance(target_channel, discord.TextChannel):
-        await interaction.followup.send("❌ I can only create the panel inside a text channel.", ephemeral=True)
-        return
-
-    s_info = scripts_data.get(script)
-    if not s_info:
-        await interaction.followup.send("❌ Selected script does not exist.", ephemeral=True)
-        return
-
-    instances = s_info.get("panel_instances")
-    if not isinstance(instances, list):
-        instances = []
-        s_info["panel_instances"] = instances
-    # Migrate the legacy single-panel record if needed.
-    if not instances and s_info.get("panel_guild_id") and s_info.get("panel_channel_id"):
-        instances.append({
-            "guild_id": s_info.get("panel_guild_id"),
-            "channel_id": s_info.get("panel_channel_id"),
-            "message_id": s_info.get("panel_message_id"),
-            "name": s_info.get("panel_name"),
-            "description": s_info.get("panel_description", ""),
-            "created_by": s_info.get("panel_created_by", s_info.get("created_by")),
-        })
-    matching = next((p for p in instances
-                     if str(p.get("guild_id")) == str(interaction.guild_id)
-                     and str(p.get("channel_id")) == str(target_channel.id)), None)
-    if matching is None:
-        quota_ok, quota_error = _quota_check(interaction.user.id, "panels")
-        if not quota_ok:
-            await interaction.followup.send("❌ " + quota_error, ephemeral=True)
-            return
-
-    ensure_file_id(script, s_info)
-    panel_description = (str(description).strip()[:4000] if description is not None
-                         else (matching.get("description") if matching else None)
-                         or s_info.get("panel_description")
-                         or f"This control panel is for the project: **{script}**\nIf you're a buyer, click on the buttons below to redeem your key, get the script or get your role")
-    embed = discord.Embed(title=name_panel, description=panel_description, color=0xd4af37)
-    embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
-    view = PanelControlView(script_name=script)
-
-    existing_message = None
-    if matching and matching.get("message_id"):
-        try:
-            existing_message = await target_channel.fetch_message(int(matching["message_id"]))
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
-            existing_message = None
-
-    if existing_message is not None:
-        await existing_message.edit(embed=embed, view=view)
-        panel_message = existing_message
-    else:
-        panel_message = await target_channel.send(embed=embed, view=view)
-
-    new_instance = {
-        "guild_id": int(interaction.guild_id),
-        "channel_id": int(target_channel.id),
-        "message_id": int(panel_message.id),
-        "name": name_panel,
-        "description": panel_description,
-        "created_by": str(interaction.user.id),
-    }
-    if matching is None:
-        instances.append(new_instance)
-    else:
-        matching.update(new_instance)
-    s_info["panel_instances"] = instances
-    # Keep legacy fields pointing at the most recently configured panel.
-    s_info["panel_guild_id"] = interaction.guild_id
-    s_info["panel_channel_id"] = target_channel.id
-    s_info["panel_message_id"] = panel_message.id
-    s_info["panel_name"] = name_panel
-    s_info["panel_description"] = panel_description
-    s_info["panel_created_by"] = str(interaction.user.id)
-    save_data()
-
-    await interaction.followup.send(
-        f"✅ Panel ready in {target_channel.mention}. This panel is saved and will be refreshed after the bot restarts/updates.\n\n{_quota_status(interaction.user.id, 'panels')}",
-        ephemeral=True
-    )
-
-
 # Panel messages can be deleted manually in Discord; no panel-delete slash command is registered.
 
 @bot.tree.command(name="update-script", description="Send a script update announcement")
@@ -3248,6 +2847,38 @@ def _load_known_users():
         return set()
 
 KNOWN_USERS = _load_known_users()
+USER_ACTIVITY_FILE = "crystal_hub_user_activity.json"
+
+def _load_user_activity():
+    try:
+        with open(USER_ACTIVITY_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+USER_ACTIVITY = _load_user_activity()
+
+def _track_user_activity(user_id: int, action: str):
+    """Persist a compact audit of features/commands used by each Discord user."""
+    try:
+        uid = str(int(user_id))
+    except (TypeError, ValueError):
+        return
+    action = str(action or "Bot interaction").strip()[:120]
+    record = USER_ACTIVITY.setdefault(uid, {"actions": {}, "last_seen": None})
+    actions = record.setdefault("actions", {})
+    item = actions.setdefault(action, {"count": 0, "last_used": None})
+    item["count"] = int(item.get("count", 0)) + 1
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    item["last_used"] = now
+    record["last_seen"] = now
+    _remember_user(int(uid))
+    try:
+        with open(USER_ACTIVITY_FILE, "w", encoding="utf-8") as f:
+            json.dump(USER_ACTIVITY, f, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        print(f"Could not save user activity: {exc}")
 
 def _remember_user(user_id: int):
     try:
@@ -3340,6 +2971,7 @@ def _backup_snapshot(backup_type):
 
     snapshot = {
         "backup_version": SETTINGS_BACKUP_VERSION,
+        "user_activity": USER_ACTIVITY,
         "backup_type": backup_type,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "data": main_data,
@@ -3391,7 +3023,7 @@ def _restore_settings_backup(snapshot, backup_type, guild_id=None):
     global site_redeem_codes, site_entitlements, monthly_usage
     global AI_CHAT_CHANNELS, GLOBAL_ADMIN_ROLE_IDS
     global admin_redeemed_users, discord_plan_codes, discord_plan_entitlements
-    global KNOWN_USERS
+    global KNOWN_USERS, USER_ACTIVITY
 
     if not isinstance(snapshot, dict) or snapshot.get("backup_version") != SETTINGS_BACKUP_VERSION:
         raise ValueError("This is not a compatible Crystal Hub settings backup.")
@@ -3460,6 +3092,12 @@ def _restore_settings_backup(snapshot, backup_type, guild_id=None):
 
     if isinstance(snapshot.get("known_users"), list):
         KNOWN_USERS = {int(x) for x in snapshot["known_users"] if str(x).isdigit()}
+        USER_ACTIVITY = snapshot.get("user_activity", {}) if isinstance(snapshot.get("user_activity", {}), dict) else {}
+        try:
+            with open(USER_ACTIVITY_FILE, "w", encoding="utf-8") as f:
+                json.dump(USER_ACTIVITY, f, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            print(f"Could not restore user activity: {exc}")
         try:
             with open(KNOWN_USERS_FILE, "w", encoding="utf-8") as f:
                 json.dump({"users": sorted(KNOWN_USERS)}, f, indent=2)
@@ -3797,6 +3435,125 @@ def _admin_role_setup_message(ctx: commands.Context) -> str:
 
 
 @bot.command(name="files")
+async def upload_script_file_and_refresh_panel(ctx: commands.Context):
+    """Upload a Lua/Luau file, update the matching script, and replace its old panel in-place."""
+    user_id = int(ctx.author.id)
+    if not (is_bot_owner(user_id) or str(user_id) in admin_redeemed_users or _discord_plan(user_id) == "Admin"):
+        await ctx.reply("❌ هذا الأمر مخصص للإدارة فقط.", mention_author=False)
+        return
+    if not ctx.guild or not isinstance(ctx.author, discord.Member):
+        await ctx.reply("❌ استخدم الأمر داخل السيرفر.", mention_author=False)
+        return
+
+    attachment = ctx.message.attachments[0] if ctx.message.attachments else None
+    if attachment is None:
+        await ctx.reply("📎 أرسل ملف `.lua` أو `.luau` أو `.txt` مع الأمر `-files`، أو أرسل الملف في الرسالة التالية خلال دقيقتين.", mention_author=False)
+        def valid_upload(message):
+            return message.author.id == ctx.author.id and message.channel.id == ctx.channel.id and bool(message.attachments)
+        try:
+            upload_message = await bot.wait_for("message", check=valid_upload, timeout=120)
+            attachment = upload_message.attachments[0]
+        except asyncio.TimeoutError:
+            await ctx.reply("⌛ انتهى الوقت ولم يصل ملف.", mention_author=False)
+            return
+
+    filename = str(attachment.filename or "script.lua")
+    if not filename.lower().endswith((".lua", ".luau", ".txt")):
+        await ctx.reply("❌ ارفع ملف Lua/Luau أو TXT فقط.", mention_author=False)
+        return
+    if attachment.size and attachment.size > 2 * 1024 * 1024:
+        await ctx.reply("❌ حجم الملف أكبر من 2MB.", mention_author=False)
+        return
+    try:
+        source = (await attachment.read()).decode("utf-8-sig")
+    except (UnicodeDecodeError, discord.HTTPException):
+        await ctx.reply("❌ تعذر قراءة الملف؛ تأكد أنه نص UTF-8.", mention_author=False)
+        return
+    if not source.strip():
+        await ctx.reply("❌ الملف فارغ.", mention_author=False)
+        return
+
+    script_name = re.sub(r"[^A-Za-z0-9 _.-]", "", filename.rsplit(".", 1)[0]).strip()[:80]
+    if not script_name:
+        script_name = "Uploaded Script"
+    existing_name = next((name for name in scripts_data if name.casefold() == script_name.casefold()), None)
+    if existing_name:
+        script_name = existing_name
+        s_info = scripts_data[script_name]
+        old_instances = list(s_info.get("panel_instances") or [])
+        if not old_instances and s_info.get("panel_guild_id") and s_info.get("panel_channel_id"):
+            old_instances = [{
+                "guild_id": s_info.get("panel_guild_id"), "channel_id": s_info.get("panel_channel_id"),
+                "message_id": s_info.get("panel_message_id"), "name": s_info.get("panel_name") or script_name,
+                "description": s_info.get("panel_description", ""), "created_by": s_info.get("panel_created_by", s_info.get("created_by")),
+            }]
+        s_info["source_code"] = source
+        s_info["version"] = str(s_info.get("version", "1.0.0"))
+        s_info["source_obfuscated"] = False
+    else:
+        quota_ok, quota_error = _quota_check(user_id, "scripts")
+        if not quota_ok:
+            await ctx.reply("❌ " + quota_error, mention_author=False)
+            return
+        old_instances = []
+        s_info = {
+            "version": "1.0.0", "buyer_role_id": None,
+            "admin_role_id": _global_admin_role_id(ctx.guild.id), "source_code": source,
+            "valid_keys": set(), "whitelisted_users": set(), "user_keys": {},
+            "created_by": str(user_id), "api_key": "CH-" + secrets.token_urlsafe(24),
+            "trail_enabled": False, "trail_mode": "PERM", "trail_expires_at": None,
+            "file_id": None, "key_meta": {}, "user_access": {}, "panel_instances": [],
+        }
+        scripts_data[script_name] = s_info
+
+    # Reuse each old panel's exact channel/title/description. For a new script,
+    # publish the first panel in the channel where -files was run.
+    panel_targets = []
+    for panel in old_instances:
+        if str(panel.get("guild_id")) == str(ctx.guild.id) and panel.get("channel_id"):
+            channel = ctx.guild.get_channel(int(panel["channel_id"]))
+            if channel is not None and hasattr(channel, "send"):
+                panel_targets.append((channel, panel))
+    if not panel_targets:
+        panel_targets = [(ctx.channel, {"name": script_name, "description": f"Crystal Hub • Script Management\n\nScript: **{script_name}**"})]
+
+    ensure_file_id(script_name, s_info)
+    s_info.setdefault("panel_instances", [])
+    if not save_data():
+        await ctx.reply("❌ ما قدرت أحفظ السكربت. تأكد من إعدادات التخزين الدائم في Render.", mention_author=False)
+        return
+
+    new_instances = []
+    replaced = 0
+    for channel, panel in panel_targets:
+        old_message_id = panel.get("message_id")
+        if old_message_id:
+            try:
+                old_message = await channel.fetch_message(int(old_message_id))
+                await old_message.delete()
+                replaced += 1
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+                pass
+        title = str(panel.get("name") or script_name)[:256]
+        description = str(panel.get("description") or f"Crystal Hub • Script Management\n\nScript: **{script_name}**")[:4000]
+        embed = discord.Embed(title=title, description=description, color=0xd4af37)
+        if bot.user:
+            embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
+        new_message = await channel.send(embed=embed, view=PanelControlView(script_name=script_name))
+        new_instances.append({"guild_id": ctx.guild.id, "channel_id": channel.id, "message_id": new_message.id,
+                              "name": title, "description": description, "created_by": str(user_id)})
+    s_info["panel_instances"] = new_instances
+    if new_instances:
+        latest = new_instances[-1]
+        s_info.update({"panel_guild_id": latest["guild_id"], "panel_channel_id": latest["channel_id"],
+                       "panel_message_id": latest["message_id"], "panel_name": latest["name"],
+                       "panel_description": latest["description"], "panel_created_by": str(user_id)})
+    save_data()
+    _track_user_activity(user_id, "-files: upload/update script and refresh panel")
+    await ctx.reply(f"✅ تم رفع/تحديث السكربت **{script_name}** وإنشاء البانل الجديد في نفس مكان القديم.\nالرسائل القديمة التي حذفت: **{replaced}** · البانلات الجديدة: **{len(new_instances)}**", mention_author=False)
+
+
+@bot.command(name="restore-files")
 async def import_all_user_files(ctx: commands.Context):
     """Admin-only full import: attach a Crystal Hub Admin backup after the prompt."""
     user_id = int(ctx.author.id)
@@ -3815,7 +3572,7 @@ async def import_all_user_files(ctx: commands.Context):
     if attachment is None:
         await ctx.reply(
             "📁 **Send the full Crystal Hub backup file now** (JSON). I'll wait up to 2 minutes.\n"
-            "Get the file using `-g file` or `-g files`. Import replaces saved bot data with the backup, "
+            "Get the file using `-g files`. Import replaces saved bot data with the backup, "
             "including users' plans, usage, scripts, keys, whitelist, settings, AI knowledge, and AI owner memory.",
             mention_author=False,
         )
@@ -3833,7 +3590,7 @@ async def import_all_user_files(ctx: commands.Context):
         snapshot = json.loads(raw.decode("utf-8-sig"))
         # Validate the Admin backup and its signature before changing any live data.
         if not isinstance(snapshot, dict) or snapshot.get("backup_type") != "admin":
-            raise ValueError("Use the full Admin backup created by `-g files`.")
+            raise ValueError("Use the full Admin backup created by `-g files` with `-restore-files`.")
         _restore_settings_backup(snapshot, "admin", ctx.guild.id if ctx.guild else None)
         users_count = len(KNOWN_USERS)
         scripts_count = len(scripts_data)
@@ -3909,8 +3666,61 @@ async def get_admin_files_backup(ctx: commands.Context, item: str = ""):
 
     try:
         payload = _backup_snapshot("admin")
+        # Human-readable user report: names, ID, plan, activity counters, and timestamps.
+        all_user_ids = sorted(set(KNOWN_USERS) | {int(uid) for uid in discord_plan_entitlements if str(uid).isdigit()} | {int(uid) for uid in USER_ACTIVITY if str(uid).isdigit()})
+        user_report = []
+        for uid in all_user_ids:
+            try:
+                member_obj = ctx.guild.get_member(uid) if ctx.guild else None
+                user_obj = member_obj or bot.get_user(uid)
+                if user_obj is None:
+                    try:
+                        user_obj = await bot.fetch_user(uid)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        user_obj = None
+                uname = str(user_obj) if user_obj else f"Unknown user ({uid})"
+            except Exception:
+                uname = f"Unknown user ({uid})"
+            activity = USER_ACTIVITY.get(str(uid), {})
+            user_report.append({"username": uname, "user_id": str(uid), "plan": _discord_plan(uid),
+                                "last_seen": activity.get("last_seen"), "actions": activity.get("actions", {})})
+        payload["user_report"] = user_report
+        # Re-sign after attaching the readable report so -restore-files validates the exact export.
+        if payload.get("backup_type") == "admin":
+            payload.pop("signature", None)
+            payload["signature"] = _backup_signature(dict(payload))
         raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-        users_count = len(set(KNOWN_USERS) | {int(uid) for uid in discord_plan_entitlements if str(uid).isdigit()})
+        report_lines = [
+            "CRYSTAL HUB — FULL ADMIN REPORT",
+            f"Generated: {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
+            "",
+            "==================== USERS / USAGE ====================",
+        ]
+        for entry in user_report:
+            report_lines.append(f"USER: {entry['username']}")
+            report_lines.append(f"Discord ID: {entry['user_id']} | Plan: {entry['plan']} | Last seen: {entry.get('last_seen') or 'Not recorded'}")
+            actions = entry.get("actions") or {}
+            if actions:
+                for action_name, action_info in sorted(actions.items()):
+                    report_lines.append(f"  - {action_name}: used {action_info.get('count', 0)} time(s); last: {action_info.get('last_used') or 'unknown'}")
+            else:
+                report_lines.append("  - No feature/command usage recorded yet.")
+            report_lines.append("")
+        report_lines.extend(["==================== SCRIPTS / PANEL LOCATIONS ====================", ""])
+        for script_name, script_info in scripts_data.items():
+            report_lines.append(f"SCRIPT: {script_name}")
+            report_lines.append(f"Created by Discord ID: {script_info.get('created_by', 'unknown')}")
+            panels = script_info.get("panel_instances") or []
+            if not panels and script_info.get("panel_channel_id"):
+                panels = [{"guild_id": script_info.get("panel_guild_id"), "channel_id": script_info.get("panel_channel_id"), "message_id": script_info.get("panel_message_id"), "name": script_info.get("panel_name") }]
+            if panels:
+                for panel in panels:
+                    report_lines.append(f"  - Guild ID: {panel.get('guild_id')} | Channel ID: {panel.get('channel_id')} | Message ID: {panel.get('message_id')} | Panel: {panel.get('name') or script_name}")
+            else:
+                report_lines.append("  - No saved panel location.")
+            report_lines.append("")
+        report_raw = "\n".join(report_lines).encode("utf-8")
+        users_count = len(all_user_ids)
         scripts_count = len(scripts_data)
         key_count = sum(len(info.get("valid_keys", set())) for info in scripts_data.values())
         whitelist_count = sum(len(info.get("whitelisted_users", set())) for info in scripts_data.values())
@@ -3918,7 +3728,10 @@ async def get_admin_files_backup(ctx: commands.Context, item: str = ""):
             f"📦 Full Admin backup: **{users_count}** known/entitled users, **{scripts_count}** scripts, "
             f"**{key_count}** stored keys, and **{whitelist_count}** script whitelist entries. "
             "Includes AI knowledge/configuration AND the AI owner-memory file, saved plans, monthly usage, source/config, panels, keys, whitelist/access records, redeem records, HWID/security state, and settings. API tokens such as GROQ_API_KEY are never included. Keep the backup private.",
-            file=discord.File(io.BytesIO(raw), filename="crystal_hub_all_users_admin_backup.json"),
+            files=[
+                discord.File(io.BytesIO(raw), filename="crystal_hub_all_users_admin_backup.json"),
+                discord.File(io.BytesIO(report_raw), filename="crystal_hub_usage_and_panels_report.txt"),
+            ],
             mention_author=False,
         )
     except Exception as exc:
@@ -4756,9 +4569,9 @@ async def un_role_prefix(ctx: commands.Context, user: discord.Member = None):
         await ctx.reply("❌ تعذر حفظ التغيير. لم أقدر أؤكد إعادة المستخدم إلى Free.", mention_author=False)
         return
 
-    # Keep @everyone and any explicitly named Free role; remove every other assignable role.
-    free_role_ids = {r.id for r in ctx.guild.roles if r.name.strip().casefold() == "free"}
-    removable = [r for r in user.roles if not r.is_default() and r.id not in free_role_ids and r < ctx.guild.me.top_role]
+    # Only remove subscription plan roles; keep unrelated server roles untouched.
+    plan_role_names = {"premium", "ultra", "admin"}
+    removable = [r for r in user.roles if r.name.strip().casefold() in plan_role_names and not r.is_default() and r < ctx.guild.me.top_role]
     removed, failed = [], []
     if removable:
         try:
@@ -4786,7 +4599,7 @@ async def un_role_prefix(ctx: commands.Context, user: discord.Member = None):
     fail_note = "\n⚠️ لم أستطع إزالة: " + ", ".join(r.name for r in failed) if failed else ""
     await ctx.reply(
         f"✅ تم إرجاع {user.mention} إلى **Free** وإزالة صلاحيات الاشتراك الداخلية.\n"
-        f"**الرتب التي أزيلت:** {', '.join(r.name for r in removed) if removed else 'لا توجد'}{free_note}{fail_note}\n"
+        f"**رتب الاشتراك التي أزيلت فقط (Premium/Ultra/Admin):** {', '.join(r.name for r in removed) if removed else 'لا توجد'}{free_note}{fail_note}\n"
         f"{_quota_status(user.id)}",
         mention_author=False, allowed_mentions=discord.AllowedMentions.none()
     )
@@ -4856,7 +4669,7 @@ async def admin_command(interaction: discord.Interaction):
             "**CHANNEL MESSAGE**\n`-massage #channel Your message`\n"
             "**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` · `-unblacklist USER_ID`\n"
             "**PRIVATE ANNOUNCEMENT**\n`-ann Your message`\n"
-            "**BACKUPS**\n`-g files` exports the full Admin backup; `-files` imports it. `-g mine` exports your own scripts; `-mine-files` restores them.\n"
+            "**BACKUPS**\n`-g files` exports the full Admin backup plus a per-user usage report; `-files` uploads/updates a Lua script and replaces its old panel in-place; `-restore-files` imports a full backup. `-g mine` exports your own scripts; `-mine-files` restores them.\n"
             "`-script file` exports script data on request. The full backup includes AI knowledge and configuration.\n"
             "**PLAN ROLES (ADMIN ONLY)**\n`-role @user Premium|Ultra|Admin` grants a lifetime plan.\n"
             "`-un role @user` removes subscription roles and resets the user to Free.\n\n"
@@ -5104,11 +4917,26 @@ async def send_server_message_prefix(ctx: commands.Context, server_id: str = "",
     await ctx.reply(f"✅ Message sent to **{guild.name}** / {channel.mention}.", mention_author=False)
 
 
+@bot.listen("on_command")
+async def _track_prefix_command_usage(ctx: commands.Context):
+    try:
+        if ctx.guild is not None and ctx.author and not getattr(ctx.author, "bot", False):
+            _track_user_activity(ctx.author.id, "-" + str(ctx.command.qualified_name))
+    except Exception as exc:
+        print(f"Could not track prefix command: {type(exc).__name__}: {exc}")
+
+
 @bot.listen("on_interaction")
 async def _track_known_interaction_user(interaction: discord.Interaction):
     try:
         if interaction.guild is not None and interaction.user and not getattr(interaction.user, "bot", False):
             _remember_user(interaction.user.id)
+            data = interaction.data if isinstance(interaction.data, dict) else {}
+            command_name = str(data.get("name") or "").strip()
+            if command_name:
+                _track_user_activity(interaction.user.id, "/" + command_name)
+            elif data.get("custom_id"):
+                _track_user_activity(interaction.user.id, "Button: " + str(data.get("custom_id"))[:90])
     except Exception as exc:
         print(f"Could not track interaction user: {type(exc).__name__}: {exc}")
 
@@ -5236,6 +5064,7 @@ async def on_message(message: discord.Message):
         if message.guild is not None and message.channel.id in AI_CHAT_CHANNELS:
             content = (message.content or "").strip()
             if content and not content.startswith(("/", "-", "!")):
+                _track_user_activity(message.author.id, "AI chat question")
                 # Ordinary AI chat is available in the configured reply channel to all plans.
                 # AI configuration/management slash commands remain restricted to Ultra/Admin.
                 now = asyncio.get_running_loop().time()
