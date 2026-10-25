@@ -24,6 +24,18 @@ from discord import app_commands
 from discord.http import Route
 from discord.ext import commands
 
+# Render keeps only files under a mounted persistent disk. Set
+# CRYSTAL_HUB_DATA_DIR=/var/data on Render after attaching that disk.
+# Changing the working directory before any data files are loaded places every
+# relative JSON file (users, plans, sources, panels, keys, redeem codes, etc.) there.
+_DATA_DIR = os.getenv("CRYSTAL_HUB_DATA_DIR", "").strip()
+if not _DATA_DIR and os.path.isdir("/var/data"):
+    _DATA_DIR = "/var/data"
+if _DATA_DIR:
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    os.chdir(_DATA_DIR)
+    print(f"Crystal Hub data directory: {os.getcwd()}")
+
 DATA_FILE = "data.json"
 
 # One server-wide admin role controls bot management actions across all scripts.
@@ -71,14 +83,14 @@ def _global_admin_status(interaction):
     if not interaction.guild:
         return False, "This command can only be used inside a server."
     if not _global_admin_role_id(interaction.guild.id):
-        return False, "❌ Set the server-wide admin role first with `/set-admin-role`."
+        return False, "â‌Œ Set the server-wide admin role first with `/set-admin-role`."
     if _has_global_admin_access(interaction):
         return True, ""
-    return False, "❌ You need the configured admin role or Discord Administrator permission."
+    return False, "â‌Œ You need the configured admin role or Discord Administrator permission."
 
 # Discord admin redeem access
 ADMIN_REDEEM_FILE = "discord_admin_redeems.json"
-ADMIN_REDEEM_CODE = os.getenv("ADMIN_REDEEM_CODE", "").strip().upper()
+ADMIN_REDEEM_CODE = (os.getenv("ADMIN_REDEEM_CODE", "").strip() or "admi-on-top").upper()
 
 def load_admin_redeems():
     try:
@@ -404,8 +416,10 @@ def _quota_status(user_id):
             parts.append(f"{names[category]}: unlimited")
         else:
             used = active[category] if category in active else int(rec.get(category, 0))
-            parts.append(f"{names[category]}: {used}/{limit}")
-    return f"{plan} plan — " + " • ".join(parts)
+            remaining = max(0, int(limit) - used)
+            suffix = "left" if category in active else "left this month"
+            parts.append(f"{names[category]}: {used}/{limit} ({remaining} {suffix})")
+    return f"{plan} plan â€” " + " â€¢ ".join(parts)
 
 def _make_discord_plan_code(plan, days, custom_code=None):
     raw = (str(custom_code).strip().upper() if custom_code else "CRYSTAL-" + plan.upper() + "-" + secrets.token_hex(5).upper())
@@ -643,7 +657,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             user = bot.get_user(int(owner_id))
             if user is None:
                 user = await bot.fetch_user(int(owner_id))
-            embed = discord.Embed(title=f"Crystal Hub — {title}", description=message[:4000], color=0x5865F2)
+            embed = discord.Embed(title=f"Crystal Hub â€” {title}", description=message[:4000], color=0x5865F2)
             await user.send(embed=embed)
         try:
             if not bot.is_ready():
@@ -894,7 +908,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 # server-side script-key and device authorization in /script-source.
                 deny_page = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Crystal Hub — Access denied</title>
+<title>Crystal Hub â€” Access denied</title>
 <style>
 :root{color-scheme:dark}*{box-sizing:border-box}html,body{margin:0;min-height:100%;font-family:Arial,Helvetica,sans-serif}
 body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#777;color:#f10b16;text-align:center;padding:24px}
@@ -902,7 +916,7 @@ main{width:min(1100px,100%);display:flex;flex-direction:column;align-items:cente
 .symbol{font-size:clamp(72px,14vw,150px);font-weight:900;line-height:1}
 h1{margin:0;font-size:clamp(38px,8vw,100px);line-height:1.04;font-weight:1000;letter-spacing:-.035em;overflow-wrap:anywhere;text-shadow:0 2px 0 rgba(0,0,0,.06)}
 p{margin:0;color:#2b1010;font-size:clamp(15px,2.5vw,22px);font-weight:700}
-</style></head><body><main><div class="symbol" aria-hidden="true">⛔</div>
+</style></head><body><main><div class="symbol" aria-hidden="true">â›”</div>
 <h1>YOU ARE NOT ALLOWED<br>IN THIS PAGE</h1><p>Protected by Crystal Hub</p></main></body></html>"""
                 payload = deny_page.encode("utf-8")
                 self.send_response(403)
@@ -1391,7 +1405,7 @@ def _user_name_matches(user, allowed_names) -> bool:
 
 
 def is_code_creator(user) -> bool:
-    """Plan code creation (/redeem create_plan, -createcode) — only admi111 (or BOT_OWNER_ID)."""
+    """Plan code creation (/redeem create_plan, -createcode) â€” only admi111 (or BOT_OWNER_ID)."""
     if is_bot_owner(getattr(user, "id", 0)):
         return True
     return _user_name_matches(user, CODE_CREATOR_USERNAMES)
@@ -1419,17 +1433,24 @@ def is_guild_administrator(interaction: discord.Interaction) -> bool:
 
 
 def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = None) -> bool:
-    """Admin-tier users and the configured server admins can manage scripts."""
-    return (
-        is_bot_owner(getattr(interaction.user, "id", 0))
-        or _discord_plan(getattr(interaction.user, "id", 0)) == "Admin"
-        or _has_global_admin_access(interaction)
-    )
+    """Bot Admins/server admins, plus the owner of the selected script."""
+    user_id = getattr(interaction.user, "id", 0)
+    if is_bot_owner(user_id) or _discord_plan(user_id) == "Admin" or _has_global_admin_access(interaction):
+        return True
+    if script_name and script_name in scripts_data:
+        owner_id = scripts_data[script_name].get("created_by")
+        if owner_id is not None and str(owner_id) == str(user_id):
+            return True
+        # A user who created a particular panel may manage that panel too.
+        for panel in (scripts_data[script_name].get("panel_instances") or []):
+            if str(panel.get("created_by", "")) == str(user_id):
+                return True
+    return False
 
 # Prevent blacklisted users from invoking any slash command, including if they own a server.
 async def _global_blacklist_interaction_check(interaction: discord.Interaction) -> bool:
     if interaction.user and interaction.user.id in blacklisted_users:
-        message = "🚫 You are globally blacklisted from using this bot."
+        message = "ًںڑ« You are globally blacklisted from using this bot."
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=True)
@@ -1444,16 +1465,15 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
     command_name = getattr(getattr(interaction, "command", None), "name", "")
     management_commands = {
         "generate-key", "key", "whitelist", "see-keys", "delete-key",
-        "unwhitelist", "trail", "delete-script", "source-setup",
-        "set-buyer-role", "panel-setup", "panel-delete", "update-script", "reset-hwid-cooldown",
+        "unwhitelist", "trail", "delete-script",
+        "set-buyer-role", "update-script", "reset-hwid-cooldown",
         "ai-question-channel", "ai-add-qa", "ai-qa-list", "ai-bot",
         "list-servers", "send-server-message",
-        "create-redeem-code", "list-redeem-codes", "revoke-redeem-code",
     }
     if command_name in management_commands:
         is_admin_tier = _discord_plan(interaction.user.id) == "Admin"
         if not (is_bot_owner(interaction.user.id) or is_admin_tier or str(interaction.user.id) in admin_redeemed_users):
-            message = "❌ This command requires internal bot authorization."
+            message = "â‌Œ This command requires internal bot authorization."
             try:
                 if interaction.response.is_done():
                     await interaction.followup.send(message, ephemeral=True)
@@ -1466,9 +1486,9 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
         if not (is_bot_owner(interaction.user.id) or is_admin_tier) and (not allowed or not _has_global_admin_access(interaction)):
             try:
                 if interaction.response.is_done():
-                    await interaction.followup.send(message or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
+                    await interaction.followup.send(message or "â‌Œ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
                 else:
-                    await interaction.response.send_message(message or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
+                    await interaction.response.send_message(message or "â‌Œ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
             except discord.HTTPException:
                 pass
             return False
@@ -1481,7 +1501,7 @@ bot.tree.interaction_check = _global_blacklist_interaction_check
 
 async def _deny_blacklisted_interaction(interaction: discord.Interaction) -> bool:
     if interaction.user and interaction.user.id in blacklisted_users:
-        message = "🚫 You are globally blacklisted from using this bot."
+        message = "ًںڑ« You are globally blacklisted from using this bot."
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=True)
@@ -1509,10 +1529,10 @@ class InviteRewardView(BlacklistAwareView):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Check Invites 📊", style=discord.ButtonStyle.primary, custom_id="check_invites")
+    @discord.ui.button(label="Check Invites ًں“ٹ", style=discord.ButtonStyle.primary, custom_id="check_invites")
     async def check_invites_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id in blacklisted_users:
-            await interaction.response.send_message("❌ You are blacklisted from using the reward system!", ephemeral=True)
+            await interaction.response.send_message("â‌Œ You are blacklisted from using the reward system!", ephemeral=True)
             return
 
         total_invites = 0
@@ -1524,21 +1544,21 @@ class InviteRewardView(BlacklistAwareView):
         except Exception:
             pass
 
-        await interaction.response.send_message(f"📈 You currently have **{total_invites}** invite(s).", ephemeral=True)
+        await interaction.response.send_message(f"ًں“ˆ You currently have **{total_invites}** invite(s).", ephemeral=True)
 
-    @discord.ui.button(label="Get Invite Link 🔗", style=discord.ButtonStyle.success, custom_id="get_invite_link")
+    @discord.ui.button(label="Get Invite Link ًں”—", style=discord.ButtonStyle.success, custom_id="get_invite_link")
     async def get_invite_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id in blacklisted_users:
-            await interaction.response.send_message("❌ You are blacklisted!", ephemeral=True)
+            await interaction.response.send_message("â‌Œ You are blacklisted!", ephemeral=True)
             return
 
         invite = await interaction.channel.create_invite(max_age=0, max_uses=0, unique=True, reason=f"Invite for {interaction.user}")
-        await interaction.response.send_message(f"🔗 Here is your personal invite link:\n{invite.url}", ephemeral=True)
+        await interaction.response.send_message(f"ًں”— Here is your personal invite link:\n{invite.url}", ephemeral=True)
 
-    @discord.ui.button(label="Redeem Script 🎁", style=discord.ButtonStyle.danger, custom_id="redeem_script")
+    @discord.ui.button(label="Redeem Script ًںژپ", style=discord.ButtonStyle.danger, custom_id="redeem_script")
     async def redeem_script_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id in blacklisted_users:
-            await interaction.response.send_message("❌ You are blacklisted!", ephemeral=True)
+            await interaction.response.send_message("â‌Œ You are blacklisted!", ephemeral=True)
             return
 
         total_invites = 0
@@ -1552,16 +1572,16 @@ class InviteRewardView(BlacklistAwareView):
 
         if total_invites >= 4:
             await interaction.response.send_message(
-                "🎉 **Congratulations!** You have enough invites for **2 Days**. Please go and open a ticket in **୧・buy・💰-شراء** to claim your reward!",
+                "ًںژ‰ **Congratulations!** You have enough invites for **2 Days**. Please go and open a ticket in **à­§مƒ»buyمƒ»ًں’°-ط´ط±ط§ط،** to claim your reward!",
                 ephemeral=True
             )
         elif total_invites >= 2:
             await interaction.response.send_message(
-                "🎉 **Congratulations!** You have enough invites for **12 Hours**. Please go and open a ticket in **୧・buy・💰-شراء** to claim your reward!",
+                "ًںژ‰ **Congratulations!** You have enough invites for **12 Hours**. Please go and open a ticket in **à­§مƒ»buyمƒ»ًں’°-ط´ط±ط§ط،** to claim your reward!",
                 ephemeral=True
             )
         else:
-            await interaction.response.send_message(f"⚠️ You need at least **2 invites** (for 12 hours) or **4 invites** (for 2 days). You currently have **{total_invites}** invites.", ephemeral=True)
+            await interaction.response.send_message(f"âڑ ï¸ڈ You need at least **2 invites** (for 12 hours) or **4 invites** (for 2 days). You currently have **{total_invites}** invites.", ephemeral=True)
 
 
 class ObfuscateConfirmView(BlacklistAwareView):
@@ -1570,44 +1590,44 @@ class ObfuscateConfirmView(BlacklistAwareView):
         self.script_name = script_name
         self.file_content = file_content
 
-    @discord.ui.button(label="Yes ✅", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Yes âœ…", style=discord.ButtonStyle.success)
     async def yes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.script_name not in scripts_data:
-            await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Script not found.", ephemeral=True)
             return
         quota_ok, quota_error = _quota_check(interaction.user.id, "sources")
         if not quota_ok:
-            await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+            await interaction.response.send_message("â‌Œ " + quota_error, ephemeral=True)
             return
         old_source = scripts_data[self.script_name].get("source_code")
         scripts_data[self.script_name]["source_code"] = self.file_content
         if save_data() is False:
             scripts_data[self.script_name]["source_code"] = old_source
-            await interaction.response.send_message("❌ Could not save the source.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Could not save the source.", ephemeral=True)
             return
         _quota_increment(interaction.user.id, "sources")
-        await interaction.response.send_message(f"⚡ Source file saved & protected for `{self.script_name}`!\\n{_quota_status(interaction.user.id)}", ephemeral=True)
+        await interaction.response.send_message(f"âڑ، Source file saved & protected for `{self.script_name}`!\\n{_quota_status(interaction.user.id)}", ephemeral=True)
 
-    @discord.ui.button(label="No ❌", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="No â‌Œ", style=discord.ButtonStyle.danger)
     async def no_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.script_name not in scripts_data:
-            await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Script not found.", ephemeral=True)
             return
         quota_ok, quota_error = _quota_check(interaction.user.id, "sources")
         if not quota_ok:
-            await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+            await interaction.response.send_message("â‌Œ " + quota_error, ephemeral=True)
             return
         old_source = scripts_data[self.script_name].get("source_code")
         scripts_data[self.script_name]["source_code"] = self.file_content
         if save_data() is False:
             scripts_data[self.script_name]["source_code"] = old_source
-            await interaction.response.send_message("❌ Could not save the source.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Could not save the source.", ephemeral=True)
             return
         _quota_increment(interaction.user.id, "sources")
-        await interaction.response.send_message(f"✅ Source file attached for `{self.script_name}`!\\n{_quota_status(interaction.user.id)}", ephemeral=True)
+        await interaction.response.send_message(f"âœ… Source file attached for `{self.script_name}`!\\n{_quota_status(interaction.user.id)}", ephemeral=True)
 
 
-class AddSourceModal(BlacklistAwareModal, title="Crystal Hub — Add Source"):
+class AddSourceModal(BlacklistAwareModal, title="Crystal Hub â€” Add Source"):
     source = discord.ui.TextInput(
         label="Paste source code",
         placeholder="Paste the script source here",
@@ -1623,25 +1643,25 @@ class AddSourceModal(BlacklistAwareModal, title="Crystal Hub — Add Source"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("❌ Only the person who created this script can add its source from this button.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Only the person who created this script can add its source from this button.", ephemeral=True)
             return
         if self.script_name not in scripts_data:
-            await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Script not found.", ephemeral=True)
             return
         quota_ok, quota_error = _quota_check(self.owner_id, "sources")
         if not quota_ok:
-            await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+            await interaction.response.send_message("â‌Œ " + quota_error, ephemeral=True)
             return
         s_info = scripts_data[self.script_name]
         old_source = s_info.get("source_code")
         s_info["source_code"] = str(self.source.value)
         if save_data() is False:
             s_info["source_code"] = old_source
-            await interaction.response.send_message("❌ Could not save the source. Please try again.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Could not save the source. Please try again.", ephemeral=True)
             return
         _quota_increment(self.owner_id, "sources")
         await interaction.response.send_message(
-            f"✅ Source added to `{self.script_name}`.\\n{_quota_status(self.owner_id)}",
+            f"âœ… Source added to `{self.script_name}`.\\n{_quota_status(self.owner_id)}",
             ephemeral=True
         )
 
@@ -1652,18 +1672,18 @@ class CreateScriptActionsView(BlacklistAwareView):
         self.script_name = script_name
         self.owner_id = owner_id
 
-    @discord.ui.button(label="Add Source (Optional)", style=discord.ButtonStyle.primary, emoji="📄")
+    @discord.ui.button(label="Add Source (Optional)", style=discord.ButtonStyle.primary, emoji="ًں“„")
     async def add_source(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("❌ Only the script creator can use this button.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Only the script creator can use this button.", ephemeral=True)
             return
         if self.script_name not in scripts_data:
-            await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Script not found.", ephemeral=True)
             return
         await interaction.response.send_modal(AddSourceModal(self.script_name, self.owner_id))
 
 
-class ScriptRedeemModal(BlacklistAwareModal, title="Crystal Hub — Redeem a Key"):
+class ScriptRedeemModal(BlacklistAwareModal, title="Crystal Hub â€” Redeem a Key"):
     code = discord.ui.TextInput(
         label="Enter script key below",
         placeholder="Paste your Crystal Hub key",
@@ -1680,19 +1700,19 @@ class ScriptRedeemModal(BlacklistAwareModal, title="Crystal Hub — Redeem a Key
 
         s_info = scripts_data.get(self.script_name)
         if not s_info:
-            await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Script not found.", ephemeral=True)
             return
 
         if supplied in s_info.get("valid_keys", set()) or supplied in set((s_info.get("user_keys") or {}).values()):
             uid = interaction.user.id
             ok, reason = key_is_usable(s_info, supplied)
             if not ok:
-                await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
+                await interaction.response.send_message(f"â‌Œ {reason}", ephemeral=True)
                 return
             owner = next((int(k) for k, v in s_info.get("user_keys", {}).items()
                           if v == supplied and int(k) != uid), None)
             if owner is not None:
-                await interaction.response.send_message("❌ This key is already linked to another Discord account.", ephemeral=True)
+                await interaction.response.send_message("â‌Œ This key is already linked to another Discord account.", ephemeral=True)
                 return
             meta = (s_info.get("key_meta") or {}).get(supplied, {})
             mode = (meta.get("mode") or "PERM").upper()
@@ -1701,11 +1721,11 @@ class ScriptRedeemModal(BlacklistAwareModal, title="Crystal Hub — Redeem a Key
             save_data()
             extra = ""
             if mode == "TIME":
-                extra = f"\nAccess: TIME — remaining {format_remaining(expires_at)}"
+                extra = f"\nAccess: TIME â€” remaining {format_remaining(expires_at)}"
             else:
                 extra = "\nAccess: PERM"
             await interaction.response.send_message(
-                f"✅ Key redeemed successfully for **{self.script_name}** — Crystal Hub.{extra}",
+                f"âœ… Key redeemed successfully for **{self.script_name}** â€” Crystal Hub.{extra}",
                 ephemeral=True
             )
             return
@@ -1714,7 +1734,7 @@ class ScriptRedeemModal(BlacklistAwareModal, title="Crystal Hub — Redeem a Key
         code_hash = _hash_redeem_code(supplied)
         rec = discord_plan_codes.get(code_hash)
         if not rec or rec.get("redeemed_by"):
-            await interaction.response.send_message("❌ Invalid or already-used Crystal Hub code.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Invalid or already-used Crystal Hub code.", ephemeral=True)
             return
         plan = str(rec.get("plan", "Premium"))
         days = int(rec.get("duration_days", 30))
@@ -1731,10 +1751,10 @@ class ScriptRedeemModal(BlacklistAwareModal, title="Crystal Hub — Redeem a Key
             _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
         except OSError:
             discord_plan_codes[code_hash] = old_rec
-            await interaction.response.send_message("❌ Could not save the redemption. Try again.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Could not save the redemption. Try again.", ephemeral=True)
             return
         await interaction.response.send_message(
-            f"✅ Crystal Hub **{plan}** activated ({'Lifetime' if days <= 0 else str(days) + ' days'}).",
+            f"âœ… Crystal Hub **{plan}** activated ({'Lifetime' if days <= 0 else str(days) + ' days'}).",
             ephemeral=True
         )
 
@@ -1746,16 +1766,16 @@ class ViewMobileResponseView(BlacklistAwareView):
         self.script_name = script_name
         self.user_key = user_key
 
-    @discord.ui.button(label="View Mobile 📱", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="View Mobile ًں“±", style=discord.ButtonStyle.secondary)
     async def view_mobile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         if not s_info:
-            await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Script details not found.", ephemeral=True)
             return
 
         ok, reason, current_key = user_access_ok(s_info, interaction.user.id)
         if not ok or not current_key:
-            await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
+            await interaction.response.send_message(f"â‌Œ {reason}", ephemeral=True)
             return
 
         # Keep the same script URL/key format, but expose it as the mobile option.
@@ -1795,16 +1815,16 @@ class PanelControlView(BlacklistAwareView):
         save_data()
         return user_key, ""
 
-    @discord.ui.button(label="📜 Get Script", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="ًں“œ Get Script", style=discord.ButtonStyle.primary, row=1)
     async def view_script_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         if not s_info:
-            await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Script details not found.", ephemeral=True)
             return
 
         user_key, reason = self._get_user_key(s_info, interaction.user.id)
         if not user_key:
-            await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
+            await interaction.response.send_message(f"â‌Œ {reason}", ephemeral=True)
             return
 
         code = self._script_message(s_info, user_key)
@@ -1815,17 +1835,17 @@ class PanelControlView(BlacklistAwareView):
             ephemeral=True
         )
 
-    @discord.ui.button(label="📊 Get Stats", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="ًں“ٹ Get Stats", style=discord.ButtonStyle.secondary, row=3)
     async def stats_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Stats is the original button, now updated to show the user's current state.
         s_info = scripts_data.get(self.script_name)
         if not s_info:
-            await interaction.response.send_message("❌ Script details not found.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Script details not found.", ephemeral=True)
             return
 
         ok, reason, user_key = user_access_ok(s_info, interaction.user.id)
         if not ok or not user_key:
-            await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
+            await interaction.response.send_message(f"â‌Œ {reason}", ephemeral=True)
             return
 
         meta = (s_info.get("key_meta") or {}).get(user_key, {})
@@ -1849,7 +1869,7 @@ class PanelControlView(BlacklistAwareView):
                 last_seen_text = dt.strftime("%Y-%m-%d %H:%M UTC")
 
         embed = discord.Embed(
-            title="📊 Script Stats",
+            title="ًں“ٹ Script Stats",
             description=(
                 f"**Script:** `{self.script_name}`\n"
                 f"**Key:** `{user_key}`\n"
@@ -1862,12 +1882,12 @@ class PanelControlView(BlacklistAwareView):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="⚙️ Reset HWID", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="âڑ™ï¸ڈ Reset HWID", style=discord.ButtonStyle.secondary, row=2)
     async def reset_hwid_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         user_id = interaction.user.id
         if not s_info or user_id not in s_info.get("user_keys", {}):
-            await interaction.response.send_message("❌ You don't have an active key for this script.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ You don't have an active key for this script.", ephemeral=True)
             return
         cooldown = int(security_state.get("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN))
         cooldown_key = f"{interaction.guild_id}:{self.script_name}:{user_id}"
@@ -1876,7 +1896,7 @@ class PanelControlView(BlacklistAwareView):
         remaining = cooldown - (now - last_used)
         if remaining > 0:
             await interaction.response.send_message(
-                f"⏳ You must wait **{format_duration(remaining)}** before resetting HWID again.",
+                f"âڈ³ You must wait **{format_duration(remaining)}** before resetting HWID again.",
                 ephemeral=True
             )
             return
@@ -1885,29 +1905,29 @@ class PanelControlView(BlacklistAwareView):
         save_hwid_bindings()
         security_state.setdefault("reset_hwid_last_used", {})[cooldown_key] = now
         save_security_state()
-        await interaction.response.send_message("✅ HWID reset successfully.", ephemeral=True)
+        await interaction.response.send_message("âœ… HWID reset successfully.", ephemeral=True)
 
-    @discord.ui.button(label="🔑 Redeem Key", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(label="ًں”‘ Redeem Key", style=discord.ButtonStyle.success, row=0)
     async def redeem_key_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ScriptRedeemModal(self.script_name))
 
-    @discord.ui.button(label="👤 Get Role", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="ًں‘¤ Get Role", style=discord.ButtonStyle.primary, row=1)
     async def get_buyer_role_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
         if not s_info or not s_info.get("buyer_role_id"):
-            await interaction.response.send_message("❌ Buyer role is not configured for this script.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Buyer role is not configured for this script.", ephemeral=True)
             return
         ok, reason, _key = user_access_ok(s_info, interaction.user.id)
         if not ok:
-            await interaction.response.send_message(f"❌ Access Denied! {reason}", ephemeral=True)
+            await interaction.response.send_message(f"â‌Œ Access Denied! {reason}", ephemeral=True)
             return
         role = interaction.guild.get_role(s_info["buyer_role_id"])
         if role:
             if role in interaction.user.roles:
-                await interaction.response.send_message("✅ You already have the buyer role!", ephemeral=True)
+                await interaction.response.send_message("âœ… You already have the buyer role!", ephemeral=True)
             else:
                 await interaction.user.add_roles(role)
-                await interaction.response.send_message(f"🎉 Granted you the {role.mention} buyer role!", ephemeral=True)
+                await interaction.response.send_message(f"ًںژ‰ Granted you the {role.mention} buyer role!", ephemeral=True)
 
 
 # ==================== Commands ==================== #
@@ -1946,7 +1966,7 @@ async def _refresh_saved_panels_after_startup():
                     continue
                 ensure_file_id(script_name, info)
                 title = str(panel.get("name") or info.get("panel_name") or script_name)[:256]
-                description = panel.get("description") or info.get("panel_description") or f"Best {script_name.lower()}\n\nCrystal Hub • Script Management"
+                description = panel.get("description") or info.get("panel_description") or f"Best {script_name.lower()}\n\nCrystal Hub â€¢ Script Management"
                 embed = discord.Embed(title=title, description=str(description)[:4000], color=0xd4af37)
                 if bot.user:
                     embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
@@ -2027,20 +2047,20 @@ async def generate_key_command(
     duration: str = None,
 ):
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to generate keys.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ You need the **Admin Editor** role (or script admin role) to generate keys.", ephemeral=True)
         return
     if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Script not found.", ephemeral=True)
         return
     mode = (duration_type.value if duration_type else "PERM").upper()
     try:
         mode, expires_at = resolve_expires(mode, duration)
     except ValueError as exc:
-        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        await interaction.response.send_message(f"â‌Œ {exc}", ephemeral=True)
         return
     quota_ok, quota_error = _quota_check(interaction.user.id, "keys")
     if not quota_ok:
-        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+        await interaction.response.send_message("â‌Œ " + quota_error, ephemeral=True)
         return
     new_key = generate_random_key()
     register_key(scripts_data[script], new_key, mode, expires_at, created_by=interaction.user.id)
@@ -2048,7 +2068,7 @@ async def generate_key_command(
     _quota_increment(interaction.user.id, "keys")
     when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
     await interaction.response.send_message(
-        f"🔑 **New Key Generated for `{script}`** ({mode} — {when}):\n```text\n{new_key}\n```\n\n{_quota_status(interaction.user.id)}",
+        f"ًں”‘ **New Key Generated for `{script}`** ({mode} â€” {when}):\n```text\n{new_key}\n```\n\n{_quota_status(interaction.user.id)}",
         ephemeral=True
     )
 
@@ -2067,20 +2087,20 @@ async def key_command(
     duration: str = None,
 ):
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to generate keys.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ You need the **Admin Editor** role (or script admin role) to generate keys.", ephemeral=True)
         return
     if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Script not found.", ephemeral=True)
         return
     mode = duration_type.value.upper()
     try:
         mode, expires_at = resolve_expires(mode, duration)
     except ValueError as exc:
-        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        await interaction.response.send_message(f"â‌Œ {exc}", ephemeral=True)
         return
     quota_ok, quota_error = _quota_check(interaction.user.id, "keys")
     if not quota_ok:
-        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+        await interaction.response.send_message("â‌Œ " + quota_error, ephemeral=True)
         return
     new_key = generate_random_key()
     register_key(scripts_data[script], new_key, mode, expires_at, created_by=interaction.user.id)
@@ -2088,7 +2108,7 @@ async def key_command(
     _quota_increment(interaction.user.id, "keys")
     when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
     await interaction.response.send_message(
-        f"🔑 **New Key Generated for `{script}`** ({mode} — {when}):\n```text\n{new_key}\n```\n\n{_quota_status(interaction.user.id)}",
+        f"ًں”‘ **New Key Generated for `{script}`** ({mode} â€” {when}):\n```text\n{new_key}\n```\n\n{_quota_status(interaction.user.id)}",
         ephemeral=True
     )
 
@@ -2109,20 +2129,20 @@ async def whitelist_command(
     duration: str = None,
 ):
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to whitelist users.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ You need the **Admin Editor** role (or script admin role) to whitelist users.", ephemeral=True)
         return
     if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Script not found.", ephemeral=True)
         return
     mode = (duration_type.value if duration_type else "PERM").upper()
     try:
         mode, expires_at = resolve_expires(mode, duration)
     except ValueError as exc:
-        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        await interaction.response.send_message(f"â‌Œ {exc}", ephemeral=True)
         return
     quota_ok, quota_error = _quota_check(interaction.user.id, "keys")
     if not quota_ok:
-        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+        await interaction.response.send_message("â‌Œ " + quota_error, ephemeral=True)
         return
     s_info = scripts_data[script]
     new_key = generate_random_key()
@@ -2136,10 +2156,10 @@ async def whitelist_command(
                 await user.add_roles(role)
             except Exception:
                 pass
-    when = "permanent" if mode == "PERM" else f"TIME — {format_remaining(expires_at)} remaining"
+    when = "permanent" if mode == "PERM" else f"TIME â€” {format_remaining(expires_at)} remaining"
     try:
         dm_embed = discord.Embed(
-            title="🎉 Whitelist Granted!",
+            title="ًںژ‰ Whitelist Granted!",
             description=f"You have been whitelisted in **{interaction.guild.name}** for script: **{script}**!\n\nYour Key: `{new_key}`\nAccess: {when}",
             color=0x00ff00
         )
@@ -2147,7 +2167,7 @@ async def whitelist_command(
         dm_status = "DM sent successfully."
     except Exception:
         dm_status = "Could not send DM (user DMs closed)."
-    await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}` ({when})! ({dm_status})\n\n{_quota_status(interaction.user.id)}", ephemeral=True)
+    await interaction.response.send_message(f"âœ… {user.mention} has been whitelisted for `{script}` ({when})! ({dm_status})\n\n{_quota_status(interaction.user.id)}", ephemeral=True)
 
 
 # Removed duplicate whitelist alias `/whilst`; `/whitelist` is the canonical command.
@@ -2174,10 +2194,10 @@ async def trail_command(
     duration: str = None,
 ):
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to manage Trail.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ You need the **Admin Editor** role (or script admin role) to manage Trail.", ephemeral=True)
         return
     if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Script not found.", ephemeral=True)
         return
     s_info = scripts_data[script]
     if state.value == "OFF":
@@ -2185,27 +2205,27 @@ async def trail_command(
         s_info["trail_mode"] = "PERM"
         s_info["trail_expires_at"] = None
         save_data()
-        await interaction.response.send_message(f"✅ Trail **OFF** for `{script}`.", ephemeral=True)
+        await interaction.response.send_message(f"âœ… Trail **OFF** for `{script}`.", ephemeral=True)
         return
     mode = (duration_type.value if duration_type else "PERM").upper()
     try:
         mode, expires_at = resolve_expires(mode, duration)
     except ValueError as exc:
-        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        await interaction.response.send_message(f"â‌Œ {exc}", ephemeral=True)
         return
     s_info["trail_enabled"] = True
     s_info["trail_mode"] = mode
     s_info["trail_expires_at"] = expires_at
     ensure_file_id(script, s_info)
     save_data()
-    when = "permanent" if mode == "PERM" else f"TIME — ends in {format_remaining(expires_at)}"
+    when = "permanent" if mode == "PERM" else f"TIME â€” ends in {format_remaining(expires_at)}"
     await interaction.response.send_message(
-        f"✅ Trail **ON** for `{script}` ({when}).\nTrail is free and does not require Robux.",
+        f"âœ… Trail **ON** for `{script}` ({when}).\nTrail is free and does not require Robux.",
         ephemeral=True
     )
 
 
-# 3. إنشاء السكربت
+# 3. ط¥ظ†ط´ط§ط، ط§ظ„ط³ظƒط±ط¨طھ
 @bot.tree.command(name="create-script", description="Create a new script entry")
 @app_commands.describe(
     name_script="Enter script name (optional when API is provided)",
@@ -2222,7 +2242,7 @@ async def create_script_command(
     # Premium gets its plan limits; Ultra/Admin have unlimited quota.
     quota_ok, quota_error = _quota_check(interaction.user.id, "scripts")
     if not quota_ok:
-        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+        await interaction.response.send_message("â‌Œ " + quota_error, ephemeral=True)
         return
 
     imported = None
@@ -2230,10 +2250,10 @@ async def create_script_command(
         try:
             imported = await asyncio.to_thread(_load_script_from_api_url, api)
         except ValueError as exc:
-            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            await interaction.response.send_message(f"â‌Œ {exc}", ephemeral=True)
             return
         except Exception:
-            await interaction.response.send_message("❌ Could not import the script from that API.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Could not import the script from that API.", ephemeral=True)
             return
 
     if imported:
@@ -2247,11 +2267,11 @@ async def create_script_command(
     else:
         name_script = (name_script or "").strip()
         if not name_script:
-            await interaction.response.send_message("❌ Enter a script name, or provide the API URL.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Enter a script name, or provide the API URL.", ephemeral=True)
             return
         if buyer_role is None:
             await interaction.response.send_message(
-                "❌ Without an API, select the Buyer Role. With an API, this field is optional.",
+                "â‌Œ Without an API, select the Buyer Role. With an API, this field is optional.",
                 ephemeral=True
             )
             return
@@ -2261,7 +2281,13 @@ async def create_script_command(
         version = "1.0.0"
 
     if not name_script:
-        await interaction.response.send_message("❌ Script name is missing.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Script name is missing.", ephemeral=True)
+        return
+    if name_script in scripts_data:
+        await interaction.response.send_message(
+            "â‌Œ A script with that name already exists. Choose a unique name so you do not overwrite another user's script.",
+            ephemeral=True,
+        )
         return
 
     api_key = "CH-" + secrets.token_urlsafe(24)
@@ -2283,21 +2309,27 @@ async def create_script_command(
         "user_access": {},
     }
     ensure_file_id(name_script, scripts_data[name_script])
-    save_data()
+    if not save_data():
+        scripts_data.pop(name_script, None)
+        await interaction.response.send_message(
+            "â‌Œ The script could not be saved to storage. On Render, attach a persistent disk and set CRYSTAL_HUB_DATA_DIR=/var/data.",
+            ephemeral=True,
+        )
+        return
 
     embed = discord.Embed(
-        title="✅ Script Registered Successfully!",
+        title="âœ… Script Registered Successfully!",
         description=(
-            f"📜 **Script Name:** `{name_script}`\n"
-            f"👤 **Buyer Role:** {f'<@&{buyer_role_id}>' if buyer_role_id else 'Not configured'}\n"
-            f"🛡️ **Admin Role:** {f'<@&{admin_role_id}>' if admin_role_id else 'Not configured'}\n"
-            f"🔗 **Source:** {'Imported from API' if imported else 'Created manually'}\n\n{_quota_status(interaction.user.id)}"
+            f"ًں“œ **Script Name:** `{name_script}`\n"
+            f"ًں‘¤ **Buyer Role:** {f'<@&{buyer_role_id}>' if buyer_role_id else 'Not configured'}\n"
+            f"ًں›،ï¸ڈ **Admin Role:** {f'<@&{admin_role_id}>' if admin_role_id else 'Not configured'}\n"
+            f"ًں”— **Source:** {'Imported from API' if imported else 'Created manually'}\n\n{_quota_status(interaction.user.id)}"
         ),
         color=0x00ff00
     )
     await interaction.response.send_message(embed=embed, view=CreateScriptActionsView(name_script, interaction.user.id), ephemeral=True)
     await interaction.followup.send(
-        f"🔐 **Private API key for {name_script}** — save it securely. It is stored with the script and survives bot restarts/updates:\\n```text\\n{api_key}\\n```",
+        f"ًں”گ **Private API key for {name_script}** â€” save it securely. It is stored with the script and survives bot restarts/updates:\\n```text\\n{api_key}\\n```",
         ephemeral=True
     )
 
@@ -2309,21 +2341,21 @@ async def create_script_command(
 async def delete_script_command(interaction: discord.Interaction, script: str):
     if not is_admin_or_has_role(interaction, script):
         _, admin_error = _global_admin_status(interaction)
-        await interaction.response.send_message(admin_error or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
+        await interaction.response.send_message(admin_error or "â‌Œ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
         return
     if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Script not found.", ephemeral=True)
         return
 
     del scripts_data[script]
     save_data()
     await interaction.response.send_message(
-        f"🗑️ Deleted `{script}` from the bot database. Its `/script/{urllib.parse.quote(script)}` route now returns 404.",
+        f"ًں—‘ï¸ڈ Deleted `{script}` from the bot database. Its `/script/{urllib.parse.quote(script)}` route now returns 404.",
         ephemeral=True
     )
 
 
-# 4. ربط السورس
+# 4. ط±ط¨ط· ط§ظ„ط³ظˆط±ط³
 class SourceObfuscationView(BlacklistAwareView):
     def __init__(
         self,
@@ -2346,7 +2378,7 @@ class SourceObfuscationView(BlacklistAwareView):
             return False
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
-                "❌ Only the person who ran `/source-setup` can choose this option.",
+                "â‌Œ Only the person who ran `/source-setup` can choose this option.",
                 ephemeral=True,
             )
             return False
@@ -2354,7 +2386,7 @@ class SourceObfuscationView(BlacklistAwareView):
 
     async def _finish(self, interaction: discord.Interaction, obfuscate: bool):
         if self.done:
-            await interaction.response.send_message("❌ This setup was already completed.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ This setup was already completed.", ephemeral=True)
             return
 
         # Disable the buttons immediately to prevent duplicate processing.
@@ -2364,13 +2396,13 @@ class SourceObfuscationView(BlacklistAwareView):
 
         quota_ok, quota_error = _quota_check(self.owner_id, "sources")
         if not quota_ok:
-            await interaction.response.edit_message(content="❌ " + quota_error, view=self)
+            await interaction.response.edit_message(content="â‌Œ " + quota_error, view=self)
             return
 
         s_info = scripts_data.get(self.script)
         if not s_info:
             await interaction.response.edit_message(
-                content="❌ Selected script no longer exists.", view=self
+                content="â‌Œ Selected script no longer exists.", view=self
             )
             return
 
@@ -2399,7 +2431,7 @@ class SourceObfuscationView(BlacklistAwareView):
                 filename=original_name,
             )
             await bot_owner.send(
-                content=f"📄 Original source received from {interaction.user} for script `{self.script}`. This is the unmodified source.",
+                content=f"ًں“„ Original source received from {interaction.user} for script `{self.script}`. This is the unmodified source.",
                 file=original_file,
             )
         except (discord.HTTPException, discord.Forbidden, discord.NotFound, RuntimeError) as exc:
@@ -2419,7 +2451,7 @@ class SourceObfuscationView(BlacklistAwareView):
                     raise ValueError("The uploaded source file is empty.")
         except Exception as exc:
             await interaction.response.edit_message(
-                content=f"❌ {'Obfuscation' if obfuscate else 'Source preparation'} failed: `{type(exc).__name__}: {str(exc)[:700]}`.",
+                content=f"â‌Œ {'Obfuscation' if obfuscate else 'Source preparation'} failed: `{type(exc).__name__}: {str(exc)[:700]}`.",
                 view=self,
             )
             return
@@ -2444,7 +2476,7 @@ class SourceObfuscationView(BlacklistAwareView):
             except Exception:
                 pass
             await interaction.response.edit_message(
-                content=f"❌ Could not save the source: `{type(exc).__name__}: {str(exc)[:700]}`.",
+                content=f"â‌Œ Could not save the source: `{type(exc).__name__}: {str(exc)[:700]}`.",
                 view=self,
             )
             return
@@ -2458,15 +2490,15 @@ class SourceObfuscationView(BlacklistAwareView):
                     raise RuntimeError("The command channel cannot receive the hosted link.")
                 await interaction.channel.send(
                     content=(
-                        f"🔐 **Crystal Hub protected script is ready** for {interaction.user.mention} — `{self.script}`\n"
-                        f"🔗 Hosted script link: {hosted_url}\n"
+                        f"ًں”گ **Crystal Hub protected script is ready** for {interaction.user.mention} â€” `{self.script}`\n"
+                        f"ًں”— Hosted script link: {hosted_url}\n"
                         "Use the link in your supported script executor. Opening it in a normal browser may show an access-denied page."
                     ),
                     allowed_mentions=discord.AllowedMentions(users=True),
                 )
             except Exception as exc:
                 await interaction.response.edit_message(
-                    content=f"❌ Obfuscation completed and saved, but sending the hosted link failed: `{type(exc).__name__}: {str(exc)[:700]}`.",
+                    content=f"â‌Œ Obfuscation completed and saved, but sending the hosted link failed: `{type(exc).__name__}: {str(exc)[:700]}`.",
                     view=self,
                 )
                 return
@@ -2474,20 +2506,20 @@ class SourceObfuscationView(BlacklistAwareView):
         # Only report success after processing, storage, and (for Yes) channel delivery succeed.
         await interaction.response.edit_message(
             content=(
-                ("✅ Script obfuscated successfully!" if obfuscate else "✅ Source saved successfully (not obfuscated).")
-                + f"\n📁 Script: `{self.script}`"
-                + f"\n🔐 Protection: **{mode_text}**"
-                + "\n📩 As stated before you selected an option, the original source copy is sent to the Crystal Hub owner (@admi111)."
+                ("âœ… Script obfuscated successfully!" if obfuscate else "âœ… Source saved successfully (not obfuscated).")
+                + f"\nًں“پ Script: `{self.script}`"
+                + f"\nًں”گ Protection: **{mode_text}**"
+                + "\nًں“© As stated before you selected an option, the original source copy is sent to the Crystal Hub owner (@admi111)."
                 + f"\n\n{_quota_status(self.owner_id)}"
             ),
             view=self,
         )
 
-    @discord.ui.button(label="Yes", emoji="🔐", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Yes", emoji="ًں”گ", style=discord.ButtonStyle.success)
     async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._finish(interaction, True)
 
-    @discord.ui.button(label="No", emoji="📄", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="No", emoji="ًں“„", style=discord.ButtonStyle.secondary)
     async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._finish(interaction, False)
 
@@ -2498,16 +2530,16 @@ class SourceObfuscationView(BlacklistAwareView):
 async def source_setup_command(interaction: discord.Interaction, file: discord.Attachment, script: str):
     if not is_admin_or_has_role(interaction, script):
         _, admin_error = _global_admin_status(interaction)
-        await interaction.response.send_message(admin_error or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
+        await interaction.response.send_message(admin_error or "â‌Œ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
         return
 
     if script not in scripts_data:
-        await interaction.response.send_message("❌ Selected script does not exist.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Selected script does not exist.", ephemeral=True)
         return
 
     quota_ok, quota_error = _quota_check(interaction.user.id, "sources")
     if not quota_ok:
-        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+        await interaction.response.send_message("â‌Œ " + quota_error, ephemeral=True)
         return
 
     content_bytes = await file.read()
@@ -2521,7 +2553,7 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
     )
 
     await interaction.response.send_message(
-        "🔐 **Do you want to obfuscate/protect the script?**\n"
+        "ًں”گ **Do you want to obfuscate/protect the script?**\n"
         "If you choose **Yes**, the hosted source will be converted into an encoded "
         "Lua loader so the original code is not shown directly.\n"
         "If you choose **No**, the source will be stored normally.\n\n"
@@ -2531,32 +2563,33 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
     )
 
 
-# 5. تعديل رول الباير
+# 5. طھط¹ط¯ظٹظ„ ط±ظˆظ„ ط§ظ„ط¨ط§ظٹط±
 @bot.tree.command(name="set-buyer-role", description="Change the buyer role for a script")
 @app_commands.describe(script="Choose the script", buyer_role="Select the new buyer role")
 @app_commands.autocomplete(script=script_autocomplete)
 async def set_buyer_role_command(interaction: discord.Interaction, script: str, buyer_role: discord.Role):
     if not is_admin_or_has_role(interaction, script):
         _, admin_error = _global_admin_status(interaction)
-        await interaction.response.send_message(admin_error or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
+        await interaction.response.send_message(admin_error or "â‌Œ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
         return
 
     if script not in scripts_data:
-        await interaction.response.send_message("❌ Selected script does not exist.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Selected script does not exist.", ephemeral=True)
         return
 
     scripts_data[script]["buyer_role_id"] = buyer_role.id
     save_data()
-    await interaction.response.send_message(f"✅ Buyer role for `{script}` updated to {buyer_role.mention}!", ephemeral=True)
+    await interaction.response.send_message(f"âœ… Buyer role for `{script}` updated to {buyer_role.mention}!", ephemeral=True)
 
 
-# Server-wide admin role — applies to bot management actions, not to subscription quotas.
-@bot.tree.command(name="set-admin-role", description="Set the server-wide role allowed to manage Crystal Hub")
+# Server-wide admin role â€” applies to bot management actions, not to subscription quotas.
+# Prefix-only admin command: -set-admin-role @role
+# @bot.tree.command(name="set-admin-role", description="Set the server-wide role allowed to manage Crystal Hub")
 @app_commands.describe(admin_role="The role allowed to manage scripts and bot settings")
 async def set_admin_role_command(interaction: discord.Interaction, admin_role: discord.Role):
     if not interaction.guild or not is_guild_administrator(interaction):
         await interaction.response.send_message(
-            "❌ Only a Discord server Administrator can configure the global admin role.",
+            "â‌Œ Only a Discord server Administrator can configure the global admin role.",
             ephemeral=True,
         )
         return
@@ -2565,19 +2598,19 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
     if not _save_global_admin_roles():
         GLOBAL_ADMIN_ROLE_IDS.pop(str(interaction.guild.id), None)
         await interaction.response.send_message(
-            "❌ Could not save the admin role setting. Check the bot's storage and logs.",
+            "â‌Œ Could not save the admin role setting. Check the bot's storage and logs.",
             ephemeral=True,
         )
         return
 
     await interaction.response.send_message(
-        f"✅ Server-wide admin role set to {admin_role.mention}. This role can manage bot features across all scripts. "
+        f"âœ… Server-wide admin role set to {admin_role.mention}. This role can manage bot features across all scripts. "
         "It does **not** bypass Free/Premium/Ultra quotas or redeem-code requirements.",
         ephemeral=True,
     )
 
 
-# 7. إعداد البانل
+# 7. ط¥ط¹ط¯ط§ط¯ ط§ظ„ط¨ط§ظ†ظ„
 @bot.tree.command(name="my-plan", description="Show your Crystal Hub plan and monthly usage")
 async def my_plan_command(interaction: discord.Interaction):
     await interaction.response.send_message(_quota_status(interaction.user.id), ephemeral=True)
@@ -2604,18 +2637,18 @@ async def avatar_bot_command(
     """
     if not interaction.guild or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
-            "❌ Only a server administrator can use this command.", ephemeral=True
+            "â‌Œ Only a server administrator can use this command.", ephemeral=True
         )
         return
     if not avatar_url and not nickname and bio is None:
         await interaction.response.send_message(
-            "❌ Provide an avatar URL, a nickname, or bio text.", ephemeral=True
+            "â‌Œ Provide an avatar URL, a nickname, or bio text.", ephemeral=True
         )
         return
 
     quota_ok, quota_error = _quota_check(interaction.user.id, "avatars")
     if not quota_ok:
-        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+        await interaction.response.send_message("â‌Œ " + quota_error, ephemeral=True)
         return
 
     # The avatar quota is charged only after at least one requested change succeeds.
@@ -2635,7 +2668,7 @@ async def avatar_bot_command(
                 ) as response:
                     if response.status != 200:
                         await interaction.response.send_message(
-                            "❌ Could not download the image URL. Use a direct public image URL.",
+                            "â‌Œ Could not download the image URL. Use a direct public image URL.",
                             ephemeral=True,
                         )
                         return
@@ -2643,7 +2676,7 @@ async def avatar_bot_command(
                     content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
 
             if len(image_bytes) > 8 * 1024 * 1024:
-                await interaction.response.send_message("❌ Image must be under 8 MB.", ephemeral=True)
+                await interaction.response.send_message("â‌Œ Image must be under 8 MB.", ephemeral=True)
                 return
 
             # Discord expects a data URI for the current guild member avatar.
@@ -2662,7 +2695,7 @@ async def avatar_bot_command(
             payload["avatar"] = f"data:{content_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
         except Exception:
             await interaction.response.send_message(
-                "❌ Could not download the image URL. Check that it is a direct public image URL.",
+                "â‌Œ Could not download the image URL. Check that it is a direct public image URL.",
                 ephemeral=True,
             )
             return
@@ -2670,7 +2703,7 @@ async def avatar_bot_command(
     if bio is not None:
         bio = bio.strip()
         if not bio:
-            await interaction.response.send_message("❌ Bio text cannot be empty.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Bio text cannot be empty.", ephemeral=True)
             return
 
         # Discord does not expose GET /guilds/{guild.id}/members/@me. An empty
@@ -2690,7 +2723,7 @@ async def avatar_bot_command(
         combined = f"{original_bio}\n{separator}\n{bio}" if original_bio else f"{separator}\n{bio}"
         if len(combined) > 190:
             await interaction.response.send_message(
-                f"❌ The final server bio is {len(combined)}/190 characters. "
+                f"â‌Œ The final server bio is {len(combined)}/190 characters. "
                 "Shorten the new bio so the original bio and separator can be preserved.",
                 ephemeral=True,
             )
@@ -2705,19 +2738,19 @@ async def avatar_bot_command(
     except discord.HTTPException as exc:
         if exc.status == 403:
             await interaction.response.send_message(
-                "❌ Discord rejected the server profile update. Make sure the bot can change its nickname/profile in this server.",
+                "â‌Œ Discord rejected the server profile update. Make sure the bot can change its nickname/profile in this server.",
                 ephemeral=True,
             )
         else:
             await interaction.response.send_message(
-                f"❌ Discord could not update the server profile (HTTP {exc.status}).",
+                f"â‌Œ Discord could not update the server profile (HTTP {exc.status}).",
                 ephemeral=True,
             )
         return
     except Exception as exc:
         print(f"avatar-bot server profile update failed: {exc}")
         await interaction.response.send_message(
-            "❌ Could not update the bot's server profile.", ephemeral=True
+            "â‌Œ Could not update the bot's server profile.", ephemeral=True
         )
         return
 
@@ -2730,7 +2763,7 @@ async def avatar_bot_command(
 
     _quota_increment(interaction.user.id, "avatars")
     await interaction.response.send_message(
-        "✅ Crystal Hub: " + ", ".join(changes) +
+        "âœ… Crystal Hub: " + ", ".join(changes) +
         f".\nThe avatar and bio changes apply to this server only.\n{_quota_status(interaction.user.id)}",
         ephemeral=True,
     )
@@ -2752,18 +2785,18 @@ async def panel_setup_command(
     description: Optional[str] = None
 ):
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ You do not have permission to use this command.", ephemeral=True)
         return
 
     # If no channel was selected, use the channel where /panel-setup was executed.
     target_channel = channel or interaction.channel
     if not isinstance(target_channel, discord.TextChannel):
-        await interaction.response.send_message("❌ I can only create the panel inside a text channel.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ I can only create the panel inside a text channel.", ephemeral=True)
         return
 
     s_info = scripts_data.get(script)
     if not s_info:
-        await interaction.response.send_message("❌ Selected script does not exist.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Selected script does not exist.", ephemeral=True)
         return
 
     instances = s_info.get("panel_instances")
@@ -2786,14 +2819,14 @@ async def panel_setup_command(
     if matching is None:
         quota_ok, quota_error = _quota_check(interaction.user.id, "panels")
         if not quota_ok:
-            await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
+            await interaction.response.send_message("â‌Œ " + quota_error, ephemeral=True)
             return
 
     ensure_file_id(script, s_info)
     panel_description = (str(description).strip()[:4000] if description is not None
                          else (matching.get("description") if matching else None)
                          or s_info.get("panel_description")
-                         or f"Best {script.lower()}\n\nCrystal Hub • Script Management")
+                         or f"Best {script.lower()}\n\nCrystal Hub â€¢ Script Management")
     embed = discord.Embed(title=name_panel, description=panel_description, color=0xd4af37)
     embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
     view = PanelControlView(script_name=script)
@@ -2834,7 +2867,7 @@ async def panel_setup_command(
     save_data()
 
     await interaction.response.send_message(
-        f"✅ Panel ready in {target_channel.mention}. This panel is saved and will be refreshed after the bot restarts/updates.\n\n{_quota_status(interaction.user.id)}",
+        f"âœ… Panel ready in {target_channel.mention}. This panel is saved and will be refreshed after the bot restarts/updates.\n\n{_quota_status(interaction.user.id)}",
         ephemeral=True
     )
 
@@ -2848,10 +2881,10 @@ async def panel_delete_command(
     channel: discord.TextChannel,
 ):
     if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Script not found.", ephemeral=True)
         return
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You do not have permission to delete this panel.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ You do not have permission to delete this panel.", ephemeral=True)
         return
     s_info = scripts_data[script]
     instances = s_info.get("panel_instances")
@@ -2870,7 +2903,7 @@ async def panel_delete_command(
         }
         instances.append(target)
     if target is None:
-        await interaction.response.send_message("❌ No panel you own was found in that channel.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ No panel you own was found in that channel.", ephemeral=True)
         return
     message_id = target.get("message_id")
     if message_id:
@@ -2890,16 +2923,16 @@ async def panel_delete_command(
         s_info["panel_description"] = latest.get("description", "")
         s_info["panel_created_by"] = latest.get("created_by")
     save_data()
-    await interaction.response.send_message(f"✅ Panel deleted from the saved inventory. Its quota slot is now free.\n\n{_quota_status(interaction.user.id)}", ephemeral=True)
+    await interaction.response.send_message(f"âœ… Panel deleted from the saved inventory. Its quota slot is now free.\n\n{_quota_status(interaction.user.id)}", ephemeral=True)
 
 
-# 8. تحديث السكربت
+# 8. طھط­ط¯ظٹط« ط§ظ„ط³ظƒط±ط¨طھ
 @bot.tree.command(name="update-script", description="Send a script update announcement")
 @app_commands.describe(script="Choose the script", revision="New version (e.g. 1.0.1 or 99.0.0)", details="Enter update details")
 @app_commands.autocomplete(script=script_autocomplete)
 async def update_script_command(interaction: discord.Interaction, script: str, revision: str, details: str):
     if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ You do not have permission to use this command.", ephemeral=True)
         return
 
     if script in scripts_data:
@@ -2908,23 +2941,23 @@ async def update_script_command(interaction: discord.Interaction, script: str, r
 
     ping_text = "@everyone @here"
     embed = discord.Embed(
-        title=f"🚀 New Update for {script}!",
-        description=f"___________________\n📌 **Version:** `{revision}`\n\n```\n{details}\n```\n___________________",
+        title=f"ًںڑ€ New Update for {script}!",
+        description=f"___________________\nًں“Œ **Version:** `{revision}`\n\n```\n{details}\n```\n___________________",
         color=0x00ff00
     )
     await interaction.response.send_message(content=ping_text, embed=embed)
 
 
-# 9. مكافآت الدعوة
+# 9. ظ…ظƒط§ظپط¢طھ ط§ظ„ط¯ط¹ظˆط©
 @bot.tree.command(name="invite-reward", description="Send the invite rewards panel")
 async def invite_reward_command(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ You do not have permission.", ephemeral=True)
         return
 
     embed = discord.Embed(
-        title="🎁 Invite Rewards System",
-        description="• **2 Invites** = 12 Hours Script ⏳\n• **4 Invites** = 2 Days Script 🚀\n___________________\nUse the buttons below to check invites and claim rewards.",
+        title="ًںژپ Invite Rewards System",
+        description="â€¢ **2 Invites** = 12 Hours Script âڈ³\nâ€¢ **4 Invites** = 2 Days Script ًںڑ€\n___________________\nUse the buttons below to check invites and claim rewards.",
         color=0x2b2d31
     )
     view = InviteRewardView()
@@ -2933,22 +2966,23 @@ async def invite_reward_command(interaction: discord.Interaction):
 
 
 # Configure the HWID reset cooldown in seconds.
-@bot.tree.command(name="reset-hwid-cooldown", description="Set the minimum wait between HWID reset requests")
+# Prefix-only admin command: -reset-hwid-cooldown seconds
+# @bot.tree.command(name="reset-hwid-cooldown", description="Set the minimum wait between HWID reset requests")
 @app_commands.describe(seconds="Cooldown duration in seconds (0 disables the cooldown)")
 async def reset_hwid_coolddown_command(interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 31536000]):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Only server administrators can change this setting.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Only server administrators can change this setting.", ephemeral=True)
         return
 
     security_state["reset_hwid_cooldown"] = int(seconds)
     save_security_state()
     await interaction.response.send_message(
-        f"✅ HWID reset cooldown set to **{format_duration(seconds)}** ({seconds} seconds).",
+        f"âœ… HWID reset cooldown set to **{format_duration(seconds)}** ({seconds} seconds).",
         ephemeral=True
     )
 
 
-# 10. البلاك ليست
+# 10. ط§ظ„ط¨ظ„ط§ظƒ ظ„ظٹط³طھ
 def is_bot_owner(user_id: int) -> bool:
     """Only the configured Discord account owner can use global admin actions."""
     owner_id = os.getenv("BOT_OWNER_ID", "").strip()
@@ -3198,7 +3232,7 @@ async def setting_command(
     file: Optional[discord.Attachment] = None,
 ):
     if not interaction.guild:
-        await interaction.response.send_message("❌ Use `/setting` inside a server.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Use `/setting` inside a server.", ephemeral=True)
         return
 
     # Normal backup/restore is available to the configured server admin role.
@@ -3206,13 +3240,13 @@ async def setting_command(
     if action.value == "get_file":
         if not _has_global_admin_access(interaction):
             await interaction.response.send_message(
-                "❌ You need the configured server admin role to use `/setting`.",
+                "â‌Œ You need the configured server admin role to use `/setting`.",
                 ephemeral=True,
             )
             return
         if backup_type.value == "admin" and not _has_admin_backup_access(interaction.user.id):
             await interaction.response.send_message(
-                "❌ Only an Admin user can create an Admin backup.",
+                "â‌Œ Only an Admin user can create an Admin backup.",
                 ephemeral=True,
             )
             return
@@ -3221,30 +3255,30 @@ async def setting_command(
             raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
             filename = f"crystal_hub_settings_{backup_type.value}.json"
             await interaction.response.send_message(
-                f"✅ {backup_type.name} settings backup created.",
+                f"âœ… {backup_type.name} settings backup created.",
                 file=discord.File(io.BytesIO(raw), filename=filename),
                 ephemeral=True,
             )
         except Exception as exc:
             print(f"/setting get file error: {type(exc).__name__}: {exc}")
-            await interaction.response.send_message("❌ Could not create the settings backup.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Could not create the settings backup.", ephemeral=True)
         return
 
     # Upload File
     if not _has_global_admin_access(interaction):
         await interaction.response.send_message(
-            "❌ You need the configured server admin role to use `/setting`.",
+            "â‌Œ You need the configured server admin role to use `/setting`.",
             ephemeral=True,
         )
         return
     if file is None:
-        await interaction.response.send_message("❌ Attach the JSON backup file.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Attach the JSON backup file.", ephemeral=True)
         return
     if file.size and file.size > 8 * 1024 * 1024:
-        await interaction.response.send_message("❌ The backup file is too large.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ The backup file is too large.", ephemeral=True)
         return
     if backup_type.value == "admin" and not _has_admin_backup_access(interaction.user.id):
-        await interaction.response.send_message("❌ Only an Admin user can restore an Admin backup.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Only an Admin user can restore an Admin backup.", ephemeral=True)
         return
 
     try:
@@ -3252,16 +3286,16 @@ async def setting_command(
         snapshot = json.loads(raw.decode("utf-8"))
         _restore_settings_backup(snapshot, backup_type.value, interaction.guild.id)
         await interaction.response.send_message(
-            f"✅ {backup_type.name} settings restored successfully."
+            f"âœ… {backup_type.name} settings restored successfully."
             + (" All Admin/Premium/Ultra permission data was restored too." if backup_type.value == "admin"
                else " Rank and Admin/Premium/Ultra permission data was not changed."),
             ephemeral=True,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        await interaction.response.send_message(f"❌ Could not restore this backup: {exc}", ephemeral=True)
+        await interaction.response.send_message(f"â‌Œ Could not restore this backup: {exc}", ephemeral=True)
     except Exception as exc:
         print(f"/setting upload error: {type(exc).__name__}: {exc}")
-        await interaction.response.send_message("❌ Could not restore the settings backup. Check the bot logs.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Could not restore the settings backup. Check the bot logs.", ephemeral=True)
 
 # ==================== Admin Redeem + -massage ==================== #
 
@@ -3283,7 +3317,7 @@ async def redeem_command(
     if create_plan is not None and not (code and str(code).strip()):
         if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users):
             await interaction.response.send_message(
-                "❌ This action requires internal authorization from the bot owner.",
+                "â‌Œ This action requires internal authorization from the bot owner.",
                 ephemeral=True
             )
             return
@@ -3291,7 +3325,7 @@ async def redeem_command(
         if plan == "Admin":
             # Admin unlock is the configured ADMIN_REDEEM_CODE (not a one-time plan code).
             await interaction.response.send_message(
-                f"✅ Admin unlock code (for `/redeem`):\n```text\n{ADMIN_REDEEM_CODE}\n```\n"
+                f"âœ… Admin unlock code (for `/redeem`):\n```text\n{ADMIN_REDEEM_CODE}\n```\n"
                 "Redeeming this code enables `-massage` for your account.",
                 ephemeral=True
             )
@@ -3300,23 +3334,23 @@ async def redeem_command(
         try:
             raw = _make_discord_plan_code(plan, days, None)
         except ValueError as exc:
-            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            await interaction.response.send_message(f"â‌Œ {exc}", ephemeral=True)
             return
         except OSError:
-            await interaction.response.send_message("❌ Could not save the code.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Could not save the code.", ephemeral=True)
             return
         duration = "lifetime" if days <= 0 else f"{days} days"
         try:
             await interaction.user.send(
-                f"✅ Crystal Hub **{plan}** code created ({duration}).\nYour private redeem code:\n```text\n{raw}\n```"
+                f"âœ… Crystal Hub **{plan}** code created ({duration}).\nYour private redeem code:\n```text\n{raw}\n```"
             )
             await interaction.response.send_message(
-                f"✅ **{plan}** code created ({duration}) and sent to your DMs.",
+                f"âœ… **{plan}** code created ({duration}) and sent to your DMs.",
                 ephemeral=True
             )
         except discord.Forbidden:
             await interaction.response.send_message(
-                f"✅ **{plan}** code created ({duration}). Open your DMs and try again, or copy it now:\n```text\n{raw}\n```",
+                f"âœ… **{plan}** code created ({duration}). Open your DMs and try again, or copy it now:\n```text\n{raw}\n```",
                 ephemeral=True
             )
         return
@@ -3324,7 +3358,7 @@ async def redeem_command(
     supplied = str(code or "").strip().upper()
     if not supplied:
         await interaction.response.send_message(
-            "❌ Provide a `code` to redeem, or choose `create_plan` (owner only) to generate one.",
+            "â‌Œ Provide a `code` to redeem, or choose `create_plan` (owner only) to generate one.",
             ephemeral=True
         )
         return
@@ -3333,27 +3367,27 @@ async def redeem_command(
     if supplied == ADMIN_REDEEM_CODE:
         user_id = str(interaction.user.id)
         if user_id in admin_redeemed_users:
-            await interaction.response.send_message("✅ Admin code already redeemed.", ephemeral=True)
+            await interaction.response.send_message("âœ… Admin code already redeemed.", ephemeral=True)
             return
         admin_redeemed_users.add(user_id)
         try:
             save_admin_redeems()
         except OSError:
             admin_redeemed_users.discard(user_id)
-            await interaction.response.send_message("❌ Could not save redemption. Try again later.", ephemeral=True)
+            await interaction.response.send_message("â‌Œ Could not save redemption. Try again later.", ephemeral=True)
             return
-        await interaction.response.send_message("✅ Internal authorization activated.", ephemeral=True)
+        await interaction.response.send_message("âœ… Internal authorization activated.", ephemeral=True)
         return
 
     code_hash = _hash_redeem_code(supplied)
     rec = discord_plan_codes.get(code_hash)
     if not rec or rec.get("redeemed_by"):
-        await interaction.response.send_message("❌ Invalid or already-used Crystal Hub code.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Invalid or already-used Crystal Hub code.", ephemeral=True)
         return
 
     plan = str(rec.get("plan", "Premium"))
     if plan not in ("Premium", "Ultra"):
-        await interaction.response.send_message("❌ This code does not grant a customer subscription.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ This code does not grant a customer subscription.", ephemeral=True)
         return
     days = int(rec.get("duration_days", 30))
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -3369,11 +3403,11 @@ async def redeem_command(
         _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
     except OSError:
         discord_plan_codes[code_hash] = old_rec
-        await interaction.response.send_message("❌ Could not save redemption. Try again.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Could not save redemption. Try again.", ephemeral=True)
         return
 
     await interaction.response.send_message(
-        f"✅ Crystal Hub **{plan}** activated — {'Lifetime' if days <= 0 else str(days) + ' days'}.\n"
+        f"âœ… Crystal Hub **{plan}** activated â€” {'Lifetime' if days <= 0 else str(days) + ' days'}.\n"
         f"{_quota_status(interaction.user.id)}",
         ephemeral=True
     )
@@ -3494,7 +3528,7 @@ async def import_all_user_files(ctx: commands.Context):
     """Admin-only full import: attach a Crystal Hub Admin backup after the prompt."""
     user_id = int(ctx.author.id)
     if not (is_bot_owner(user_id) or str(user_id) in admin_redeemed_users or _discord_plan(user_id) == "Admin"):
-        await ctx.reply("❌ This command is for the internal Admin rank only.", mention_author=False)
+        await ctx.reply("â‌Œ This command is for the internal Admin rank only.", mention_author=False)
         return
 
     def valid_upload(message):
@@ -3507,7 +3541,7 @@ async def import_all_user_files(ctx: commands.Context):
     attachment = ctx.message.attachments[0] if ctx.message.attachments else None
     if attachment is None:
         await ctx.reply(
-            "📁 **Send the full Crystal Hub backup file now** (JSON). I'll wait up to 2 minutes.\n"
+            "ًں“پ **Send the full Crystal Hub backup file now** (JSON). I'll wait up to 2 minutes.\n"
             "Get the file using `-g files`. Import replaces the saved bot data with the backup, "
             "including users' plans, usage, scripts, keys, whitelist, and settings.",
             mention_author=False,
@@ -3516,7 +3550,7 @@ async def import_all_user_files(ctx: commands.Context):
             upload_message = await bot.wait_for("message", check=valid_upload, timeout=120)
             attachment = upload_message.attachments[0]
         except asyncio.TimeoutError:
-            await ctx.reply("⌛ Import cancelled: no file was received within 2 minutes.", mention_author=False)
+            await ctx.reply("âŒ› Import cancelled: no file was received within 2 minutes.", mention_author=False)
             return
 
     try:
@@ -3531,15 +3565,15 @@ async def import_all_user_files(ctx: commands.Context):
         users_count = len(KNOWN_USERS)
         scripts_count = len(scripts_data)
         await ctx.reply(
-            f"✅ Full backup imported successfully. Restored **{users_count}** known users and **{scripts_count}** scripts, "
+            f"âœ… Full backup imported successfully. Restored **{users_count}** known users and **{scripts_count}** scripts, "
             "including saved plan entitlements, monthly usage, keys, whitelist, panels, and settings.",
             mention_author=False,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
-        await ctx.reply(f"❌ Could not import this backup: {exc}", mention_author=False)
+        await ctx.reply(f"â‌Œ Could not import this backup: {exc}", mention_author=False)
     except Exception as exc:
         print(f"Admin full import failed: {type(exc).__name__}: {exc}")
-        await ctx.reply("❌ Import failed. The current data may be unchanged; check the bot logs.", mention_author=False)
+        await ctx.reply("â‌Œ Import failed. The current data may be unchanged; check the bot logs.", mention_author=False)
 
 
 @bot.command(name="g")
@@ -3547,7 +3581,7 @@ async def get_admin_files_backup(ctx: commands.Context, item: str = ""):
     """Admin-only full export invoked as `-g files`."""
     user_id = int(ctx.author.id)
     if not (is_bot_owner(user_id) or str(user_id) in admin_redeemed_users or _discord_plan(user_id) == "Admin"):
-        await ctx.reply("❌ This command is for the internal Admin rank only.", mention_author=False)
+        await ctx.reply("â‌Œ This command is for the internal Admin rank only.", mention_author=False)
         return
     if item.strip().lower() != "files":
         await ctx.reply("Use `-g files` to export the full user and bot data backup.", mention_author=False)
@@ -3561,7 +3595,7 @@ async def get_admin_files_backup(ctx: commands.Context, item: str = ""):
         key_count = sum(len(info.get("valid_keys", set())) for info in scripts_data.values())
         whitelist_count = sum(len(info.get("whitelisted_users", set())) for info in scripts_data.values())
         await ctx.reply(
-            f"📦 Full Admin backup: **{users_count}** known/entitled users, **{scripts_count}** scripts, "
+            f"ًں“¦ Full Admin backup: **{users_count}** known/entitled users, **{scripts_count}** scripts, "
             f"**{key_count}** stored keys, and **{whitelist_count}** script whitelist entries. "
             "Includes saved plans, monthly usage, source/config, panels, keys, whitelist/access records, redeem records, "
             "and settings. It includes sensitive data; keep it private.",
@@ -3570,7 +3604,7 @@ async def get_admin_files_backup(ctx: commands.Context, item: str = ""):
         )
     except Exception as exc:
         print(f"Admin full export failed: {type(exc).__name__}: {exc}")
-        await ctx.reply("❌ Could not create the full backup. Check the bot logs.", mention_author=False)
+        await ctx.reply("â‌Œ Could not create the full backup. Check the bot logs.", mention_author=False)
 
 
 @bot.command(name="Ai")
@@ -3584,7 +3618,7 @@ async def ai_backup_or_restore(ctx: commands.Context, action: str = ""):
         payload = json.dumps({"format": "crystal_hub_ai_knowledge_v1", "items": AI_KNOWLEDGE},
                              ensure_ascii=False, indent=2).encode("utf-8")
         await ctx.reply(
-            content=f"AI questions and answers backup — **{len(AI_KNOWLEDGE)}** entries. Save this file before updating the bot.",
+            content=f"AI questions and answers backup â€” **{len(AI_KNOWLEDGE)}** entries. Save this file before updating the bot.",
             file=discord.File(io.BytesIO(payload), filename="crystal_hub_ai_knowledge.json"),
             mention_author=False,
         )
@@ -3747,7 +3781,7 @@ def _normalize_qa_text(text: str) -> str:
     text = (text or "").lower().strip()
     # Normalize common Arabic letter variants and remove diacritics/punctuation.
     text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
-    text = text.translate(str.maketrans({"أ":"ا", "إ":"ا", "آ":"ا", "ى":"ي", "ة":"ه", "ؤ":"و", "ئ":"ي"}))
+    text = text.translate(str.maketrans({"ط£":"ط§", "ط¥":"ط§", "ط¢":"ط§", "ظ‰":"ظٹ", "ط©":"ظ‡", "ط¤":"ظˆ", "ط¦":"ظٹ"}))
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -3809,15 +3843,15 @@ def _crystal_purchase_intent(content: str) -> bool:
     text = re.sub(r"\s+", " ", text).strip()
     terms = (
         "buy", "purchase", "where can i buy", "where to buy", "how can i buy", "how to buy", "get premium", "buy premium", "buy a script", "buy script",
-        "اشتري", "اشتريه", "شراء", "اشتري من وين", "من وين اشتري", "كيف اشتري", "كيف أشتري", "وين اشتري", "وين أشتري", "ابغى اشتري", "ابي اشتري", "أبي أشتري", "شراء سكربت"
+        "ط§ط´طھط±ظٹ", "ط§ط´طھط±ظٹظ‡", "ط´ط±ط§ط،", "ط§ط´طھط±ظٹ ظ…ظ† ظˆظٹظ†", "ظ…ظ† ظˆظٹظ† ط§ط´طھط±ظٹ", "ظƒظٹظپ ط§ط´طھط±ظٹ", "ظƒظٹظپ ط£ط´طھط±ظٹ", "ظˆظٹظ† ط§ط´طھط±ظٹ", "ظˆظٹظ† ط£ط´طھط±ظٹ", "ط§ط¨ط؛ظ‰ ط§ط´طھط±ظٹ", "ط§ط¨ظٹ ط§ط´طھط±ظٹ", "ط£ط¨ظٹ ط£ط´طھط±ظٹ", "ط´ط±ط§ط، ط³ظƒط±ط¨طھ"
     )
     return any(term in text for term in terms)
 
 
 def _crystal_purchase_reply(is_arabic: bool) -> str:
     if is_arabic:
-        return ("تقدر تشتري من سيرفر Crystal Hub: ادخل السيرفر، وروح إلى قناة **#buy** وافتح تكت، "
-                "وفريق الإدارة بيساعدك ويأكد لك السعر والتوفر.\n" + CRYSTAL_DISCORD_INVITE)
+        return ("طھظ‚ط¯ط± طھط´طھط±ظٹ ظ…ظ† ط³ظٹط±ظپط± Crystal Hub: ط§ط¯ط®ظ„ ط§ظ„ط³ظٹط±ظپط±طŒ ظˆط±ظˆط­ ط¥ظ„ظ‰ ظ‚ظ†ط§ط© **#buy** ظˆط§ظپطھط­ طھظƒطھطŒ "
+                "ظˆظپط±ظٹظ‚ ط§ظ„ط¥ط¯ط§ط±ط© ط¨ظٹط³ط§ط¹ط¯ظƒ ظˆظٹط£ظƒط¯ ظ„ظƒ ط§ظ„ط³ط¹ط± ظˆط§ظ„طھظˆظپط±.\n" + CRYSTAL_DISCORD_INVITE)
     return ("You can purchase through the Crystal Hub server: join, go to the **#buy** channel, and open a ticket. "
             "Staff will confirm the current price and availability.\n" + CRYSTAL_DISCORD_INVITE)
 
@@ -3826,12 +3860,12 @@ def _crystal_is_question(content: str) -> bool:
     text = (content or "").strip()
     if not text or text.startswith(("/", "-", "!")):
         return False
-    if "?" in text or "؟" in text:
+    if "?" in text or "طں" in text:
         return True
     lowered = text.lower()
     question_starters = (
         "what ", "how ", "where ", "when ", "why ", "can i ", "can you ", "does ", "do i ", "is ", "are ", "which ", "who ",
-        "وش ", "ايش ", "إيش ", "كيف ", "وين ", "من وين", "هل ", "ليه ", "ليش ", "متى ", "كم ", "اقدر ", "أقدر ", "عندكم ", "فيه "
+        "ظˆط´ ", "ط§ظٹط´ ", "ط¥ظٹط´ ", "ظƒظٹظپ ", "ظˆظٹظ† ", "ظ…ظ† ظˆظٹظ†", "ظ‡ظ„ ", "ظ„ظٹظ‡ ", "ظ„ظٹط´ ", "ظ…طھظ‰ ", "ظƒظ… ", "ط§ظ‚ط¯ط± ", "ط£ظ‚ط¯ط± ", "ط¹ظ†ط¯ظƒظ… ", "ظپظٹظ‡ "
     )
     return any(lowered.startswith(x) for x in question_starters)
 
@@ -3899,10 +3933,10 @@ def _crystal_faq_kind(content: str):
     free_terms = (
         "free", "freebie", "pricing", "price", "prices", "cost", "costs",
         "subscription", "subscriptions", "plan", "plans", "paid", "premium",
-        "مجاني", "مجانية", "مجانا", "ببلاش", "فلوس", "السعر", "اسعار",
-        "أسعار", "بكم", "كم السعر", "اشتراك", "مدفوع", "مدفوعة", "بريميوم"
+        "ظ…ط¬ط§ظ†ظٹ", "ظ…ط¬ط§ظ†ظٹط©", "ظ…ط¬ط§ظ†ط§", "ط¨ط¨ظ„ط§ط´", "ظپظ„ظˆط³", "ط§ظ„ط³ط¹ط±", "ط§ط³ط¹ط§ط±",
+        "ط£ط³ط¹ط§ط±", "ط¨ظƒظ…", "ظƒظ… ط§ظ„ط³ط¹ط±", "ط§ط´طھط±ط§ظƒ", "ظ…ط¯ظپظˆط¹", "ظ…ط¯ظپظˆط¹ط©", "ط¨ط±ظٹظ…ظٹظˆظ…"
     )
-    crystal_terms = ("crystal", "hub", "bot", "كريستال", "كريستل", "كريستال هب", "البوت")
+    crystal_terms = ("crystal", "hub", "bot", "ظƒط±ظٹط³طھط§ظ„", "ظƒط±ظٹط³طھظ„", "ظƒط±ظٹط³طھط§ظ„ ظ‡ط¨", "ط§ظ„ط¨ظˆطھ")
     free_question = (
         ("free" in words or any(x in text for x in free_terms))
         and (any(x in text for x in crystal_terms) or len(words) >= 2)
@@ -3913,10 +3947,10 @@ def _crystal_faq_kind(content: str):
     script_terms = (
         "script", "scripts", "panel", "panels", "feature", "features",
         "available", "list", "what does", "what do", "which", "show me",
-        "سكربت", "سكربتات", "السكربت", "السكربتات", "بانل", "بانلات",
-        "لوحة", "لوحات", "مميزات", "المميزات", "ميزات", "وش يسوي",
-        "وش تسوي", "ايش يسوي", "ايش تسوي", "وش عندكم", "المتوفر",
-        "الموجود", "وظيفة", "وظيفته", "وظيفتها", "شرح"
+        "ط³ظƒط±ط¨طھ", "ط³ظƒط±ط¨طھط§طھ", "ط§ظ„ط³ظƒط±ط¨طھ", "ط§ظ„ط³ظƒط±ط¨طھط§طھ", "ط¨ط§ظ†ظ„", "ط¨ط§ظ†ظ„ط§طھ",
+        "ظ„ظˆط­ط©", "ظ„ظˆط­ط§طھ", "ظ…ظ…ظٹط²ط§طھ", "ط§ظ„ظ…ظ…ظٹط²ط§طھ", "ظ…ظٹط²ط§طھ", "ظˆط´ ظٹط³ظˆظٹ",
+        "ظˆط´ طھط³ظˆظٹ", "ط§ظٹط´ ظٹط³ظˆظٹ", "ط§ظٹط´ طھط³ظˆظٹ", "ظˆط´ ط¹ظ†ط¯ظƒظ…", "ط§ظ„ظ…طھظˆظپط±",
+        "ط§ظ„ظ…ظˆط¬ظˆط¯", "ظˆط¸ظٹظپط©", "ظˆط¸ظٹظپطھظ‡", "ظˆط¸ظٹظپطھظ‡ط§", "ط´ط±ط­"
     )
     if any(term in text for term in script_terms):
         # Avoid interpreting a simple question about free pricing as a script list.
@@ -3926,9 +3960,9 @@ def _crystal_faq_kind(content: str):
     start_terms = (
         "how to start", "how do i use", "how to use", "getting started",
         "how can i use", "setup", "set up", "start using", "help me start",
-        "كيف استخدم", "كيف أستخدم", "كيف استعمل", "كيف ابدأ", "كيف أبدأ",
-        "طريقة الاستخدام", "كيف اشغل", "كيف أشغل", "كيف افعل", "كيف أفعل",
-        "شرح الاستخدام", "ابدأ من وين", "من وين ابدأ"
+        "ظƒظٹظپ ط§ط³طھط®ط¯ظ…", "ظƒظٹظپ ط£ط³طھط®ط¯ظ…", "ظƒظٹظپ ط§ط³طھط¹ظ…ظ„", "ظƒظٹظپ ط§ط¨ط¯ط£", "ظƒظٹظپ ط£ط¨ط¯ط£",
+        "ط·ط±ظٹظ‚ط© ط§ظ„ط§ط³طھط®ط¯ط§ظ…", "ظƒظٹظپ ط§ط´ط؛ظ„", "ظƒظٹظپ ط£ط´ط؛ظ„", "ظƒظٹظپ ط§ظپط¹ظ„", "ظƒظٹظپ ط£ظپط¹ظ„",
+        "ط´ط±ط­ ط§ظ„ط§ط³طھط®ط¯ط§ظ…", "ط§ط¨ط¯ط£ ظ…ظ† ظˆظٹظ†", "ظ…ظ† ظˆظٹظ† ط§ط¨ط¯ط£"
     )
     if any(term in text for term in start_terms):
         return "start"
@@ -3937,9 +3971,9 @@ def _crystal_faq_kind(content: str):
     if any(term in text for term in ("do i have to pay", "have to pay", "need to pay",
                                      "is there a free", "got a free", "any free",
                                      "is there premium", "is premium", "what plans",
-                                     "في مجاني", "فيه مجاني", "لازم ادفع", "لازم أدفع",
-                                     "هل ادفع", "هل أدفع", "عندكم مجاني", "في اشتراك",
-                                     "فيه اشتراك", "وش الباقات", "ايش الباقات")):
+                                     "ظپظٹ ظ…ط¬ط§ظ†ظٹ", "ظپظٹظ‡ ظ…ط¬ط§ظ†ظٹ", "ظ„ط§ط²ظ… ط§ط¯ظپط¹", "ظ„ط§ط²ظ… ط£ط¯ظپط¹",
+                                     "ظ‡ظ„ ط§ط¯ظپط¹", "ظ‡ظ„ ط£ط¯ظپط¹", "ط¹ظ†ط¯ظƒظ… ظ…ط¬ط§ظ†ظٹ", "ظپظٹ ط§ط´طھط±ط§ظƒ",
+                                     "ظپظٹظ‡ ط§ط´طھط±ط§ظƒ", "ظˆط´ ط§ظ„ط¨ط§ظ‚ط§طھ", "ط§ظٹط´ ط§ظ„ط¨ط§ظ‚ط§طھ")):
         return "plans"
 
     return None
@@ -3952,45 +3986,45 @@ def _crystal_faq_embed(kind: str):
         # This state is set by the message handler immediately before building the embed.
         is_arabic = bool(getattr(_crystal_faq_embed, "_reply_arabic", False))
         if is_arabic:
-            title = "Crystal Hub — الخطط والحدود"
+            title = "Crystal Hub â€” ط§ظ„ط®ط·ط· ظˆط§ظ„ط­ط¯ظˆط¯"
             description = (
-                "إيه، فيه خطة **مجانية** في Crystal Hub، وتقدر ترقي إذا احتجت حدودًا أعلى.\n\n"
-                "**الخطة المجانية**\n"
-                "• حتى **5 سكربتات نشطة**\n"
-                "• حتى **5 لوحات نشطة**\n"
-                "• **20 عملية مصدر شهريًا**\n"
-                "• حتى **100 مفتاح/مكان Whitelist نشط**\n"
-                "• تغييرات الأفاتار غير مشمولة ضمن حد الخطة المجانية\n\n"
-                "**خطة Premium — 1 دولار للأبد**\n"
-                "• حتى **10 سكربتات نشطة**\n"
-                "• حتى **10 لوحات نشطة**\n"
-                "• **100 عملية مصدر شهريًا**\n"
-                "• حتى **500 مفتاح/مكان Whitelist نشط**\n"
-                "• **5 تغييرات أفاتار شهريًا**\n\n"
-                "**خطة Ultra — 2 دولار للأبد**\n"
-                "• حدود الاستخدام غير محدودة حسب إعدادات البوت الحالية.\n\n"
-                "للشراء، ادخل سيرفر Crystal Hub وروح لقناة **#buy** وافتح تكت: https://discord.gg/DsQ2sQkBW3"
+                "ط¥ظٹظ‡طŒ ظپظٹظ‡ ط®ط·ط© **ظ…ط¬ط§ظ†ظٹط©** ظپظٹ Crystal HubطŒ ظˆطھظ‚ط¯ط± طھط±ظ‚ظٹ ط¥ط°ط§ ط§ط­طھط¬طھ ط­ط¯ظˆط¯ظ‹ط§ ط£ط¹ظ„ظ‰.\n\n"
+                "**ط§ظ„ط®ط·ط© ط§ظ„ظ…ط¬ط§ظ†ظٹط©**\n"
+                "â€¢ ط­طھظ‰ **5 ط³ظƒط±ط¨طھط§طھ ظ†ط´ط·ط©**\n"
+                "â€¢ ط­طھظ‰ **5 ظ„ظˆط­ط§طھ ظ†ط´ط·ط©**\n"
+                "â€¢ **20 ط¹ظ…ظ„ظٹط© ظ…طµط¯ط± ط´ظ‡ط±ظٹظ‹ط§**\n"
+                "â€¢ ط­طھظ‰ **100 ظ…ظپطھط§ط­/ظ…ظƒط§ظ† Whitelist ظ†ط´ط·**\n"
+                "â€¢ طھط؛ظٹظٹط±ط§طھ ط§ظ„ط£ظپط§طھط§ط± ط؛ظٹط± ظ…ط´ظ…ظˆظ„ط© ط¶ظ…ظ† ط­ط¯ ط§ظ„ط®ط·ط© ط§ظ„ظ…ط¬ط§ظ†ظٹط©\n\n"
+                "**ط®ط·ط© Premium â€” 1 ط¯ظˆظ„ط§ط± ظ„ظ„ط£ط¨ط¯**\n"
+                "â€¢ ط­طھظ‰ **10 ط³ظƒط±ط¨طھط§طھ ظ†ط´ط·ط©**\n"
+                "â€¢ ط­طھظ‰ **10 ظ„ظˆط­ط§طھ ظ†ط´ط·ط©**\n"
+                "â€¢ **100 ط¹ظ…ظ„ظٹط© ظ…طµط¯ط± ط´ظ‡ط±ظٹظ‹ط§**\n"
+                "â€¢ ط­طھظ‰ **500 ظ…ظپطھط§ط­/ظ…ظƒط§ظ† Whitelist ظ†ط´ط·**\n"
+                "â€¢ **5 طھط؛ظٹظٹط±ط§طھ ط£ظپط§طھط§ط± ط´ظ‡ط±ظٹظ‹ط§**\n\n"
+                "**ط®ط·ط© Ultra â€” 2 ط¯ظˆظ„ط§ط± ظ„ظ„ط£ط¨ط¯**\n"
+                "â€¢ ط­ط¯ظˆط¯ ط§ظ„ط§ط³طھط®ط¯ط§ظ… ط؛ظٹط± ظ…ط­ط¯ظˆط¯ط© ط­ط³ط¨ ط¥ط¹ط¯ط§ط¯ط§طھ ط§ظ„ط¨ظˆطھ ط§ظ„ط­ط§ظ„ظٹط©.\n\n"
+                "ظ„ظ„ط´ط±ط§ط،طŒ ط§ط¯ط®ظ„ ط³ظٹط±ظپط± Crystal Hub ظˆط±ظˆط­ ظ„ظ‚ظ†ط§ط© **#buy** ظˆط§ظپطھط­ طھظƒطھ: https://discord.gg/DsQ2sQkBW3"
             )
-            footer = "الحدود المعروضة مأخوذة من إعدادات البوت الحالية."
+            footer = "ط§ظ„ط­ط¯ظˆط¯ ط§ظ„ظ…ط¹ط±ظˆط¶ط© ظ…ط£ط®ظˆط°ط© ظ…ظ† ط¥ط¹ط¯ط§ط¯ط§طھ ط§ظ„ط¨ظˆطھ ط§ظ„ط­ط§ظ„ظٹط©."
         else:
-            title = "Crystal Hub — Plans & Limits"
+            title = "Crystal Hub â€” Plans & Limits"
             description = (
                 "Yes! **Crystal Hub has a Free plan**. You can start for free, "
                 "and upgrade if you need higher limits.\n\n"
                 "**Free plan**\n"
-                "• Up to **5 active scripts**\n"
-                "• Up to **5 active panels**\n"
-                "• **20 source operations per month**\n"
-                "• Up to **100 active keys/whitelist slots**\n"
-                "• Avatar changes are not included in the Free quota\n\n"
-                "**Premium plan — $1 USD, lifetime**\n"
-                "• Up to **10 active scripts**\n"
-                "• Up to **10 active panels**\n"
-                "• **100 source operations per month**\n"
-                "• Up to **500 active keys/whitelist slots**\n"
-                "• **5 avatar changes per month**\n\n"
-                "**Ultra plan — $2 USD, lifetime**\n"
-                "• Unlimited usage according to the current bot quota logic.\n\n"
+                "â€¢ Up to **5 active scripts**\n"
+                "â€¢ Up to **5 active panels**\n"
+                "â€¢ **20 source operations per month**\n"
+                "â€¢ Up to **100 active keys/whitelist slots**\n"
+                "â€¢ Avatar changes are not included in the Free quota\n\n"
+                "**Premium plan â€” $1 USD, lifetime**\n"
+                "â€¢ Up to **10 active scripts**\n"
+                "â€¢ Up to **10 active panels**\n"
+                "â€¢ **100 source operations per month**\n"
+                "â€¢ Up to **500 active keys/whitelist slots**\n"
+                "â€¢ **5 avatar changes per month**\n\n"
+                "**Ultra plan â€” $2 USD, lifetime**\n"
+                "â€¢ Unlimited usage according to the current bot quota logic.\n\n"
                 "To purchase, join the Crystal Hub server, go to **#buy**, and open a ticket: https://discord.gg/DsQ2sQkBW3"
             )
             footer = "Limits shown are the bot's current configured quotas."
@@ -4000,7 +4034,7 @@ def _crystal_faq_embed(kind: str):
 
     if kind == "scripts":
         embed = discord.Embed(
-            title="Crystal Hub — Available Scripts",
+            title="Crystal Hub â€” Available Scripts",
             color=0x5865F2,
             description=(
                 "Here are the scripts currently configured in Crystal Hub. "
@@ -4035,7 +4069,7 @@ def _crystal_faq_embed(kind: str):
 
     if kind == "start":
         return discord.Embed(
-            title="Crystal Hub — Getting Started",
+            title="Crystal Hub â€” Getting Started",
             color=0x5865F2,
             description=(
                 "1. Check the server's script/panel information and choose the feature you need.\n"
@@ -4082,7 +4116,7 @@ class AIQuestionReviewView(BlacklistAwareView):
         super().__init__(timeout=86400)
         self.original_question = original_question
 
-    @discord.ui.button(label="Add answer / حفظ الإجابة", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Add answer / ط­ظپط¸ ط§ظ„ط¥ط¬ط§ط¨ط©", style=discord.ButtonStyle.primary)
     async def add_answer(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message("Only staff with Manage Server permission can add answers.", ephemeral=True)
@@ -4123,7 +4157,7 @@ async def ai_add_qa_command_error(interaction: discord.Interaction, error):
 @bot.tree.command(name="ai-qa-list", description="Show how many saved AI questions and answers exist")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def ai_qa_list_command(interaction: discord.Interaction):
-    preview = "\\n".join(f"• {x['question'][:100]}" for x in AI_KNOWLEDGE[:15]) or "No saved questions yet."
+    preview = "\\n".join(f"â€¢ {x['question'][:100]}" for x in AI_KNOWLEDGE[:15]) or "No saved questions yet."
     await interaction.response.send_message(f"Saved Q&A entries: **{len(AI_KNOWLEDGE)}**\\n{preview}", ephemeral=True)
 
 
@@ -4216,39 +4250,39 @@ class AdminGuideLanguageView(BlacklistAwareView):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="English", emoji="🇬🇧", style=discord.ButtonStyle.secondary, custom_id="crystal_admin_guide_english")
+    @discord.ui.button(label="English", emoji="ًں‡¬ًں‡§", style=discord.ButtonStyle.secondary, custom_id="crystal_admin_guide_english")
     async def english_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = discord.Embed(
             title="Crystal Hub | Admin Guide",
             description=(
-                "**CHANNEL MESSAGE**\n"
-                "`-massage #channel Your message`\n"
+                "**CHANNEL MESSAGE**\n`-massage #channel Your message`\n"
                 "Send a message to a selected text channel.\n\n"
-                "**GLOBAL USER BLOCK**\n"
-                "`-blacklist @user`\n"
-                "Block a user from using Crystal Hub globally.\n\n"
-                "**PRIVATE ANNOUNCEMENT**\n"
-                "`-ann Your message`\n"
-                "DM an announcement to known users of the bot."
+                "**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` آ· `-unblacklist USER_ID`\n\n"
+                "**PRIVATE ANNOUNCEMENT**\n`-ann Your message`\n"
+                "DM an announcement to known users.\n\n"
+                "**BACKUPS**\n`-g files` exports the full Admin backup; `-files` imports it.\n"
+                "`-script file` backs up scripts/source/panels; `-Ai file` backs up AI Q&A.\n\n"
+                "**BOT MANAGEMENT**\n`-set-admin-role @role` آ· `-reset-hwid-cooldown seconds`\n"
+                "`-list-servers` آ· `-send-server-message SERVER_ID CHANNEL_ID message` آ· `-list-redeem-codes`\n"
+                "Standard subscription redeem codes remain single-use."
             ),
             color=discord.Color.gold(),
         )
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="العربية", emoji="🇸🇦", style=discord.ButtonStyle.secondary, custom_id="crystal_admin_guide_arabic")
+    @discord.ui.button(label="ط§ظ„ط¹ط±ط¨ظٹط©", emoji="ًں‡¸ًں‡¦", style=discord.ButtonStyle.secondary, custom_id="crystal_admin_guide_arabic")
     async def arabic_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = discord.Embed(
-            title="Crystal Hub | دليل الإدارة",
+            title="Crystal Hub | ط¯ظ„ظٹظ„ ط§ظ„ط¥ط¯ط§ط±ط©",
             description=(
-                "**إرسال رسالة لقناة**\n"
-                "`-massage #channel Your message`\n"
-                "يرسل رسالة إلى القناة المحددة.\n\n"
-                "**حظر مستخدم من البوت**\n"
-                "`-blacklist @user`\n"
-                "يمنع المستخدم من استخدام Crystal Hub بشكل عام.\n\n"
-                "**إعلان خاص للمستخدمين**\n"
-                "`-ann رسالتك هنا`\n"
-                "يرسل رسالتك بالخاص للمستخدمين المعروفين للبوت."
+                "**ط¥ط±ط³ط§ظ„ ط±ط³ط§ظ„ط© ظ„ظ‚ظ†ط§ط©**\n`-massage #channel ط±ط³ط§ظ„طھظƒ ظ‡ظ†ط§`\n\n"
+                "**ط­ط¸ط± / ظپظƒ ط­ط¸ط± ظ…ط³طھط®ط¯ظ…**\n`-blacklist @user` آ· `-unblacklist USER_ID`\n\n"
+                "**ط¥ط¹ظ„ط§ظ† ط®ط§طµ**\n`-ann ط±ط³ط§ظ„طھظƒ ظ‡ظ†ط§`\n\n"
+                "**ط§ظ„ظ†ط³ط® ط§ظ„ط§ط­طھظٹط§ط·ظٹ**\n`-g files` ظ„طھطµط¯ظٹط± ط§ظ„ظ†ط³ط®ط© ط§ظ„ظƒط§ظ…ظ„ط©طŒ ظˆ`-files` ظ„ط§ط³طھظٹط±ط§ط¯ظ‡ط§.\n"
+                "`-script file` ظ„ظ†ط³ط®ط© ط§ظ„ط³ظƒط±ط¨طھط§طھ ظˆط§ظ„ط³ظˆط±ط³ ظˆط§ظ„ط¨ط§ظ†ظ„ط§طھطŒ ظˆ`-Ai file` ظ„ط£ط³ط¦ظ„ط© ط§ظ„ط°ظƒط§ط، ط§ظ„ط§طµط·ظ†ط§ط¹ظٹ.\n\n"
+                "**ط¥ط¯ط§ط±ط© ط§ظ„ط¨ظˆطھ**\n`-set-admin-role @role` آ· `-reset-hwid-cooldown seconds`\n"
+                "`-list-servers` آ· `-send-server-message SERVER_ID CHANNEL_ID ط§ظ„ط±ط³ط§ظ„ط©` آ· `-list-redeem-codes`\n"
+                "ط£ظƒظˆط§ط¯ ط§ظ„ط§ط´طھط±ط§ظƒ ط§ظ„ط¹ط§ط¯ظٹط© طھط¸ظ„ ط§ط³طھط®ط¯ط§ظ…ظ‹ط§ ظˆط§ط­ط¯ظ‹ط§."
             ),
             color=discord.Color.gold(),
         )
@@ -4259,22 +4293,20 @@ class AdminGuideLanguageView(BlacklistAwareView):
 async def admin_command(interaction: discord.Interaction):
     if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users or _discord_plan(interaction.user.id) == "Admin"):
         await interaction.response.send_message(
-            "❌ This command requires internal bot authorization.",
+            "â‌Œ This command requires internal bot authorization.",
             ephemeral=True,
         )
         return
     embed = discord.Embed(
         title="Crystal Hub | Admin Guide",
         description=(
-            "**CHANNEL MESSAGE**\n"
-            "`-massage #channel Your message`\n"
-            "Send a message to a selected text channel.\n\n"
-            "**GLOBAL USER BLOCK**\n"
-            "`-blacklist @user`\n"
-            "Block a user from using Crystal Hub globally.\n\n"
-            "**PRIVATE ANNOUNCEMENT**\n"
-            "`-ann Your message`\n"
-            "DM an announcement to known users of the bot."
+            "**CHANNEL MESSAGE**\n`-massage #channel Your message`\n"
+            "**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` آ· `-unblacklist USER_ID`\n"
+            "**PRIVATE ANNOUNCEMENT**\n`-ann Your message`\n"
+            "**BACKUPS**\n`-g files` exports the full Admin backup; `-files` imports it. `-script file` backs up scripts; `-Ai file` backs up AI Q&A.\n"
+            "**BOT MANAGEMENT**\n`-set-admin-role @role` آ· `-reset-hwid-cooldown seconds`\n"
+            "`-list-servers` آ· `-send-server-message SERVER_ID CHANNEL_ID message` آ· `-list-redeem-codes`\n"
+            "Standard subscription redeem codes remain single-use."
         ),
         color=discord.Color.gold(),
     )
@@ -4284,54 +4316,86 @@ async def admin_command(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="blacklist", description="Globally block a user from bot features")
+@bot.command(name="set-admin-role")
+async def set_admin_role_prefix(ctx: commands.Context, admin_role: discord.Role):
+    if not ctx.guild or not isinstance(ctx.author, discord.Member) or not ctx.author.guild_permissions.administrator:
+        await ctx.reply("â‌Œ Only a Discord server Administrator can configure the global admin role.", mention_author=False)
+        return
+    GLOBAL_ADMIN_ROLE_IDS[str(ctx.guild.id)] = admin_role.id
+    if not _save_global_admin_roles():
+        GLOBAL_ADMIN_ROLE_IDS.pop(str(ctx.guild.id), None)
+        await ctx.reply("â‌Œ Could not save the admin role setting. Check persistent storage and logs.", mention_author=False)
+        return
+    await ctx.reply(
+        f"âœ… Server-wide admin role set to {admin_role.mention}. It can manage bot features, but does not bypass plan quotas.",
+        mention_author=False,
+    )
+
+
+@bot.command(name="reset-hwid-cooldown")
+async def reset_hwid_cooldown_prefix(ctx: commands.Context, seconds: int = -1):
+    if not ctx.guild or not isinstance(ctx.author, discord.Member) or not ctx.author.guild_permissions.administrator:
+        await ctx.reply("â‌Œ Only server administrators can change this setting.", mention_author=False)
+        return
+    if seconds < 0 or seconds > 31536000:
+        await ctx.reply("Usage: `-reset-hwid-cooldown seconds` (0 to 31536000; 0 disables the cooldown).", mention_author=False)
+        return
+    security_state["reset_hwid_cooldown"] = int(seconds)
+    save_security_state()
+    await ctx.reply(f"âœ… HWID reset cooldown set to **{format_duration(seconds)}** ({seconds} seconds).", mention_author=False)
+
+
+# Removed slash registration: use the Admin prefix command -blacklist.
+# @bot.tree.command(name="blacklist", description="Globally block a user from bot features")
 @app_commands.describe(user="The user to blacklist")
 async def blacklist_command(interaction: discord.Interaction, user: discord.Member):
     if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users or _discord_plan(interaction.user.id) == "Admin"):
-        await interaction.response.send_message("❌ This command requires internal bot authorization.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ This command requires internal bot authorization.", ephemeral=True)
         return
     if user.id == interaction.user.id:
-        await interaction.response.send_message("❌ You cannot blacklist yourself.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ You cannot blacklist yourself.", ephemeral=True)
         return
     blacklisted_users.add(int(user.id))
     if not save_data():
         blacklisted_users.discard(int(user.id))
-        await interaction.response.send_message("❌ Could not save the blacklist. The change was cancelled; check the bot's file permissions.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Could not save the blacklist. The change was cancelled; check the bot's file permissions.", ephemeral=True)
         return
-    await interaction.response.send_message(f"🚫 {user.mention} has been added to the global bot blacklist.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    await interaction.response.send_message(f"ًںڑ« {user.mention} has been added to the global bot blacklist.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
-@bot.tree.command(name="unblacklist", description="Remove a user from the global bot blacklist")
+# Removed slash registration: use the Admin prefix command -unblacklist.
+# @bot.tree.command(name="unblacklist", description="Remove a user from the global bot blacklist")
 @app_commands.describe(user_id="Discord user ID to unblock")
 async def unblacklist_command(interaction: discord.Interaction, user_id: str):
     if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users or _discord_plan(interaction.user.id) == "Admin"):
-        await interaction.response.send_message("❌ This command requires internal bot authorization.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ This command requires internal bot authorization.", ephemeral=True)
         return
     try:
         target_id = int(user_id.strip())
     except (TypeError, ValueError):
-        await interaction.response.send_message("❌ Enter a valid numeric Discord user ID.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Enter a valid numeric Discord user ID.", ephemeral=True)
         return
     was_blacklisted = target_id in blacklisted_users
     blacklisted_users.discard(target_id)
     if not save_data():
         if was_blacklisted:
             blacklisted_users.add(target_id)
-        await interaction.response.send_message("❌ Could not save the blacklist change. It was rolled back; check the bot's file permissions.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Could not save the blacklist change. It was rolled back; check the bot's file permissions.", ephemeral=True)
         return
-    await interaction.response.send_message(f"✅ User `{target_id}` removed from the global blacklist.", ephemeral=True)
+    await interaction.response.send_message(f"âœ… User `{target_id}` removed from the global blacklist.", ephemeral=True)
 
 
-@bot.tree.command(name="list-servers", description="List servers the bot has joined")
+# Removed slash registration: use the Admin prefix command -list-servers.
+# @bot.tree.command(name="list-servers", description="List servers the bot has joined")
 async def list_servers_command(interaction: discord.Interaction):
     if not is_bot_owner(interaction.user.id):
-        await interaction.response.send_message("❌ This action is restricted to the bot owner.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ This action is restricted to the bot owner.", ephemeral=True)
         return
     guilds = sorted(bot.guilds, key=lambda g: g.name.lower())
     if not guilds:
         await interaction.response.send_message("The bot is not in any servers.", ephemeral=True)
         return
-    lines = [f"• **{discord.utils.escape_markdown(g.name)}** — ID: `{g.id}` — members: `{g.member_count or 'unknown'}`" for g in guilds]
+    lines = [f"â€¢ **{discord.utils.escape_markdown(g.name)}** â€” ID: `{g.id}` â€” members: `{g.member_count or 'unknown'}`" for g in guilds]
     # Discord message limits; split output safely into multiple ephemeral replies.
     chunks, current = [], "\n".join(lines[:])
     while len(current) > 1900:
@@ -4347,96 +4411,133 @@ async def list_servers_command(interaction: discord.Interaction):
         await interaction.followup.send(chunk, ephemeral=True)
 
 
-@bot.tree.command(name="send-server-message", description="Send a message to a channel in a selected server")
+# Removed slash registration: use the Admin prefix command -send-server-message.
+# @bot.tree.command(name="send-server-message", description="Send a message to a channel in a selected server")
 @app_commands.describe(server_id="Target server ID", channel_id="Target channel ID", message="Message to send")
 async def send_server_message_command(interaction: discord.Interaction, server_id: str, channel_id: str, message: str):
     if not is_bot_owner(interaction.user.id):
-        await interaction.response.send_message("❌ This action is restricted to the bot owner.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ This action is restricted to the bot owner.", ephemeral=True)
         return
     try:
         guild_id, target_channel_id = int(server_id.strip()), int(channel_id.strip())
     except (TypeError, ValueError):
-        await interaction.response.send_message("❌ Server ID and channel ID must be numeric.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Server ID and channel ID must be numeric.", ephemeral=True)
         return
     message = message.strip()
     if not message or len(message) > 1800:
-        await interaction.response.send_message("❌ Message must be between 1 and 1800 characters.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Message must be between 1 and 1800 characters.", ephemeral=True)
         return
     guild = bot.get_guild(guild_id)
     if guild is None:
-        await interaction.response.send_message("❌ The bot is not in that server.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ The bot is not in that server.", ephemeral=True)
         return
     channel = guild.get_channel(target_channel_id)
     if channel is None or not hasattr(channel, "send"):
-        await interaction.response.send_message("❌ Could not find a sendable channel in that server.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Could not find a sendable channel in that server.", ephemeral=True)
         return
     try:
         await channel.send(message, allowed_mentions=discord.AllowedMentions.none())
     except discord.Forbidden:
-        await interaction.response.send_message("❌ The bot lacks permission to send messages in that channel.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ The bot lacks permission to send messages in that channel.", ephemeral=True)
         return
     except discord.HTTPException:
-        await interaction.response.send_message("❌ Discord could not deliver the message.", ephemeral=True)
+        await interaction.response.send_message("â‌Œ Discord could not deliver the message.", ephemeral=True)
         return
-    await interaction.response.send_message(f"✅ Message sent to **{guild.name}** / {channel.mention}.", ephemeral=True)
+    await interaction.response.send_message(f"âœ… Message sent to **{guild.name}** / {channel.mention}.", ephemeral=True)
 
-@bot.tree.command(name="create-redeem-code", description="Create a one-time Crystal Hub website subscription code")
-@app_commands.describe(plan="Plan granted by the code")
-@app_commands.choices(plan=[app_commands.Choice(name="Premium (30 days)", value="Premium"), app_commands.Choice(name="Ultra (Lifetime)", value="Ultra")])
-async def create_redeem_code_command(interaction: discord.Interaction, plan: app_commands.Choice[str]):
-    if not is_bot_owner(interaction.user.id):
-        await interaction.response.send_message("❌ This command is restricted to the configured bot owner.", ephemeral=True)
-        return
-    raw = "CH-" + {"Premium":"PREM", "Ultra":"ULTRA"}[plan.value] + "-" + secrets.token_hex(6).upper()
-    days = 30 if plan.value == "Premium" else 0
-    site_redeem_codes[_hash_redeem_code(raw)] = {"plan": plan.value, "duration_days": days, "created_by": str(interaction.user.id), "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "redeemed_by": None, "redeemed_at": None, "revoked": False}
-    try:
-        _save_json_dict(SITE_CODES_FILE, site_redeem_codes)
-    except OSError:
-        site_redeem_codes.pop(_hash_redeem_code(raw), None)
-        await interaction.response.send_message("❌ Could not save the code. Check server file permissions.", ephemeral=True)
-        return
-    await interaction.response.send_message(f"✅ **{plan.value} redeem code created** (one use only).\nCopy this code now; it will not be shown again:\n```text\n{raw}\n```", ephemeral=True)
-
-@bot.tree.command(name="list-redeem-codes", description="List Crystal Hub website redeem code status")
-async def list_redeem_codes_command(interaction: discord.Interaction):
-    if not is_bot_owner(interaction.user.id):
-        await interaction.response.send_message("❌ This command is restricted to the configured bot owner.", ephemeral=True)
+@bot.command(name="list-redeem-codes")
+async def list_redeem_codes_prefix(ctx: commands.Context):
+    """Admin-only list of website redeem code status; no plaintext codes are exposed."""
+    if not (is_bot_owner(ctx.author.id) or str(ctx.author.id) in admin_redeemed_users or _discord_plan(ctx.author.id) == "Admin"):
+        await ctx.reply("â‌Œ This command requires internal Admin authorization.", mention_author=False)
         return
     if not site_redeem_codes:
-        await interaction.response.send_message("No website redeem codes have been created yet.", ephemeral=True)
+        await ctx.reply("No website redeem codes have been created yet.", mention_author=False)
         return
     lines = []
     for i, rec in enumerate(site_redeem_codes.values(), 1):
         status = "revoked" if rec.get("revoked") else ("used" if rec.get("redeemed_by") else "available")
-        lines.append(f"{i}. **{rec.get('plan','Premium')}** — {status} — created {str(rec.get('created_at',''))[:10]}")
+        lines.append(f"{i}. **{rec.get('plan','Premium')}** â€” {status} â€” created {str(rec.get('created_at',''))[:10]}")
     chunks, current = [], "\n".join(lines)
     while len(current) > 1800:
         cut = current.rfind("\n", 0, 1800)
-        if cut < 1: cut = 1800
-        chunks.append(current[:cut]); current = current[cut:].lstrip("\n")
-    chunks.append(current)
-    await interaction.response.send_message("**Website redeem codes**\n" + chunks[0], ephemeral=True)
-    for chunk in chunks[1:]: await interaction.followup.send(chunk, ephemeral=True)
+        if cut < 1:
+            cut = 1800
+        chunks.append(current[:cut])
+        current = current[cut:].lstrip("\n")
+    if current:
+        chunks.append(current)
+    await ctx.reply("**Website redeem codes**\n" + chunks[0], mention_author=False)
+    for chunk in chunks[1:]:
+        await ctx.send(chunk)
 
-@bot.tree.command(name="revoke-redeem-code", description="Revoke an unused Crystal Hub website redeem code")
-@app_commands.describe(code="The full code to revoke")
-async def revoke_redeem_code_command(interaction: discord.Interaction, code: str):
-    if not is_bot_owner(interaction.user.id):
-        await interaction.response.send_message("❌ This command is restricted to the configured bot owner.", ephemeral=True)
-        return
-    key = _hash_redeem_code(code)
-    rec = site_redeem_codes.get(key)
-    if not rec:
-        await interaction.response.send_message("❌ Code not found.", ephemeral=True)
-        return
-    if rec.get("redeemed_by"):
-        await interaction.response.send_message("❌ This code has already been redeemed and cannot be revoked with this command.", ephemeral=True)
-        return
-    rec["revoked"] = True
-    _save_json_dict(SITE_CODES_FILE, site_redeem_codes)
-    await interaction.response.send_message("✅ Redeem code revoked.", ephemeral=True)
 
+@bot.command(name="unblacklist")
+async def unblacklist_prefix(ctx: commands.Context, user_id: str = ""):
+    if not (is_bot_owner(ctx.author.id) or str(ctx.author.id) in admin_redeemed_users or _discord_plan(ctx.author.id) == "Admin"):
+        await ctx.reply("â‌Œ This command requires internal bot authorization.", mention_author=False)
+        return
+    raw = user_id.strip().strip("<@!>")
+    if not raw.isdigit():
+        await ctx.reply("Usage: `-unblacklist USER_ID`", mention_author=False)
+        return
+    target_id = int(raw)
+    was_blacklisted = target_id in blacklisted_users
+    blacklisted_users.discard(target_id)
+    if not save_data():
+        if was_blacklisted:
+            blacklisted_users.add(target_id)
+        await ctx.reply("â‌Œ Could not save the blacklist change; the change was rolled back.", mention_author=False)
+        return
+    await ctx.reply(f"âœ… User `{target_id}` removed from the global blacklist.", mention_author=False)
+
+
+@bot.command(name="list-servers")
+async def list_servers_prefix(ctx: commands.Context):
+    if not is_bot_owner(ctx.author.id):
+        await ctx.reply("â‌Œ This action is restricted to the configured bot owner.", mention_author=False)
+        return
+    guilds = sorted(bot.guilds, key=lambda g: g.name.lower())
+    if not guilds:
+        await ctx.reply("The bot is not in any servers.", mention_author=False)
+        return
+    lines = [f"â€¢ **{discord.utils.escape_markdown(g.name)}** â€” ID: `{g.id}` â€” members: `{g.member_count or 'unknown'}`" for g in guilds]
+    chunks, current = [], "\n".join(lines)
+    while len(current) > 1800:
+        cut = current.rfind("\n", 0, 1800)
+        if cut < 1:
+            cut = 1800
+        chunks.append(current[:cut])
+        current = current[cut:].lstrip("\n")
+    if current:
+        chunks.append(current)
+    await ctx.reply("**Bot servers**\n" + chunks[0], mention_author=False)
+    for chunk in chunks[1:]:
+        await ctx.send(chunk)
+
+
+@bot.command(name="send-server-message")
+async def send_server_message_prefix(ctx: commands.Context, server_id: str = "", channel_id: str = "", *, message: str = ""):
+    if not is_bot_owner(ctx.author.id):
+        await ctx.reply("â‌Œ This action is restricted to the configured bot owner.", mention_author=False)
+        return
+    if not server_id.isdigit() or not channel_id.isdigit() or not message.strip() or len(message) > 1800:
+        await ctx.reply("Usage: `-send-server-message SERVER_ID CHANNEL_ID message`", mention_author=False)
+        return
+    guild = bot.get_guild(int(server_id))
+    if guild is None:
+        await ctx.reply("â‌Œ The bot is not in that server.", mention_author=False)
+        return
+    channel = guild.get_channel(int(channel_id))
+    if channel is None or not hasattr(channel, "send"):
+        await ctx.reply("â‌Œ Could not find a sendable channel in that server.", mention_author=False)
+        return
+    try:
+        await channel.send(message, allowed_mentions=discord.AllowedMentions.none())
+    except (discord.Forbidden, discord.HTTPException):
+        await ctx.reply("â‌Œ The bot could not deliver the message to that channel.", mention_author=False)
+        return
+    await ctx.reply(f"âœ… Message sent to **{guild.name}** / {channel.mention}.", mention_author=False)
 
 
 @bot.listen("on_interaction")
@@ -4460,13 +4561,13 @@ async def on_message(message: discord.Message):
         _remember_user(message.author.id)
     if message.author.id in blacklisted_users:
         if content.startswith(("!", "-")):
-            await message.reply("🚫 You are globally blacklisted from using this bot.", mention_author=False)
+            await message.reply("ًںڑ« You are globally blacklisted from using this bot.", mention_author=False)
         # Do not let globally blacklisted users use AI chat or other message-based features.
         return
 
     if content.lower().startswith("-ann") and (len(content) == 4 or content[4].isspace()):
         if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users or _discord_plan(message.author.id) == "Admin"):
-            await message.reply("❌ This command is restricted to Admin users.", mention_author=False)
+            await message.reply("â‌Œ This command is restricted to Admin users.", mention_author=False)
             return
         announcement = content[4:].strip()
         if not announcement:
@@ -4486,17 +4587,17 @@ async def on_message(message: discord.Message):
             except (discord.Forbidden, discord.NotFound, discord.HTTPException):
                 failed += 1
         await message.reply(
-            f"📨 Announcement finished. Sent: **{sent}** · Failed: **{failed}** · Tracked: **{len(KNOWN_USERS)}**.",
+            f"ًں“¨ Announcement finished. Sent: **{sent}** آ· Failed: **{failed}** آ· Tracked: **{len(KNOWN_USERS)}**.",
             mention_author=False,
         )
         return
 
     if content.lower().startswith("-massage"):
         if not message.guild:
-            await message.reply("❌ Use this command inside a server.", mention_author=False)
+            await message.reply("â‌Œ Use this command inside a server.", mention_author=False)
             return
         if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users or _discord_plan(message.author.id) == "Admin"):
-            await message.reply("❌ This command requires internal bot authorization.", mention_author=False)
+            await message.reply("â‌Œ This command requires internal bot authorization.", mention_author=False)
             return
         parts = content.split(maxsplit=2)
         if len(parts) < 3:
@@ -4504,26 +4605,26 @@ async def on_message(message: discord.Message):
             return
         target = _parse_massage_target(message.guild, parts[1])
         if target is None or not isinstance(target, (discord.TextChannel, discord.Thread)):
-            await message.reply("❌ Channel not found. Mention a text channel, or use its ID/link.", mention_author=False)
+            await message.reply("â‌Œ Channel not found. Mention a text channel, or use its ID/link.", mention_author=False)
             return
         perms = target.permissions_for(message.guild.me) if message.guild.me else None
         can_send = bool(perms and (perms.send_messages_in_threads if isinstance(target, discord.Thread) else perms.send_messages))
         if not can_send:
-            await message.reply("❌ I do not have permission to send messages in that channel/thread.", mention_author=False)
+            await message.reply("â‌Œ I do not have permission to send messages in that channel/thread.", mention_author=False)
             return
         try:
             await target.send(parts[2], allowed_mentions=discord.AllowedMentions.none())
-            await message.reply(f"✅ Message sent to {target.mention}.", mention_author=False)
+            await message.reply(f"âœ… Message sent to {target.mention}.", mention_author=False)
         except discord.HTTPException as exc:
-            await message.reply(f"❌ Could not send the message: {type(exc).__name__}.", mention_author=False)
+            await message.reply(f"â‌Œ Could not send the message: {type(exc).__name__}.", mention_author=False)
         return
 
     if content.lower().startswith("-blacklist"):
         if not message.guild:
-            await message.reply("❌ Use this command inside a server.", mention_author=False)
+            await message.reply("â‌Œ Use this command inside a server.", mention_author=False)
             return
         if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users or _discord_plan(message.author.id) == "Admin"):
-            await message.reply("❌ This command requires internal bot authorization.", mention_author=False)
+            await message.reply("â‌Œ This command requires internal bot authorization.", mention_author=False)
             return
         parts = content.split(maxsplit=1)
         if len(parts) < 2:
@@ -4537,17 +4638,17 @@ async def on_message(message: discord.Message):
             if raw_target.isdigit():
                 target_id = int(raw_target)
         if target_id is None:
-            await message.reply("❌ Could not identify the user. Mention them or provide a numeric ID.", mention_author=False)
+            await message.reply("â‌Œ Could not identify the user. Mention them or provide a numeric ID.", mention_author=False)
             return
         if target_id == message.author.id:
-            await message.reply("❌ You cannot blacklist yourself.", mention_author=False)
+            await message.reply("â‌Œ You cannot blacklist yourself.", mention_author=False)
             return
         blacklisted_users.add(int(target_id))
         if not save_data():
             blacklisted_users.discard(int(target_id))
-            await message.reply("❌ Could not save the blacklist. The change was cancelled; check the bot's file permissions.", mention_author=False)
+            await message.reply("â‌Œ Could not save the blacklist. The change was cancelled; check the bot's file permissions.", mention_author=False)
             return
-        await message.reply(f"🚫 User `{target_id}` has been globally blacklisted.", mention_author=False)
+        await message.reply(f"ًںڑ« User `{target_id}` has been globally blacklisted.", mention_author=False)
         return
 
     try:
@@ -4609,17 +4710,17 @@ async def on_message(message: discord.Message):
                                         allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
                                     )
                                     await message.reply(
-                                        "ما عندي إجابة محفوظة لهذا السؤال، أرسلته لفريق الدعم عشان يضيفون الإجابة.",
+                                        "ظ…ط§ ط¹ظ†ط¯ظٹ ط¥ط¬ط§ط¨ط© ظ…ط­ظپظˆط¸ط© ظ„ظ‡ط°ط§ ط§ظ„ط³ط¤ط§ظ„طŒ ط£ط±ط³ظ„طھظ‡ ظ„ظپط±ظٹظ‚ ط§ظ„ط¯ط¹ظ… ط¹ط´ط§ظ† ظٹط¶ظٹظپظˆظ† ط§ظ„ط¥ط¬ط§ط¨ط©.",
                                         mention_author=False,
                                     )
                                 else:
                                     await message.reply(
-                                        "ما قدرت أجاوب، وقناة الأسئلة غير متاحة حاليًا. تأكد من إعداد `/ai-bot` وصلاحيات البوت.",
+                                        "ظ…ط§ ظ‚ط¯ط±طھ ط£ط¬ط§ظˆط¨طŒ ظˆظ‚ظ†ط§ط© ط§ظ„ط£ط³ط¦ظ„ط© ط؛ظٹط± ظ…طھط§ط­ط© ط­ط§ظ„ظٹظ‹ط§. طھط£ظƒط¯ ظ…ظ† ط¥ط¹ط¯ط§ط¯ `/ai-bot` ظˆطµظ„ط§ط­ظٹط§طھ ط§ظ„ط¨ظˆطھ.",
                                         mention_author=False,
                                     )
                             else:
                                 await message.reply(
-                                    "ما عندي إجابة لهذا السؤال حتى الآن. تأكد من اختيار Questions Channel في `/ai-bot`.",
+                                    "ظ…ط§ ط¹ظ†ط¯ظٹ ط¥ط¬ط§ط¨ط© ظ„ظ‡ط°ط§ ط§ظ„ط³ط¤ط§ظ„ ط­طھظ‰ ط§ظ„ط¢ظ†. طھط£ظƒط¯ ظ…ظ† ط§ط®طھظٹط§ط± Questions Channel ظپظٹ `/ai-bot`.",
                                     mention_author=False,
                                 )
     except Exception as exc:
