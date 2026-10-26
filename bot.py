@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import secrets
 import datetime
+import difflib
 import time
 import io
 import base64
@@ -1466,7 +1467,7 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
         "generate-key", "key", "whitelist", "see-keys", "delete-key",
         "unwhitelist", "trail", "delete-script",
         "set-buyer-role", "update-script", "reset-hwid-cooldown",
-        "ai-question-channel", "ai-bot",
+        "ai-bot",
         "list-servers", "send-server-message",
     }
     if command_name in management_commands:
@@ -1822,6 +1823,13 @@ class PanelControlView(BlacklistAwareView):
             return
 
         user_key, reason = self._get_user_key(s_info, interaction.user.id)
+        if not user_key and trail_is_active(s_info):
+            mode = str(s_info.get("trail_mode") or "PERM").upper()
+            expires_at = s_info.get("trail_expires_at") if mode == "TIME" else None
+            user_key = generate_random_key()
+            register_key(s_info, user_key, mode, expires_at, created_by=interaction.user.id)
+            grant_user_access(s_info, interaction.user.id, user_key, mode, expires_at)
+            save_data()
         if not user_key:
             await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
             return
@@ -2219,7 +2227,7 @@ async def trail_command(
     save_data()
     when = "permanent" if mode == "PERM" else f"TIME — ends in {format_remaining(expires_at)}"
     await interaction.response.send_message(
-        f"✅ Trail **ON** for `{script}` ({when}).\nTrail is free and does not require Robux.",
+        f"✅ Trail **ON** for `{script}` ({when}).",
         ephemeral=True
     )
 
@@ -2227,13 +2235,13 @@ async def trail_command(
 # 3. إنشاء السكربت
 @bot.tree.command(name="create-script", description="Create a new script entry")
 @app_commands.describe(
-    name_script="Enter script name (optional when API is provided)",
+    name_script="Required: the name to use for this script",
     buyer_role="Select buyer role (optional when API is provided)",
-    api="Optional Crystal Hub script API URL. If supplied, the script is imported automatically."
+    api="Optional Crystal Hub script API URL. The imported source uses the name you enter."
 )
 async def create_script_command(
     interaction: discord.Interaction,
-    name_script: Optional[str] = None,
+    name_script: str,
     buyer_role: Optional[discord.Role] = None,
     api: Optional[str] = None,
 ):
@@ -2244,6 +2252,10 @@ async def create_script_command(
         await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
         return
 
+    name_script = (name_script or "").strip()
+    if not name_script:
+        await interaction.response.send_message("❌ Script name is required.", ephemeral=True)
+        return
     imported = None
     if api:
         try:
@@ -2256,7 +2268,7 @@ async def create_script_command(
             return
 
     if imported:
-        name_script = imported["name"]
+        # Keep the requested name, but clone source/config from the API entry.
         buyer_role_id = imported.get("buyer_role_id")
         admin_role_id = _global_admin_role_id(interaction.guild.id if interaction.guild else None)
         if buyer_role is not None:
@@ -2264,10 +2276,6 @@ async def create_script_command(
         source_code = imported["source_code"]
         version = imported["version"]
     else:
-        name_script = (name_script or "").strip()
-        if not name_script:
-            await interaction.response.send_message("❌ Enter a script name, or provide the API URL.", ephemeral=True)
-            return
         if buyer_role is None:
             await interaction.response.send_message(
                 "❌ Without an API, select the Buyer Role. With an API, this field is optional.",
@@ -2328,7 +2336,7 @@ async def create_script_command(
     )
     await interaction.response.send_message(embed=embed, view=CreateScriptActionsView(name_script, interaction.user.id), ephemeral=True)
     await interaction.followup.send(
-        f"🔐 **Private API key for {name_script}** — save it securely. It is stored with the script and survives bot restarts/updates:\\n```text\\n{api_key}\\n```",
+        f"🔐 **Private API key for {name_script}** — save it securely. It is stored with the script and survives bot restarts/updates:\\n``{api_key}``",
         ephemeral=True
     )
 
@@ -2555,8 +2563,7 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
         "🔐 **Do you want to obfuscate/protect the script?**\n"
         "If you choose **Yes**, the hosted source will be converted into an encoded "
         "Lua loader so the original code is not shown directly.\n"
-        "If you choose **No**, the source will be stored normally.\n\n"
-        "**Source handling notice:** the original uploaded source file is also sent to the Crystal Hub owner (@admi111) for maintenance/support, whether you choose Yes or No.",
+        "If you choose **No**, the source will be stored normally.\n\n",
         view=view,
         ephemeral=True,
     )
@@ -3077,11 +3084,11 @@ def _backup_snapshot(backup_type):
         "security_state": security_state,
         "hwid_bindings": hwid_bindings,
         "ai_chat_channels": sorted(int(x) for x in AI_CHAT_CHANNELS),
-        "ai_question_channel_id": AI_QUESTION_CHANNEL_ID,
         "site_redeem_codes": site_redeem_codes,
         "site_entitlements": site_entitlements,
         "monthly_usage": monthly_usage,
         "known_users": sorted(KNOWN_USERS),
+        "ai_information": AI_INFORMATION,
     }
 
     # Normal backups intentionally DO NOT carry any personal subscription/
@@ -3114,7 +3121,6 @@ def _has_admin_backup_access(user_id):
 
 def _restore_settings_backup(snapshot, backup_type, guild_id=None):
     global scripts_data, blacklisted_users, security_state, hwid_bindings
-    global AI_QUESTION_CHANNEL_ID
     global site_redeem_codes, site_entitlements, monthly_usage
     global AI_CHAT_CHANNELS, GLOBAL_ADMIN_ROLE_IDS
     global admin_redeemed_users, discord_plan_codes, discord_plan_entitlements
@@ -3167,8 +3173,10 @@ def _restore_settings_backup(snapshot, backup_type, guild_id=None):
     if isinstance(snapshot.get("ai_chat_channels"), list):
         AI_CHAT_CHANNELS = {int(x) for x in snapshot["ai_chat_channels"] if str(x).isdigit()}
         _save_ai_chat_channels()
-    AI_QUESTION_CHANNEL_ID = snapshot.get("ai_question_channel_id")
-    _save_ai_question_channel()
+    if isinstance(snapshot.get("ai_information"), dict):
+        AI_INFORMATION.clear()
+        AI_INFORMATION.update({str(g): str(v)[:12000] for g, v in snapshot["ai_information"].items() if str(g).isdigit() and isinstance(v, str)})
+        _save_ai_information()
 
     if isinstance(snapshot.get("site_redeem_codes"), dict):
         site_redeem_codes = snapshot["site_redeem_codes"]
@@ -3205,92 +3213,6 @@ def _restore_settings_backup(snapshot, backup_type, guild_id=None):
         _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
 
     save_data()
-
-@bot.tree.command(name="setting", description="Get or restore Crystal Hub settings")
-@app_commands.describe(
-    action="Get File or Upload File",
-    backup_type="Normal = general settings only; Admin = all rank/permission state",
-    file="JSON backup file for Upload File",
-)
-@app_commands.choices(action=[
-    app_commands.Choice(name="Get File", value="get_file"),
-    app_commands.Choice(name="Upload File", value="upload_file"),
-])
-@app_commands.choices(backup_type=[
-    app_commands.Choice(name="Normal", value="normal"),
-    app_commands.Choice(name="Admin", value="admin"),
-])
-async def setting_command(
-    interaction: discord.Interaction,
-    action: app_commands.Choice[str],
-    backup_type: app_commands.Choice[str],
-    file: Optional[discord.Attachment] = None,
-):
-    if not interaction.guild:
-        await interaction.response.send_message("❌ Use `/setting` inside a server.", ephemeral=True)
-        return
-
-    # Normal backup/restore is available to the configured server admin role.
-    # Admin backup/restore requires the actual Admin entitlement.
-    if action.value == "get_file":
-        if not _has_global_admin_access(interaction):
-            await interaction.response.send_message(
-                "❌ You need the configured server admin role to use `/setting`.",
-                ephemeral=True,
-            )
-            return
-        if backup_type.value == "admin" and not _has_admin_backup_access(interaction.user.id):
-            await interaction.response.send_message(
-                "❌ Only an Admin user can create an Admin backup.",
-                ephemeral=True,
-            )
-            return
-        try:
-            payload = _backup_snapshot(backup_type.value)
-            raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-            filename = f"crystal_hub_settings_{backup_type.value}.json"
-            await interaction.response.send_message(
-                f"✅ {backup_type.name} settings backup created.",
-                file=discord.File(io.BytesIO(raw), filename=filename),
-                ephemeral=True,
-            )
-        except Exception as exc:
-            print(f"/setting get file error: {type(exc).__name__}: {exc}")
-            await interaction.response.send_message("❌ Could not create the settings backup.", ephemeral=True)
-        return
-
-    # Upload File
-    if not _has_global_admin_access(interaction):
-        await interaction.response.send_message(
-            "❌ You need the configured server admin role to use `/setting`.",
-            ephemeral=True,
-        )
-        return
-    if file is None:
-        await interaction.response.send_message("❌ Attach the JSON backup file.", ephemeral=True)
-        return
-    if file.size and file.size > 8 * 1024 * 1024:
-        await interaction.response.send_message("❌ The backup file is too large.", ephemeral=True)
-        return
-    if backup_type.value == "admin" and not _has_admin_backup_access(interaction.user.id):
-        await interaction.response.send_message("❌ Only an Admin user can restore an Admin backup.", ephemeral=True)
-        return
-
-    try:
-        raw = await file.read()
-        snapshot = json.loads(raw.decode("utf-8"))
-        _restore_settings_backup(snapshot, backup_type.value, interaction.guild.id)
-        await interaction.response.send_message(
-            f"✅ {backup_type.name} settings restored successfully."
-            + (" All Admin/Premium/Ultra permission data was restored too." if backup_type.value == "admin"
-               else " Rank and Admin/Premium/Ultra permission data was not changed."),
-            ephemeral=True,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        await interaction.response.send_message(f"❌ Could not restore this backup: {exc}", ephemeral=True)
-    except Exception as exc:
-        print(f"/setting upload error: {type(exc).__name__}: {exc}")
-        await interaction.response.send_message("❌ Could not restore the settings backup. Check the bot logs.", ephemeral=True)
 
 # ==================== Admin Redeem + -massage ==================== #
 
@@ -3437,7 +3359,27 @@ def _parse_massage_target(guild: discord.Guild, target: str):
 
 
 
-# AI chat reply channels and unanswered-question channel are configured with /ai-bot.
+# Per-server owner-written AI instructions/context, persisted across restarts.
+AI_INFORMATION_FILE = "crystal_ai_information.json"
+def _load_ai_information():
+    try:
+        with open(AI_INFORMATION_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        rows = raw.get("guilds", {}) if isinstance(raw, dict) else {}
+        return {str(g): str(v)[:12000] for g, v in rows.items() if str(g).isdigit() and isinstance(v, str)}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+AI_INFORMATION = _load_ai_information()
+def _save_ai_information():
+    try:
+        with open(AI_INFORMATION_FILE, "w", encoding="utf-8") as f:
+            json.dump({"guilds": AI_INFORMATION}, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError as exc:
+        print(f"Could not save AI Information: {exc}")
+        return False
+
+# AI chat reply channels are configured with /ai-bot.
 AI_CHANNEL_CONFIG_FILE = "crystal_ai_channel.json"
 AI_CHAT_CHANNELS = set()
 _AI_CHAT_HISTORY = {}
@@ -3461,25 +3403,7 @@ def _save_ai_chat_channels():
 
 AI_CHAT_CHANNELS = _load_ai_chat_channels()
 
-# Staff channel for unanswered AI questions (kept for compatibility with existing settings).
-AI_QUESTION_CHANNEL_FILE = "crystal_ai_question_channel.json"
-
-def _load_ai_question_channel():
-    try:
-        with open(AI_QUESTION_CHANNEL_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        return int(raw.get("channel_id")) if raw.get("channel_id") else None
-    except (OSError, ValueError, TypeError):
-        return None
-
-def _save_ai_question_channel():
-    try:
-        with open(AI_QUESTION_CHANNEL_FILE, "w", encoding="utf-8") as f:
-            json.dump({"channel_id": AI_QUESTION_CHANNEL_ID}, f, indent=2)
-    except OSError as exc:
-        print(f"Could not save AI question channel: {exc}")
-
-AI_QUESTION_CHANNEL_ID = _load_ai_question_channel()
+# AI Information is the only editable server-specific AI knowledge store.
 
 
 # ---------- Admin-only portable backups/imports ----------
@@ -3697,6 +3621,15 @@ async def script_backup_or_restore(ctx: commands.Context, action: str = ""):
         await ctx.reply("Import failed. Check the bot logs and make sure this is a valid script backup.", mention_author=False)
 
 
+def _normalize_qa_text(text: str) -> str:
+    text = (text or "").lower().strip()
+    # Normalize common Arabic letter variants and remove diacritics/punctuation.
+    text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
+    text = text.translate(str.maketrans({"أ":"ا", "إ":"ا", "آ":"ا", "ى":"ي", "ة":"ه", "ؤ":"و", "ئ":"ي"}))
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
 # AI FAQ support (OpenRouter primary, then Gemini/OpenAI if configured). Keep all API keys in host environment variables.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
@@ -3824,8 +3757,11 @@ def _crystal_call_openai(prompt: str) -> str:
     return str(data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
 
 
-async def _crystal_ai_answer(content: str, history=None) -> str:
-    context = json.dumps(_crystal_ai_context(), ensure_ascii=False)
+async def _crystal_ai_answer(content: str, history=None, guild_id=None) -> str:
+    context_data = _crystal_ai_context()
+    if guild_id is not None:
+        context_data["server_owner_ai_information"] = AI_INFORMATION.get(str(guild_id), "")
+    context = json.dumps(context_data, ensure_ascii=False)
     history_text = "\n".join(f"{item.get('role', 'user')}: {item.get('content', '')}" for item in (history or [])[-8:])
     prompt = (
         "You are Crystal Hub's friendly Discord AI chat assistant. Understand paraphrases, typos, follow-up messages, and casual conversation. "
@@ -3852,11 +3788,36 @@ async def _crystal_ai_answer(content: str, history=None) -> str:
     return ""
 
 
-@bot.tree.command(name="ai-bot", description="Set AI reply and unanswered-question channels")
+@bot.tree.command(name="ai-information", description="Save instructions and server-owner information for the AI")
+@app_commands.describe(information="Information/instructions the AI should use in this server")
+async def ai_information_command(interaction: discord.Interaction, information: str):
+    plan = _discord_plan(interaction.user.id)
+    if plan not in ("Admin", "Ultra"):
+        await interaction.response.send_message("❌ This command requires an **Admin or Ultra** subscription.", ephemeral=True)
+        return
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("❌ Use this command inside a server.", ephemeral=True)
+        return
+    has_role = _has_global_admin_access(interaction)
+    is_discord_admin = interaction.user.guild_permissions.administrator
+    if not (has_role or is_discord_admin):
+        await interaction.response.send_message("❌ You need the configured **Admin role** or Discord **Administrator** permission.", ephemeral=True)
+        return
+    text_value = information.strip()
+    if not text_value:
+        await interaction.response.send_message("❌ Enter the information you want the AI to remember.", ephemeral=True)
+        return
+    AI_INFORMATION[str(interaction.guild.id)] = text_value[:12000]
+    if not _save_ai_information():
+        await interaction.response.send_message("❌ Could not save AI Information. Check the bot storage.", ephemeral=True)
+        return
+    await interaction.response.send_message("✅ Saved. The AI will use this information in conversations in this server.", ephemeral=True)
+
+
+@bot.tree.command(name="ai-bot", description="Turn AI replies on or off in a channel")
 @app_commands.describe(
     mode="Turn AI replies on or off",
     reply_channel="Channel where members can ask the bot and receive replies",
-    questions_channel="Staff channel where unanswered questions are sent",
 )
 @app_commands.choices(mode=[
     app_commands.Choice(name="On", value="on"),
@@ -3867,31 +3828,25 @@ async def ai_bot_command(
     interaction: discord.Interaction,
     mode: app_commands.Choice[str],
     reply_channel: Optional[discord.TextChannel] = None,
-    questions_channel: Optional[discord.TextChannel] = None,
 ):
-    global AI_QUESTION_CHANNEL_ID
 
     if not interaction.guild:
         await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
         return
 
     if mode.value == "on":
-        if reply_channel is None or questions_channel is None:
+        if reply_channel is None:
             await interaction.response.send_message(
-                "To turn AI on, choose both **Reply Channel** (where members talk to the bot) "
-                "and **Questions Channel** (where unanswered questions are sent to staff).",
+                "Choose a **Reply Channel** where members can talk to the AI.",
                 ephemeral=True,
             )
             return
 
         AI_CHAT_CHANNELS.add(reply_channel.id)
         _AI_CHAT_HISTORY[reply_channel.id] = []
-        AI_QUESTION_CHANNEL_ID = questions_channel.id
         _save_ai_chat_channels()
-        _save_ai_question_channel()
         await interaction.response.send_message(
-            f"AI replies are now **ON** in {reply_channel.mention}. "
-            f"Unanswered questions will be sent to {questions_channel.mention}.",
+            f"AI replies are now **ON** in {reply_channel.mention}.",
             ephemeral=True,
         )
     else:
@@ -3903,10 +3858,6 @@ async def ai_bot_command(
             AI_CHAT_CHANNELS.discard(target_channel.id)
             _AI_CHAT_HISTORY.pop(target_channel.id, None)
             _save_ai_chat_channels()
-
-        if questions_channel is not None:
-            AI_QUESTION_CHANNEL_ID = questions_channel.id
-            _save_ai_question_channel()
 
         if target_channel is not None:
             await interaction.response.send_message(
@@ -3946,15 +3897,13 @@ class AdminGuideLanguageView(BlacklistAwareView):
         embed = discord.Embed(
             title="Crystal Hub | Admin Guide",
             description=(
-                "**CHANNEL MESSAGE**\n`-massage #channel Your message`\n"
+                "**CHANNEL MESSAGE**\n`-massage @user Your private message` أو `-massage #channel Your message`\n"
                 "Send a message to a selected text channel.\n\n"
                 "**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` · `-unblacklist USER_ID`\n\n"
                 "**PRIVATE ANNOUNCEMENT**\n`-ann Your message`\n"
                 "DM an announcement to known users.\n\n"
                 "**BACKUPS**\n`-g files` exports the full Admin backup; `-files` imports it.\n"
-                "`-script file` backs up scripts/source/panels; `-Ai file` backs up AI Q&A.\n\n"
-                "**BOT MANAGEMENT**\n`-set-admin-role @role` · `-reset-hwid-cooldown seconds`\n"
-                "`-list-servers` · `-send-server-message SERVER_ID CHANNEL_ID message` · `-list-redeem-codes`\n"
+                "`-script file` backs up scripts/source/panels; `/ai-information` saves server-specific AI instructions (Admin/Ultra + Admin role or Administrator).\n\n"
                 "Standard subscription redeem codes remain single-use."
             ),
             color=discord.Color.gold(),
@@ -3970,9 +3919,7 @@ class AdminGuideLanguageView(BlacklistAwareView):
                 "**حظر / فك حظر مستخدم**\n`-blacklist @user` · `-unblacklist USER_ID`\n\n"
                 "**إعلان خاص**\n`-ann رسالتك هنا`\n\n"
                 "**النسخ الاحتياطي**\n`-g files` لتصدير النسخة الكاملة، و`-files` لاستيرادها.\n"
-                "`-script file` لنسخة السكربتات والسورس والبانلات، و`-Ai file` لأسئلة الذكاء الاصطناعي.\n\n"
-                "**إدارة البوت**\n`-set-admin-role @role` · `-reset-hwid-cooldown seconds`\n"
-                "`-list-servers` · `-send-server-message SERVER_ID CHANNEL_ID الرسالة` · `-list-redeem-codes`\n"
+                "`-script file` لنسخة السكربتات والسورس والبانلات، و`/ai-information` لحفظ معلومات الذكاء الاصطناعي.\n\n"
                 "أكواد الاشتراك العادية تظل استخدامًا واحدًا."
             ),
             color=discord.Color.gold(),
@@ -3991,12 +3938,10 @@ async def admin_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Crystal Hub | Admin Guide",
         description=(
-            "**CHANNEL MESSAGE**\n`-massage #channel Your message`\n"
+            "**CHANNEL MESSAGE**\n`-massage @user Your private message` أو `-massage #channel Your message`\n"
             "**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` · `-unblacklist USER_ID`\n"
             "**PRIVATE ANNOUNCEMENT**\n`-ann Your message`\n"
-            "**BACKUPS**\n`-g files` exports the full Admin backup; `-files` imports it. `-script file` backs up scripts; `-Ai file` backs up AI Q&A.\n"
-            "**BOT MANAGEMENT**\n`-set-admin-role @role` · `-reset-hwid-cooldown seconds`\n"
-            "`-list-servers` · `-send-server-message SERVER_ID CHANNEL_ID message` · `-list-redeem-codes`\n"
+            "**BACKUPS**\n`-g files` exports the full Admin backup; `-files` imports it. `-script file` backs up scripts; `/ai-information` saves server-specific AI instructions (Admin/Ultra + Admin role or Administrator).\n"
             "Standard subscription redeem codes remain single-use."
         ),
         color=discord.Color.gold(),
@@ -4242,7 +4187,7 @@ async def _track_known_interaction_user(interaction: discord.Interaction):
 
 @bot.event
 async def on_message(message: discord.Message):
-    """Answer messages in configured AI channels using the live AI provider code."""
+    """Answer messages in configured AI channels and forward unknown questions to staff."""
     if message.author.bot:
         await bot.process_commands(message)
         return
@@ -4273,7 +4218,9 @@ async def on_message(message: discord.Message):
                 continue
             try:
                 user = bot.get_user(uid) or await bot.fetch_user(uid)
-                await user.send(announcement, allowed_mentions=discord.AllowedMentions.none())
+                owned_scripts = [name for name, info in scripts_data.items() if str(info.get("created_by", "")) == str(uid)]
+                status_line = ("You have created a script on Crystal Hub: " + ", ".join(owned_scripts[:10])) if owned_scripts else "You have not created a script on Crystal Hub yet."
+                await user.send(announcement + "\n\n" + status_line, allowed_mentions=discord.AllowedMentions.none())
                 sent += 1
             except (discord.Forbidden, discord.NotFound, discord.HTTPException):
                 failed += 1
@@ -4292,11 +4239,30 @@ async def on_message(message: discord.Message):
             return
         parts = content.split(maxsplit=2)
         if len(parts) < 3:
-            await message.reply("Usage: `-massage #channel Your message`", mention_author=False)
+            await message.reply("Usage: `-massage @user Your private message` or `-massage @user Your private message` أو `-massage #channel Your message`", mention_author=False)
             return
-        target = _parse_massage_target(message.guild, parts[1])
+        target_token, body = parts[1], parts[2]
+        target_user = None
+        raw_user_id = target_token.strip().strip("<@!>")
+        if message.mentions:
+            target_user = message.mentions[0]
+        elif raw_user_id.isdigit():
+            try:
+                target_user = bot.get_user(int(raw_user_id)) or await bot.fetch_user(int(raw_user_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                target_user = None
+        else:
+            target_user = next((u for u in bot.users if u.name.lower() == target_token.lower()), None)
+        if target_user is not None:
+            try:
+                await target_user.send(body, allowed_mentions=discord.AllowedMentions.none())
+                await message.reply(f"✅ Private message sent to {target_user.mention}.", mention_author=False)
+            except discord.HTTPException as exc:
+                await message.reply(f"❌ Could not DM that user: {type(exc).__name__}. They may have DMs disabled.", mention_author=False)
+            return
+        target = _parse_massage_target(message.guild, target_token)
         if target is None or not isinstance(target, (discord.TextChannel, discord.Thread)):
-            await message.reply("❌ Channel not found. Mention a text channel, or use its ID/link.", mention_author=False)
+            await message.reply("❌ User/channel not found. Mention a user for DM, or a channel for public messages.", mention_author=False)
             return
         perms = target.permissions_for(message.guild.me) if message.guild.me else None
         can_send = bool(perms and (perms.send_messages_in_threads if isinstance(target, discord.Thread) else perms.send_messages))
@@ -4304,7 +4270,7 @@ async def on_message(message: discord.Message):
             await message.reply("❌ I do not have permission to send messages in that channel/thread.", mention_author=False)
             return
         try:
-            await target.send(parts[2], allowed_mentions=discord.AllowedMentions.none())
+            await target.send(body, allowed_mentions=discord.AllowedMentions.none())
             await message.reply(f"✅ Message sent to {target.mention}.", mention_author=False)
         except discord.HTTPException as exc:
             await message.reply(f"❌ Could not send the message: {type(exc).__name__}.", mention_author=False)
@@ -4351,17 +4317,14 @@ async def on_message(message: discord.Message):
                 if now - last >= 2:
                     _ai_last_reply_by_user[message.author.id] = now
                     history = _AI_CHAT_HISTORY.setdefault(message.channel.id, [])
-                    answer = await _crystal_ai_answer(content, history=history)
+                    answer = await _crystal_ai_answer(content, history=history, guild_id=message.guild.id)
                     history.append({"role": "user", "content": content[:1000]})
                     if answer:
                         history.append({"role": "assistant", "content": answer[:1500]})
                         del history[:-12]
                         await message.reply(answer[:1900], mention_author=False)
                     else:
-                        await message.reply(
-                            "The AI service is temporarily unavailable. Please try again in a moment.",
-                            mention_author=False,
-                        )
+                        await message.reply("ما قدرت أجيب رد من الـAI حاليًا. تأكد من إعداد مفاتيح مزوّد الـAI في Render.", mention_author=False)
     except Exception as exc:
         print(f"AI message handler failed: {type(exc).__name__}: {exc}")
 
