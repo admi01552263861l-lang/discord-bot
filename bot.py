@@ -13,7 +13,6 @@ import hashlib
 import hmac
 import secrets
 import datetime
-import difflib
 import time
 import io
 import base64
@@ -3462,7 +3461,7 @@ def _save_ai_chat_channels():
 
 AI_CHAT_CHANNELS = _load_ai_chat_channels()
 
-# The AI uses live API responses only. No saved-question/answer knowledge base is loaded.
+# Staff channel for unanswered AI questions (kept for compatibility with existing settings).
 AI_QUESTION_CHANNEL_FILE = "crystal_ai_question_channel.json"
 
 def _load_ai_question_channel():
@@ -3698,6 +3697,18 @@ async def script_backup_or_restore(ctx: commands.Context, action: str = ""):
         await ctx.reply("Import failed. Check the bot logs and make sure this is a valid script backup.", mention_author=False)
 
 
+# AI FAQ support (OpenRouter primary, then Gemini/OpenAI if configured). Keep all API keys in host environment variables.
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://crystal-hub67.netlify.app/").strip()
+OPENROUTER_SITE_NAME = os.getenv("OPENROUTER_SITE_NAME", "Crystal Hub").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+CRYSTAL_DISCORD_INVITE = "https://discord.gg/DsQ2sQkBW3"
+_ai_last_reply_by_user = {}
+
 
 def _crystal_ai_context():
     """Build grounded context from the bot's current settings; never invent prices."""
@@ -3841,11 +3852,11 @@ async def _crystal_ai_answer(content: str, history=None) -> str:
     return ""
 
 
-@bot.tree.command(name="ai-bot", description="Configure the AI reply channel")
+@bot.tree.command(name="ai-bot", description="Set AI reply and unanswered-question channels")
 @app_commands.describe(
     mode="Turn AI replies on or off",
     reply_channel="Channel where members can ask the bot and receive replies",
-    questions_channel="Legacy optional channel setting; saved-answer features are disabled",
+    questions_channel="Staff channel where unanswered questions are sent",
 )
 @app_commands.choices(mode=[
     app_commands.Choice(name="On", value="on"),
@@ -3865,20 +3876,22 @@ async def ai_bot_command(
         return
 
     if mode.value == "on":
-        if reply_channel is None:
+        if reply_channel is None or questions_channel is None:
             await interaction.response.send_message(
-                "To turn AI on, choose a **Reply Channel**. The Questions Channel is optional.",
+                "To turn AI on, choose both **Reply Channel** (where members talk to the bot) "
+                "and **Questions Channel** (where unanswered questions are sent to staff).",
                 ephemeral=True,
             )
             return
 
         AI_CHAT_CHANNELS.add(reply_channel.id)
         _AI_CHAT_HISTORY[reply_channel.id] = []
-        AI_QUESTION_CHANNEL_ID = questions_channel.id if questions_channel else None
+        AI_QUESTION_CHANNEL_ID = questions_channel.id
         _save_ai_chat_channels()
         _save_ai_question_channel()
         await interaction.response.send_message(
-            f"AI replies are now **ON** in {reply_channel.mention}. Every new question will use the live AI API.",
+            f"AI replies are now **ON** in {reply_channel.mention}. "
+            f"Unanswered questions will be sent to {questions_channel.mention}.",
             ephemeral=True,
         )
     else:
@@ -4229,7 +4242,7 @@ async def _track_known_interaction_user(interaction: discord.Interaction):
 
 @bot.event
 async def on_message(message: discord.Message):
-    """Answer messages in configured AI channels and forward unknown questions to staff."""
+    """Answer messages in configured AI channels using the live AI provider code."""
     if message.author.bot:
         await bot.process_commands(message)
         return
