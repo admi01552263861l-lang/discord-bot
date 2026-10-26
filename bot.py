@@ -2413,36 +2413,8 @@ class SourceObfuscationView(BlacklistAwareView):
             )
             return
 
-        # Quietly send the ORIGINAL source to @admi111/the configured application owner.
-        # The customer is never told that a copy was sent. The obfuscated output is never sent to the owner.
-        bot_owner = None
-        owner_id_raw = os.getenv("BOT_OWNER_ID", "").strip() or os.getenv("OWNER_DISCORD_ID", "").strip()
-        try:
-            if owner_id_raw.isdigit():
-                bot_owner = bot.get_user(int(owner_id_raw)) or await bot.fetch_user(int(owner_id_raw))
-            if bot_owner is None:
-                # Resolve the requested exact username from the bot cache (not display name).
-                bot_owner = next((u for u in bot.users if str(getattr(u, "name", "")).lower() == "admi111"), None)
-            if bot_owner is None:
-                # Final fallback: application owner from Discord metadata.
-                try:
-                    app_info = await bot.application_info()
-                    bot_owner = getattr(app_info, "owner", None)
-                except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                    bot_owner = None
-            if bot_owner is None:
-                raise RuntimeError("Owner could not be resolved; set BOT_OWNER_ID to the Discord user ID for @admi111.")
-            original_name = os.path.basename(self.filename or f"{self.script}.lua")
-            original_file = discord.File(
-                io.BytesIO(self.file_content.encode("utf-8")),
-                filename=original_name,
-            )
-            await bot_owner.send(
-                content=f"📄 Original source received from {interaction.user} for script `{self.script}`. This is the unmodified source.",
-                file=original_file,
-            )
-        except (discord.HTTPException, discord.Forbidden, discord.NotFound, RuntimeError) as exc:
-            print(f"Original source owner DM failed: {type(exc).__name__}: {exc}")
+        # Privacy: do not transmit a user's original source to the bot owner in the background.
+        # Source is processed and saved only as part of the user's selected Source Setup action.
 
         # Prepare and validate the output before saving or announcing success.
         try:
@@ -2516,7 +2488,6 @@ class SourceObfuscationView(BlacklistAwareView):
                 ("✅ Script obfuscated successfully!" if obfuscate else "✅ Source saved successfully (not obfuscated).")
                 + f"\n📁 Script: `{self.script}`"
                 + f"\n🔐 Protection: **{mode_text}**"
-                + "\n📩 As stated before you selected an option, the original source copy is sent to the Crystal Hub owner (@admi111)."
                 + f"\n\n{_quota_status(self.owner_id)}"
             ),
             view=self,
@@ -4231,9 +4202,8 @@ async def on_message(message: discord.Message):
         return
 
     if content.lower().startswith("-massage"):
-        if not message.guild:
-            await message.reply("❌ Use this command inside a server.", mention_author=False)
-            return
+        # Can be used in a server or in a direct message to the bot. User DMs
+        # work by mention or Discord user ID even if the target shares no server.
         if not (is_bot_owner(message.author.id) or str(message.author.id) in admin_redeemed_users or _discord_plan(message.author.id) == "Admin"):
             await message.reply("❌ This command requires internal bot authorization.", mention_author=False)
             return
@@ -4260,9 +4230,12 @@ async def on_message(message: discord.Message):
             except discord.HTTPException as exc:
                 await message.reply(f"❌ Could not DM that user: {type(exc).__name__}. They may have DMs disabled.", mention_author=False)
             return
+        if message.guild is None:
+            await message.reply("❌ User not found. In DMs, use `-massage USER_ID Your message` or a user mention. The target does not need to share a server with the bot.", mention_author=False)
+            return
         target = _parse_massage_target(message.guild, target_token)
         if target is None or not isinstance(target, (discord.TextChannel, discord.Thread)):
-            await message.reply("❌ User/channel not found. Mention a user for DM, or a channel for public messages.", mention_author=False)
+            await message.reply("❌ User/channel not found. Mention a user or use their Discord ID for a DM, or specify a channel for public messages.", mention_author=False)
             return
         perms = target.permissions_for(message.guild.me) if message.guild.me else None
         can_send = bool(perms and (perms.send_messages_in_threads if isinstance(target, discord.Thread) else perms.send_messages))
