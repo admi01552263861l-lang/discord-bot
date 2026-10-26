@@ -2461,7 +2461,7 @@ class SourceObfuscationView(BlacklistAwareView):
             return False
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
-                "❌ Only the person who ran `/source-setup` can choose this option.",
+                "❌ Only the person who ran `/update source` can choose this option.",
                 ephemeral=True,
             )
             return False
@@ -2575,10 +2575,13 @@ class SourceObfuscationView(BlacklistAwareView):
         await self._finish(interaction, False)
 
 
-@bot.tree.command(name="source-setup", description="Attach source file to a script")
+update_group = app_commands.Group(name="update", description="Update Crystal Hub scripts and sources")
+bot.tree.add_command(update_group)
+
+@update_group.command(name="source", description="Attach source file to a script")
 @app_commands.describe(file="Upload the script file", script="Choose the target script")
 @app_commands.autocomplete(script=script_autocomplete)
-async def source_setup_command(interaction: discord.Interaction, file: discord.Attachment, script: str):
+async def update_source_command(interaction: discord.Interaction, file: discord.Attachment, script: str):
     if not _has_server_admin_or_configured_role(interaction):
         await interaction.response.send_message(_server_admin_denial(interaction), ephemeral=True)
         return
@@ -4166,20 +4169,27 @@ async def _crystal_ai_answer(content: str, history=None, memory_text: str = "") 
         f"TRUSTED OWNER MEMORY (read from crystal_ai_memory.md):\n{memory_text or '(no saved memory yet)'}\n\n"
         f"TRUSTED CRYSTAL HUB CONTEXT:\n{context}\n\nRECENT CHANNEL CONVERSATION:\n{history_text or '(no previous conversation)'}\n\nLATEST USER MESSAGE:\n{content[:1500]}"
     )
-    # Use Groq for this server bot; configure its key through the hosting provider's environment.
-    # Do not use Gemini API here because its current additional terms restrict API clients
-    # that are directed toward or likely to be accessed by under-18 users.
-    for provider in (_crystal_call_groq,):
-        if not GROQ_API_KEY:
-            continue
+    # Use the configured live Groq API. Never silently skip the request when the
+    # deployment key is missing; log the exact configuration problem for the owner.
+    if not GROQ_API_KEY:
+        print("Crystal Hub AI is unavailable: GROQ_API_KEY is missing from the hosting environment.")
+        return ""
+    try:
+        answer = await asyncio.to_thread(_crystal_call_groq, prompt)
+        if answer:
+            if answer.strip().upper().strip(" `\n.") in ("NO_KNOWLEDGE", "I DON'T KNOW", "UNKNOWN"):
+                return ""
+            return answer[:1900]
+        print("Crystal Hub AI provider returned an empty response. Check GROQ_MODEL and the Groq API response.")
+    except urllib.error.HTTPError as exc:
+        detail = ""
         try:
-            answer = await asyncio.to_thread(provider, prompt)
-            if answer:
-                if answer.strip().upper().strip(" `\n.") in ("NO_KNOWLEDGE", "I DON'T KNOW", "UNKNOWN"):
-                    return ""
-                return answer[:1900]
-        except Exception as exc:
-            print(f"Crystal Hub AI provider {provider.__name__} failed: {type(exc).__name__}: {exc}")
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        print(f"Crystal Hub Groq HTTP error: status={exc.code}; detail={detail}")
+    except Exception as exc:
+        print(f"Crystal Hub Groq provider failed: {type(exc).__name__}: {exc}")
     return ""
 
 
