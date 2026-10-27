@@ -83,7 +83,7 @@ def _global_admin_status(interaction):
     if not interaction.guild:
         return False, "This command can only be used inside a server."
     if not _global_admin_role_id(interaction.guild.id):
-        return False, "❌ Set the server-wide admin role first with `/set-admin-role`."
+        return False, "❌ Set the server-wide admin role first with `/admin-role`."
     if _has_global_admin_access(interaction):
         return True, ""
     return False, "❌ You need the configured admin role or Discord Administrator permission."
@@ -196,6 +196,12 @@ def save_data():
                 "user_access": {str(k): v for k, v in (s_info.get("user_access") or {}).items()},
                 "created_by": s_info.get("created_by"),
                 "panel_created_by": s_info.get("panel_created_by"),
+                "api_key": s_info.get("api_key", ""),
+                "supabase_user_id": s_info.get("supabase_user_id"),
+                "supabase_row_id": s_info.get("supabase_row_id"),
+                "fast_mode": bool(s_info.get("fast_mode", False)),
+                "obfuscator": bool(s_info.get("obfuscator", False)),
+                "ultra_safe": bool(s_info.get("ultra_safe", False)),
             }
         
         payload = {
@@ -440,7 +446,8 @@ def _hash_redeem_code(code):
 def _verify_supabase_access_token(access_token):
     """Verify identity with Supabase Auth; never trust a user ID sent by the browser."""
     project_url = os.getenv("SUPABASE_URL", "https://qhxlclqcfncgkglwqwpx.supabase.co").rstrip("/")
-    publishable_key = (os.getenv("SUPABASE_PUBLISHABLE_KEY", "") or os.getenv("SUPABASE_KEY", "") or "sb_publishable_GiQrr4SPvTJJtHjjxisC1w_TfFe7vjq").strip()
+    publishable_key = (os.getenv("SUPABASE_KEY", "").strip()
+                       or os.getenv("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_GiQrr4SPvTJJtHjjxisC1w_TfFe7vjq").strip())
     if not publishable_key or not access_token:
         return None
     req = urllib.request.Request(
@@ -456,197 +463,6 @@ def _verify_supabase_access_token(access_token):
     except Exception as exc:
         print(f"Supabase token verification failed: {type(exc).__name__}")
     return None
-
-# ==================== Crystal Hub Supabase bridge ====================
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://qhxlclqcfncgkglwqwpx.supabase.co").strip().rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
-SUPA_PRIVATE = os.getenv("SUPA_PRIVATE", "").strip()
-
-
-def _supabase_request(method, path, payload=None, query=""):
-    key = SUPA_PRIVATE or SUPABASE_KEY
-    if not SUPABASE_URL or not key:
-        return None
-    url = SUPABASE_URL + "/rest/v1/" + path.lstrip("/")
-    if query:
-        url += ("&" if "?" in url else "?") + query.lstrip("?")
-    body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    headers = {
-        "apikey": key,
-        "Authorization": "Bearer " + key,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates,return=representation",
-    }
-    try:
-        req = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
-        with urllib.request.urlopen(req, timeout=12) as response:
-            raw = response.read(4_000_000)
-            if not raw:
-                return []
-            return json.loads(raw.decode("utf-8"))
-    except Exception as exc:
-        print(f"Supabase bridge {method} {path} failed: {type(exc).__name__}: {exc}")
-        return None
-
-
-def _supabase_user_for_discord(discord_user_id):
-    rows = _supabase_request("GET", "crystal_discord_users", query=urllib.parse.urlencode({
-        "discord_user_id": f"eq.{int(discord_user_id)}",
-        "select": "discord_user_id,supabase_user_id,discord_username,api_key,plan",
-        "limit": "1",
-    }))
-    if isinstance(rows, list) and rows:
-        return rows[0]
-    return None
-
-
-def _supabase_script_by_api_key(api_key):
-    rows = _supabase_request("GET", "crystal_scripts", query=urllib.parse.urlencode({
-        "api_key": f"eq.{api_key}",
-        "select": "*",
-        "limit": "1",
-    }))
-    if isinstance(rows, list) and rows:
-        return rows[0]
-    return None
-
-
-def _supabase_script_by_id(script_id):
-    rows = _supabase_request("GET", "crystal_scripts", query=urllib.parse.urlencode({
-        "id": f"eq.{script_id}",
-        "select": "*",
-        "limit": "1",
-    }))
-    if isinstance(rows, list) and rows:
-        return rows[0]
-    return None
-
-
-def _supabase_save_script(row):
-    if not isinstance(row, dict) or not row.get("user_id"):
-        return None
-    clean = {k: row.get(k) for k in (
-        "user_id", "name", "api_key", "script", "source_code", "fast_mode",
-        "obfuscator", "ultra_safe", "discord_user_id", "discord_username", "guild_id", "bot_data"
-    ) if k in row}
-    if not clean.get("name") or not clean.get("source_code"):
-        clean.setdefault("source_code", clean.get("script", "-- Default Script"))
-    existing_id = row.get("id")
-    if existing_id:
-        result = _supabase_request("PATCH", "crystal_scripts", clean, query=urllib.parse.urlencode({"id": f"eq.{existing_id}"}))
-    else:
-        result = _supabase_request("POST", "crystal_scripts", clean)
-    if isinstance(result, list) and result:
-        return result[0]
-    return None
-
-
-def _local_script_from_row(row, fallback_creator=None):
-    if not isinstance(row, dict):
-        return None
-    name = str(row.get("name") or "").strip()[:100]
-    if not name:
-        return None
-    return {
-        "version": str(row.get("bot_data", {}).get("version") if isinstance(row.get("bot_data"), dict) else "1.0.0"),
-        "buyer_role_id": (row.get("bot_data") or {}).get("buyer_role_id") if isinstance(row.get("bot_data"), dict) else None,
-        "admin_role_id": (row.get("bot_data") or {}).get("admin_role_id") if isinstance(row.get("bot_data"), dict) else None,
-        "source_code": row.get("source_code") or row.get("script") or "-- Default Script",
-        "valid_keys": set(), "whitelisted_users": set(), "user_keys": {},
-        "created_by": str(row.get("discord_user_id") or fallback_creator or ""),
-        "api_key": str(row.get("api_key") or ""),
-        "trail_enabled": False, "trail_mode": "PERM", "trail_expires_at": None,
-        "file_id": None, "key_meta": {}, "user_access": {},
-        "supabase_id": row.get("id"), "supabase_user_id": row.get("user_id"),
-        "discord_user_id": row.get("discord_user_id"), "discord_username": row.get("discord_username"),
-        "guild_id": row.get("guild_id"),
-    }
-
-
-def _sync_scripts_from_supabase():
-    rows = _supabase_request("GET", "crystal_scripts", query=urllib.parse.urlencode({
-        "select": "*", "discord_user_id": "not.is.null", "limit": "1000",
-    }))
-    if not isinstance(rows, list):
-        return 0
-    added = 0
-    for row in rows:
-        info = _local_script_from_row(row)
-        if not info:
-            continue
-        name = str(row.get("name"))
-        existing = scripts_data.get(name)
-        if existing and existing.get("source_code") and existing.get("api_key"):
-            continue
-        scripts_data[name] = info
-        added += 1
-    if added:
-        save_data()
-    return added
-
-
-def _discord_id_from_supabase_user(user):
-    if not isinstance(user, dict):
-        return ""
-    meta = user.get("user_metadata") or {}
-    identities = user.get("identities") or []
-    for identity in identities:
-        if identity.get("provider") == "discord":
-            data = identity.get("identity_data") or {}
-            for key in ("provider_id", "id", "sub"):
-                value = str(data.get(key) or "").strip()
-                if value.isdigit():
-                    return value
-    for key in ("provider_id", "discord_id", "discord_user_id"):
-        value = str(meta.get(key) or "").strip()
-        if value.isdigit():
-            return value
-    return ""
-
-
-def _upsert_discord_link(discord_user_id, discord_username, supabase_user_id, api_key=""):
-    if not discord_user_id or not supabase_user_id:
-        return False
-    payload = {
-        "discord_user_id": str(discord_user_id),
-        "discord_username": str(discord_username or "")[:100],
-        "supabase_user_id": str(supabase_user_id),
-        "api_key": str(api_key or "")[:200],
-    }
-    result = _supabase_request("POST", "crystal_discord_users", payload)
-    return isinstance(result, list)
-
-
-def _sync_dashboard_script_payload(payload, discord_user_id, discord_username, guild_id=None):
-    if not isinstance(payload, dict):
-        raise ValueError("Invalid script payload.")
-    name = str(payload.get("name") or "").strip()[:100]
-    source = payload.get("source_code", payload.get("script", ""))
-    if not name or not isinstance(source, str):
-        raise ValueError("Script name and source are required.")
-    auth = _supabase_user_for_discord(discord_user_id)
-    user_id = auth.get("supabase_user_id") if auth else payload.get("user_id")
-    if not user_id:
-        raise ValueError("Your Discord account is not linked to a Crystal Hub dashboard account yet.")
-    row = {
-        "id": payload.get("id"), "user_id": str(user_id), "name": name,
-        "api_key": str(payload.get("api_key") or "CH-" + secrets.token_urlsafe(24)),
-        "script": source, "source_code": source,
-        "fast_mode": bool(payload.get("fast_mode", False)),
-        "obfuscator": bool(payload.get("obfuscator", False)),
-        "ultra_safe": bool(payload.get("ultra_safe", False)),
-        "discord_user_id": str(discord_user_id),
-        "discord_username": str(discord_username or "")[:100],
-        "guild_id": str(guild_id) if guild_id else payload.get("guild_id"),
-        "bot_data": payload.get("bot_data") if isinstance(payload.get("bot_data"), dict) else {},
-    }
-    saved = _supabase_save_script(row)
-    if not saved:
-        raise ValueError("Could not save the script to Supabase.")
-    scripts_data[name] = _local_script_from_row(saved, fallback_creator=discord_user_id)
-    save_data()
-    return saved
 
 
 # Persistent HWID reset cooldown configuration.
@@ -707,6 +523,153 @@ def format_duration(seconds: int) -> str:
     return " ".join(parts)
 
 
+def _supabase_rest(table: str, query: dict = None, method: str = "GET", payload=None, prefer: str = ""):
+    """Server-side Supabase REST helper. The private key is read only from Render env vars."""
+    base = os.getenv("SUPABASE_URL", "https://qhxlclqcfncgkglwqwpx.supabase.co").strip().rstrip("/")
+    secret = (os.getenv("SUPA_PRIVATE", "").strip()
+              or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip())
+    if not base or not secret:
+        raise RuntimeError("Supabase server credentials are missing (SUPABASE_URL / SUPA_PRIVATE).")
+    url = f"{base}/rest/v1/{urllib.parse.quote(table, safe='')}"
+    if query:
+        url += "?" + urllib.parse.urlencode(query, doseq=True)
+    headers = {"apikey": secret, "Authorization": "Bearer " + secret,
+               "Accept": "application/json", "Content-Type": "application/json"}
+    if prefer:
+        headers["Prefer"] = prefer
+    data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=12) as response:
+            raw = response.read(2_000_000)
+            if not raw:
+                return []
+            parsed = json.loads(raw.decode("utf-8"))
+            return parsed if isinstance(parsed, list) else [parsed] if isinstance(parsed, dict) else []
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1200).decode("utf-8", "replace")
+        raise RuntimeError(f"Supabase {table} returned HTTP {exc.code}: {detail}") from exc
+
+
+def _load_script_from_supabase_api_key(api_key: str) -> dict:
+    key = str(api_key or "").strip()
+    if not key:
+        raise ValueError("Enter a Crystal Hub API key or a full script API URL.")
+    try:
+        rows = _supabase_rest("crystal_scripts", {
+            "select": "id,name,api_key,source_code,script,user_id,discord_user_id,discord_username,version,buyer_role_id,admin_role_id,fast_mode,obfuscator,ultra_safe,bot_data",
+            "api_key": "eq." + key, "limit": "1"
+        })
+    except RuntimeError as exc:
+        raise ValueError("Could not look up that API key in Supabase. Check SUPA_PRIVATE and the crystal_scripts table.") from exc
+    if not rows:
+        # A bot-generated key can be imported from the local database as a fallback.
+        for local_name, info in scripts_data.items():
+            if secrets.compare_digest(str(info.get("api_key", "")), key):
+                return {"name": local_name, "source_code": info.get("source_code", "-- Default Script"),
+                        "version": info.get("version", "1.0.0"), "buyer_role_id": info.get("buyer_role_id"),
+                        "admin_role_id": info.get("admin_role_id"), "_api_key": key,
+                        "_supabase_user_id": info.get("supabase_user_id"), "_supabase_row_id": info.get("supabase_row_id")}
+        raise ValueError("API key not found. Paste the exact API Key shown on your Dashboard.")
+    row = rows[0]
+    source = row.get("source_code") or row.get("script") or "-- Default Script"
+    return {"name": row.get("name", "Imported Script"), "source_code": source,
+            "version": row.get("version", "1.0.0"), "buyer_role_id": row.get("buyer_role_id"),
+            "admin_role_id": row.get("admin_role_id"), "_api_key": key,
+            "_supabase_user_id": row.get("user_id"), "_supabase_row_id": row.get("id"),
+            "_discord_user_id": row.get("discord_user_id")}
+
+
+def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str, discord_username: str, guild_id=None):
+    """Push bot-created/updated scripts into the dashboard table when the account is linked."""
+    try:
+        user_id = info.get("supabase_user_id")
+        if not user_id:
+            linked = _supabase_rest("crystal_discord_users", {
+                "select": "supabase_user_id", "discord_user_id": "eq." + str(discord_user_id), "limit": "1"
+            })
+            user_id = linked[0].get("supabase_user_id") if linked else None
+        if not user_id:
+            print(f"Crystal sync: Discord user {discord_user_id} is not linked to a Supabase account; script kept locally.")
+            return False
+        info["supabase_user_id"] = str(user_id)
+        # Persist the Discord <-> Supabase identity bridge so future dashboard scripts sync too.
+        try:
+            _supabase_rest("crystal_discord_users", {}, "POST", {
+                "discord_user_id": str(discord_user_id), "discord_username": str(discord_username)[:100],
+                "supabase_user_id": str(user_id), "api_key": info.get("api_key", ""),
+                "plan": "Free", "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }, "resolution=merge-duplicates,return=minimal")
+        except Exception as link_exc:
+            print(f"Crystal identity-link upsert warning for {discord_user_id}: {type(link_exc).__name__}: {link_exc}")
+        row = {"user_id": str(user_id), "name": script_name, "api_key": info.get("api_key", ""),
+               "script": info.get("source_code", ""), "source_code": info.get("source_code", ""),
+               "fast_mode": bool(info.get("fast_mode", False)), "obfuscator": bool(info.get("obfuscator", False)),
+               "ultra_safe": bool(info.get("ultra_safe", False)), "discord_user_id": str(discord_user_id),
+               "discord_username": str(discord_username)[:100], "guild_id": str(guild_id) if guild_id else None,
+               "bot_data": {"version": info.get("version", "1.0.0"), "buyer_role_id": info.get("buyer_role_id"),
+                            "admin_role_id": info.get("admin_role_id"), "created_by": str(discord_user_id)}}
+        row_id = info.get("supabase_row_id")
+        if row_id:
+            updated = _supabase_rest("crystal_scripts", {"id": "eq." + str(row_id)}, "PATCH", row, "return=representation")
+            if updated:
+                return True
+        existing = _supabase_rest("crystal_scripts", {"select": "id", "api_key": "eq." + str(row["api_key"]), "limit": "1"}) if row["api_key"] else []
+        if existing:
+            updated = _supabase_rest("crystal_scripts", {"id": "eq." + str(existing[0]["id"])}, "PATCH", row, "return=representation")
+            if updated:
+                info["supabase_row_id"] = updated[0].get("id")
+                return True
+        inserted = _supabase_rest("crystal_scripts", {}, "POST", row, "return=representation")
+        if inserted:
+            info["supabase_row_id"] = inserted[0].get("id")
+        return bool(inserted)
+    except Exception as exc:
+        print(f"Crystal sync to Supabase failed for {script_name}: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _sync_dashboard_scripts_from_supabase():
+    """Import dashboard scripts whose Supabase account is linked to a Discord user."""
+    try:
+        links = _supabase_rest("crystal_discord_users", {"select": "discord_user_id,supabase_user_id"})
+        user_map = {str(x.get("supabase_user_id")): str(x.get("discord_user_id"))
+                    for x in links if x.get("supabase_user_id") and x.get("discord_user_id")}
+        rows = _supabase_rest("crystal_scripts", {
+            "select": "id,user_id,name,api_key,source_code,script,discord_user_id,version,bot_data,buyer_role_id,admin_role_id,fast_mode,obfuscator,ultra_safe"
+        })
+        count = 0
+        for row in rows:
+            owner = str(row.get("discord_user_id") or user_map.get(str(row.get("user_id")), ""))
+            name = str(row.get("name") or "").strip()
+            if not owner or not name:
+                continue
+            info = scripts_data.get(name, {})
+            # Do not overwrite a same-name script owned by another Discord user.
+            if info and str(info.get("created_by", "")) not in ("", owner):
+                continue
+            bot_data = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
+            info.update({"version": row.get("version") or bot_data.get("version", "1.0.0"),
+                         "source_code": row.get("source_code") or row.get("script") or "-- Default Script",
+                         "buyer_role_id": row.get("buyer_role_id", bot_data.get("buyer_role_id")),
+                         "admin_role_id": row.get("admin_role_id", bot_data.get("admin_role_id")),
+                         "valid_keys": info.get("valid_keys", set()), "whitelisted_users": info.get("whitelisted_users", set()),
+                         "user_keys": info.get("user_keys", {}), "created_by": owner, "api_key": row.get("api_key", ""),
+                         "supabase_user_id": str(row.get("user_id") or ""), "supabase_row_id": row.get("id"),
+                         "fast_mode": bool(row.get("fast_mode", False)), "obfuscator": bool(row.get("obfuscator", False)),
+                         "ultra_safe": bool(row.get("ultra_safe", False)), "trail_enabled": info.get("trail_enabled", False),
+                         "trail_mode": info.get("trail_mode", "PERM"), "trail_expires_at": info.get("trail_expires_at"),
+                         "file_id": info.get("file_id"), "key_meta": info.get("key_meta", {}), "user_access": info.get("user_access", {})})
+            scripts_data[name] = info
+            count += 1
+        if count:
+            save_data()
+        print(f"Crystal sync: imported {count} linked dashboard scripts.")
+        return count
+    except Exception as exc:
+        print(f"Crystal sync from Supabase failed: {type(exc).__name__}: {exc}")
+        return 0
+
 def _script_api_key_valid(query_key: str) -> bool:
     expected = os.getenv("SCRIPT_API_KEY", "").strip()
     if not expected:
@@ -726,39 +689,11 @@ def _script_record_payload(script_name: str, s_info: dict) -> dict:
     }
 
 def _load_script_from_api_url(api_url: str) -> dict:
-    """Load a Dashboard script by CH- API key, or fetch a full HTTP(S) API URL."""
-    supplied = (api_url or "").strip()
-    # Dashboard API keys are identifiers, not URLs. Look them up in Supabase.
-    if supplied.upper().startswith("CH-"):
-        row = _supabase_script_by_api_key(supplied)
-        if not row:
-            # Fallback to scripts already loaded from the bot's persistent data.
-            for local_name, local_info in scripts_data.items():
-                if secrets.compare_digest(str(local_info.get("api_key") or ""), supplied):
-                    return {
-                        "name": local_name,
-                        "version": str(local_info.get("version") or "1.0.0"),
-                        "source_code": str(local_info.get("source_code") or ""),
-                        "buyer_role_id": local_info.get("buyer_role_id"),
-                        "admin_role_id": local_info.get("admin_role_id"),
-                        "api_key": supplied,
-                    }
-            raise ValueError("API key not found in Supabase or this bot. Check that the Dashboard script was saved and SUPA_PRIVATE is set on Render.")
-        bot_data = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
-        return {
-            "name": str(row.get("name") or "").strip(),
-            "version": str(bot_data.get("version") or "1.0.0"),
-            "source_code": str(row.get("source_code") or row.get("script") or ""),
-            "buyer_role_id": bot_data.get("buyer_role_id"),
-            "admin_role_id": bot_data.get("admin_role_id"),
-            "api_key": str(row.get("api_key") or supplied),
-            "supabase_id": row.get("id"),
-            "supabase_user_id": row.get("user_id"),
-            "discord_user_id": row.get("discord_user_id"),
-        }
-    parsed = urllib.parse.urlparse(supplied)
+    """Accept either a Crystal Hub API key or a full API URL."""
+    raw_value = (api_url or "").strip()
+    parsed = urllib.parse.urlparse(raw_value)
     if parsed.scheme not in ("https", "http") or not parsed.netloc:
-        raise ValueError("Invalid API URL.")
+        return _load_script_from_supabase_api_key(raw_value)
 
     allowed_hosts = []
     for raw in (
@@ -2254,6 +2189,7 @@ async def on_ready():
         print(f"Error syncing global slash commands: {type(e).__name__}: {e}")
 
     print(f"Bot connected successfully as: {bot.user}")
+    await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
     if not getattr(bot, "_crystal_panels_refreshed_this_process", False):
         bot._crystal_panels_refreshed_this_process = True
         await _refresh_saved_panels_after_startup()
@@ -2457,7 +2393,7 @@ async def trail_command(
 @app_commands.describe(
     name_script="Required: the name to use for this script",
     buyer_role="Select buyer role (optional when API is provided)",
-    api="Optional Crystal Hub script API URL. The imported source uses the name you enter."
+    api="Paste a Crystal Hub API key (CH-...) or a full script API URL."
 )
 async def create_script_command(
     interaction: discord.Interaction,
@@ -2488,10 +2424,7 @@ async def create_script_command(
             return
 
     if imported:
-        # A CH-... key identifies an existing Dashboard script. Reuse that record
-        # instead of creating a second website entry.
-        if imported.get("supabase_id"):
-            name_script = imported.get("name") or name_script
+        # Keep the requested name, but clone source/config from the API entry.
         buyer_role_id = imported.get("buyer_role_id")
         admin_role_id = _global_admin_role_id(interaction.guild.id if interaction.guild else None)
         if buyer_role is not None:
@@ -2520,9 +2453,7 @@ async def create_script_command(
         )
         return
 
-    api_key = str(imported.get("api_key") or "") if imported else ""
-    if not api_key:
-        api_key = "CH-" + secrets.token_urlsafe(24)
+    api_key = (imported.get("_api_key") if imported and imported.get("_api_key") else "CH-" + secrets.token_urlsafe(24))
     scripts_data[name_script] = {
         "version": version,
         "buyer_role_id": buyer_role_id,
@@ -2533,6 +2464,8 @@ async def create_script_command(
         "user_keys": {},
         "created_by": str(interaction.user.id),
         "api_key": api_key,
+        "supabase_user_id": (imported or {}).get("_supabase_user_id"),
+        "supabase_row_id": (imported or {}).get("_supabase_row_id"),
         "trail_enabled": False,
         "trail_mode": "PERM",
         "trail_expires_at": None,
@@ -2549,29 +2482,8 @@ async def create_script_command(
         )
         return
 
-    # Mirror every Discord-created script into the signed-in user's Dashboard
-    # when that Discord account has been linked there.
-    try:
-        linked = _supabase_user_for_discord(interaction.user.id)
-        if linked and linked.get("supabase_user_id"):
-            existing_row = _supabase_script_by_id(imported.get("supabase_id")) if imported and imported.get("supabase_id") else None
-            row = {
-                "id": existing_row.get("id") if existing_row else None,
-                "user_id": linked.get("supabase_user_id"),
-                "name": name_script, "api_key": api_key,
-                "script": source_code, "source_code": source_code,
-                "fast_mode": False, "obfuscator": False, "ultra_safe": False,
-                "discord_user_id": str(interaction.user.id),
-                "discord_username": str(interaction.user),
-                "guild_id": str(interaction.guild.id) if interaction.guild else None,
-                "bot_data": {"version": version, "buyer_role_id": buyer_role_id, "admin_role_id": admin_role_id},
-            }
-            saved_row = _supabase_save_script(row)
-            if saved_row:
-                scripts_data[name_script]["supabase_id"] = saved_row.get("id")
-                scripts_data[name_script]["supabase_user_id"] = saved_row.get("user_id")
-    except Exception as exc:
-        print(f"Dashboard script sync failed for /create-script: {type(exc).__name__}: {exc}")
+    _sync_script_to_supabase(name_script, scripts_data[name_script], str(interaction.user.id),
+                             str(interaction.user), interaction.guild.id if interaction.guild else None)
 
     embed = discord.Embed(
         title="✅ Script Registered Successfully!",
@@ -3098,10 +3010,7 @@ async def panel_setup_command(
     )
 
 
-# Removed from slash-command menu as requested; implementation kept for compatibility.
-# @bot.tree.command(name="panel-delete", description="Delete one of your configured panels and free its quota slot")
-@app_commands.describe(script="Script whose panel should be deleted", channel="Channel containing the panel")
-@app_commands.autocomplete(script=script_autocomplete)
+# The old /panel-delete slash command is intentionally unregistered.
 async def panel_delete_command(
     interaction: discord.Interaction,
     script: str,
@@ -3641,7 +3550,7 @@ def _is_server_admin(ctx: commands.Context) -> bool:
 
 def _admin_role_setup_message(ctx: commands.Context) -> str:
     if ctx.guild and not _global_admin_role_id(ctx.guild.id):
-        return "Set the server-wide admin role first using `/set-admin-role`, then try again."
+        return "Set the server-wide admin role first using `/admin-role`, then try again."
     return "This command requires the configured admin role or Discord Administrator permission."
 
 
@@ -4173,8 +4082,8 @@ async def admin_command(interaction: discord.Interaction):
     )
 
 
-@bot.command(name="set-admin-role")
-async def set_admin_role_prefix(ctx: commands.Context, admin_role: discord.Role):
+@bot.command(name="admin-role", aliases=["set-admin-role"])
+async def admin_role_prefix(ctx: commands.Context, admin_role: discord.Role):
     if not ctx.guild or not isinstance(ctx.author, discord.Member) or not ctx.author.guild_permissions.administrator:
         await ctx.reply("❌ Only a Discord server Administrator can configure the global admin role.", mention_author=False)
         return
