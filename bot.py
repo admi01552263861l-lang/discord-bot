@@ -556,12 +556,17 @@ def _load_script_from_supabase_api_key(api_key: str) -> dict:
     if not key:
         raise ValueError("Enter a Crystal Hub API key or a full script API URL.")
     try:
+        # Only select columns present in the shared schema. Version and role IDs
+        # live inside bot_data; selecting them as top-level columns causes HTTP 400
+        # on databases where those optional columns were never created.
         rows = _supabase_rest("crystal_scripts", {
-            "select": "id,name,api_key,source_code,script,user_id,discord_user_id,discord_username,version,buyer_role_id,admin_role_id,fast_mode,obfuscator,ultra_safe,bot_data",
+            "select": "id,name,api_key,source_code,script,user_id,discord_user_id,discord_username,fast_mode,obfuscator,ultra_safe,bot_data",
             "api_key": "eq." + key, "limit": "1"
         })
     except RuntimeError as exc:
-        raise ValueError("Could not look up that API key in Supabase. Check SUPA_PRIVATE and the crystal_scripts table.") from exc
+        # Preserve the actual PostgREST error so Render logs/UI reveal whether the
+        # secret is invalid, a column is missing, or the table/policy is wrong.
+        raise ValueError(f"Supabase API-key lookup failed: {exc}") from exc
     if not rows:
         # A bot-generated key can be imported from the local database as a fallback.
         for local_name, info in scripts_data.items():
@@ -572,10 +577,11 @@ def _load_script_from_supabase_api_key(api_key: str) -> dict:
                         "_supabase_user_id": info.get("supabase_user_id"), "_supabase_row_id": info.get("supabase_row_id")}
         raise ValueError("API key not found. Paste the exact API Key shown on your Dashboard.")
     row = rows[0]
+    bot_data = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
     source = row.get("source_code") or row.get("script") or "-- Default Script"
     return {"name": row.get("name", "Imported Script"), "source_code": source,
-            "version": row.get("version", "1.0.0"), "buyer_role_id": row.get("buyer_role_id"),
-            "admin_role_id": row.get("admin_role_id"), "_api_key": key,
+            "version": bot_data.get("version", "1.0.0"), "buyer_role_id": bot_data.get("buyer_role_id"),
+            "admin_role_id": bot_data.get("admin_role_id"), "_api_key": key,
             "_supabase_user_id": row.get("user_id"), "_supabase_row_id": row.get("id"),
             "_discord_user_id": row.get("discord_user_id")}
 
@@ -636,7 +642,7 @@ def _sync_dashboard_scripts_from_supabase():
         user_map = {str(x.get("supabase_user_id")): str(x.get("discord_user_id"))
                     for x in links if x.get("supabase_user_id") and x.get("discord_user_id")}
         rows = _supabase_rest("crystal_scripts", {
-            "select": "id,user_id,name,api_key,source_code,script,discord_user_id,version,bot_data,buyer_role_id,admin_role_id,fast_mode,obfuscator,ultra_safe"
+            "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data,fast_mode,obfuscator,ultra_safe"
         })
         count = 0
         for row in rows:
@@ -649,10 +655,10 @@ def _sync_dashboard_scripts_from_supabase():
             if info and str(info.get("created_by", "")) not in ("", owner):
                 continue
             bot_data = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
-            info.update({"version": row.get("version") or bot_data.get("version", "1.0.0"),
+            info.update({"version": bot_data.get("version", "1.0.0"),
                          "source_code": row.get("source_code") or row.get("script") or "-- Default Script",
-                         "buyer_role_id": row.get("buyer_role_id", bot_data.get("buyer_role_id")),
-                         "admin_role_id": row.get("admin_role_id", bot_data.get("admin_role_id")),
+                         "buyer_role_id": bot_data.get("buyer_role_id"),
+                         "admin_role_id": bot_data.get("admin_role_id"),
                          "valid_keys": info.get("valid_keys", set()), "whitelisted_users": info.get("whitelisted_users", set()),
                          "user_keys": info.get("user_keys", {}), "created_by": owner, "api_key": row.get("api_key", ""),
                          "supabase_user_id": str(row.get("user_id") or ""), "supabase_row_id": row.get("id"),
