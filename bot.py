@@ -726,8 +726,37 @@ def _script_record_payload(script_name: str, s_info: dict) -> dict:
     }
 
 def _load_script_from_api_url(api_url: str) -> dict:
-    """Fetch a Crystal Hub script API payload for /create-script."""
-    parsed = urllib.parse.urlparse(api_url.strip())
+    """Load a Dashboard script by CH- API key, or fetch a full HTTP(S) API URL."""
+    supplied = (api_url or "").strip()
+    # Dashboard API keys are identifiers, not URLs. Look them up in Supabase.
+    if supplied.upper().startswith("CH-"):
+        row = _supabase_script_by_api_key(supplied)
+        if not row:
+            # Fallback to scripts already loaded from the bot's persistent data.
+            for local_name, local_info in scripts_data.items():
+                if secrets.compare_digest(str(local_info.get("api_key") or ""), supplied):
+                    return {
+                        "name": local_name,
+                        "version": str(local_info.get("version") or "1.0.0"),
+                        "source_code": str(local_info.get("source_code") or ""),
+                        "buyer_role_id": local_info.get("buyer_role_id"),
+                        "admin_role_id": local_info.get("admin_role_id"),
+                        "api_key": supplied,
+                    }
+            raise ValueError("API key not found in Supabase or this bot. Check that the Dashboard script was saved and SUPA_PRIVATE is set on Render.")
+        bot_data = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
+        return {
+            "name": str(row.get("name") or "").strip(),
+            "version": str(bot_data.get("version") or "1.0.0"),
+            "source_code": str(row.get("source_code") or row.get("script") or ""),
+            "buyer_role_id": bot_data.get("buyer_role_id"),
+            "admin_role_id": bot_data.get("admin_role_id"),
+            "api_key": str(row.get("api_key") or supplied),
+            "supabase_id": row.get("id"),
+            "supabase_user_id": row.get("user_id"),
+            "discord_user_id": row.get("discord_user_id"),
+        }
+    parsed = urllib.parse.urlparse(supplied)
     if parsed.scheme not in ("https", "http") or not parsed.netloc:
         raise ValueError("Invalid API URL.")
 
@@ -2781,7 +2810,7 @@ async def set_buyer_role_command(interaction: discord.Interaction, script: str, 
 
 # Server-wide admin role — applies to bot management actions, not to subscription quotas.
 # Prefix-only admin command: -set-admin-role @role
-# @bot.tree.command(name="set-admin-role", description="Set the server-wide role allowed to manage Crystal Hub")
+@bot.tree.command(name="admin-role", description="Set the server-wide role allowed to manage Crystal Hub")
 @app_commands.describe(admin_role="The role allowed to manage scripts and bot settings")
 async def set_admin_role_command(interaction: discord.Interaction, admin_role: discord.Role):
     if not interaction.guild or not is_guild_administrator(interaction):
@@ -3069,7 +3098,8 @@ async def panel_setup_command(
     )
 
 
-@bot.tree.command(name="panel-delete", description="Delete one of your configured panels and free its quota slot")
+# Removed from slash-command menu as requested; implementation kept for compatibility.
+# @bot.tree.command(name="panel-delete", description="Delete one of your configured panels and free its quota slot")
 @app_commands.describe(script="Script whose panel should be deleted", channel="Channel containing the panel")
 @app_commands.autocomplete(script=script_autocomplete)
 async def panel_delete_command(
