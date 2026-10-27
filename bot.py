@@ -154,6 +154,13 @@ def load_data():
                     s_info.setdefault("source_obfuscated", False)
                     s_info.setdefault("key_meta", {})
                     s_info.setdefault("user_access", {})
+                    s_info.setdefault("loader_code", None)
+                    s_info.setdefault("access_mode", "free")
+                    s_info.setdefault("disabled", False)
+                    s_info.setdefault("webhook_url", "")
+                    s_info.setdefault("settings", {})
+                    s_info.setdefault("source_name", None)
+                    s_info.setdefault("source_path", None)
                     # Normalize access maps
                     if not isinstance(s_info.get("key_meta"), dict):
                         s_info["key_meta"] = {}
@@ -202,6 +209,13 @@ def save_data():
                 "fast_mode": bool(s_info.get("fast_mode", False)),
                 "obfuscator": bool(s_info.get("obfuscator", False)),
                 "ultra_safe": bool(s_info.get("ultra_safe", False)),
+                "loader_code": s_info.get("loader_code"),
+                "access_mode": s_info.get("access_mode", "free"),
+                "disabled": bool(s_info.get("disabled", False)),
+                "webhook_url": s_info.get("webhook_url", ""),
+                "settings": s_info.get("settings", {}) if isinstance(s_info.get("settings", {}), dict) else {},
+                "source_name": s_info.get("source_name"),
+                "source_path": s_info.get("source_path"),
             }
         
         payload = {
@@ -438,6 +452,13 @@ def _make_discord_plan_code(plan, days, custom_code=None):
         "redeemed_by": None, "redeemed_at": None
     }
     _save_json_dict(DISCORD_PLAN_CODES_FILE, discord_plan_codes)
+    try:
+        _supabase_rest("crystal_redeem_codes", {}, "POST", {
+            "code_hash": code_hash, "plan": plan, "duration_days": int(days),
+            "created_by": "discord-owner", "created_at": _iso_now(), "revoked": False
+        }, "resolution=merge-duplicates,return=minimal")
+    except Exception as exc:
+        print(f"Crystal redeem-code Supabase sync warning: {type(exc).__name__}")
     return raw
 
 def _hash_redeem_code(code):
@@ -551,6 +572,69 @@ def _supabase_rest(table: str, query: dict = None, method: str = "GET", payload=
         raise RuntimeError(f"Supabase {table} returned HTTP {exc.code}: {detail}") from exc
 
 
+def _supabase_upsert_subscription(user_id, plan, expires_at=None, source="dashboard", redeem_code_id=None):
+    if not user_id:
+        return False
+    row = {
+        "user_id": str(user_id),
+        "plan": str(plan),
+        "expires_at": expires_at,
+        "source": str(source)[:120],
+        "redeem_code_id": redeem_code_id,
+        "updated_at": _iso_now(),
+    }
+    try:
+        _supabase_rest("crystal_subscriptions", {}, "POST", row, "resolution=merge-duplicates,return=minimal")
+        return True
+    except Exception as exc:
+        print(f"Crystal subscription sync failed: {type(exc).__name__}: {exc}")
+        return False
+
+def _send_script_webhook(s_info, event_type, *, username="", discord_user_id="", key="", device="", country="", duration="", extra=None):
+    url = str(s_info.get("webhook_url") or "").strip()
+    if not url or not url.startswith(("https://", "http://")):
+        return False
+    payload = {
+        "username": "Crystal Hub",
+        "embeds": [{
+            "title": f"Crystal Hub — {event_type}",
+            "color": 0x5865F2,
+            "fields": [
+                {"name": "User", "value": str(username or "Unknown")[:1024], "inline": True},
+                {"name": "Discord ID", "value": str(discord_user_id or "Unknown")[:1024], "inline": True},
+                {"name": "Script", "value": str(s_info.get("name") or "Unknown")[:1024], "inline": True},
+                {"name": "Key", "value": str(key or "Unknown")[:1024], "inline": True},
+                {"name": "Device", "value": str(device or "Unknown")[:1024], "inline": True},
+                {"name": "Country", "value": str(country or "Unknown")[:1024], "inline": True},
+                {"name": "Key type", "value": str((s_info.get("key_meta") or {}).get(key, {}).get("mode") or "Unknown")[:1024], "inline": True},
+                {"name": "Duration", "value": str(duration or "Unknown")[:1024], "inline": True},
+                {"name": "Access", "value": str(s_info.get("access_mode") or "free").upper()[:1024], "inline": True},
+                {"name": "Expiration", "value": str(((s_info.get("key_meta") or {}).get(key, {}) or {}).get("expires_at") or "Lifetime")[:1024], "inline": True},
+            ],
+            "footer": {"text": "Crystal Hub"}
+        }]
+    }
+    if isinstance(extra, dict):
+        payload["embeds"][0]["fields"].extend({"name": str(k)[:256], "value": str(v)[:1024], "inline": True} for k,v in extra.items())
+    try:
+        req=urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type":"application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=8) as response:
+            response.read(256)
+        return True
+    except Exception as exc:
+        print(f"Crystal webhook failed: {type(exc).__name__}")
+        return False
+
+def _persist_script_row(row_id, patch):
+    if not row_id:
+        return False
+    try:
+        _supabase_rest("crystal_scripts", {"id": "eq." + str(row_id)}, "PATCH", patch, "return=minimal")
+        return True
+    except Exception as exc:
+        print(f"Crystal script persistence failed: {type(exc).__name__}: {exc}")
+        return False
+
 def _load_script_from_supabase_api_key(api_key: str) -> dict:
     key = str(api_key or "").strip()
     if not key:
@@ -560,7 +644,7 @@ def _load_script_from_supabase_api_key(api_key: str) -> dict:
         # live inside bot_data; selecting them as top-level columns causes HTTP 400
         # on databases where those optional columns were never created.
         rows = _supabase_rest("crystal_scripts", {
-            "select": "id,name,api_key,source_code,script,user_id,discord_user_id,discord_username,fast_mode,obfuscator,ultra_safe,bot_data",
+            "select": "id,name,api_key,source_code,script,user_id,discord_user_id,discord_username,fast_mode,obfuscator,ultra_safe,bot_data,loader_code,access_mode,disabled,webhook_url,settings,key_meta,user_access,source_name,source_path",
             "api_key": "eq." + key, "limit": "1"
         })
     except RuntimeError as exc:
@@ -583,7 +667,13 @@ def _load_script_from_supabase_api_key(api_key: str) -> dict:
             "version": bot_data.get("version", "1.0.0"), "buyer_role_id": bot_data.get("buyer_role_id"),
             "admin_role_id": bot_data.get("admin_role_id"), "_api_key": key,
             "_supabase_user_id": row.get("user_id"), "_supabase_row_id": row.get("id"),
-            "_discord_user_id": row.get("discord_user_id")}
+            "_discord_user_id": row.get("discord_user_id"),
+            "loader_code": row.get("loader_code"), "access_mode": row.get("access_mode", "free"),
+            "disabled": bool(row.get("disabled", False)), "webhook_url": row.get("webhook_url") or "",
+            "settings": row.get("settings") if isinstance(row.get("settings"), dict) else {},
+            "key_meta": row.get("key_meta") if isinstance(row.get("key_meta"), dict) else {},
+            "user_access": row.get("user_access") if isinstance(row.get("user_access"), dict) else {},
+            "source_name": row.get("source_name"), "source_path": row.get("source_path")}
 
 
 def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str, discord_username: str, guild_id=None):
@@ -613,8 +703,18 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
                "fast_mode": bool(info.get("fast_mode", False)), "obfuscator": bool(info.get("obfuscator", False)),
                "ultra_safe": bool(info.get("ultra_safe", False)), "discord_user_id": str(discord_user_id),
                "discord_username": str(discord_username)[:100], "guild_id": str(guild_id) if guild_id else None,
+               "loader_code": info.get("loader_code") or info.get("file_id") or secrets.token_urlsafe(12).replace("-", "").replace("_", ""),
+               "access_mode": info.get("access_mode", "free"), "disabled": bool(info.get("disabled", False)),
+               "webhook_url": str(info.get("webhook_url") or "")[:2000],
+               "settings": info.get("settings", {}) if isinstance(info.get("settings", {}), dict) else {},
+               "key_meta": info.get("key_meta", {}) if isinstance(info.get("key_meta", {}), dict) else {},
+               "user_access": {str(k): v for k,v in (info.get("user_access") or {}).items()},
+               "source_name": info.get("source_name"), "source_path": info.get("source_path"),
                "bot_data": {"version": info.get("version", "1.0.0"), "buyer_role_id": info.get("buyer_role_id"),
                             "admin_role_id": info.get("admin_role_id"), "created_by": str(discord_user_id)}}
+        info["loader_code"] = str(row.get("loader_code") or info.get("file_id") or secrets.token_urlsafe(12).replace("-", "").replace("_", ""))
+        info["file_id"] = info["loader_code"]
+        row["loader_code"] = info["loader_code"]
         row_id = info.get("supabase_row_id")
         if row_id:
             updated = _supabase_rest("crystal_scripts", {"id": "eq." + str(row_id)}, "PATCH", row, "return=representation")
@@ -642,7 +742,7 @@ def _sync_dashboard_scripts_from_supabase():
         user_map = {str(x.get("supabase_user_id")): str(x.get("discord_user_id"))
                     for x in links if x.get("supabase_user_id") and x.get("discord_user_id")}
         rows = _supabase_rest("crystal_scripts", {
-            "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data,fast_mode,obfuscator,ultra_safe"
+            "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data,fast_mode,obfuscator,ultra_safe,loader_code,access_mode,disabled,webhook_url,settings,key_meta,user_access,source_name,source_path"
         })
         count = 0
         for row in rows:
@@ -665,7 +765,14 @@ def _sync_dashboard_scripts_from_supabase():
                          "fast_mode": bool(row.get("fast_mode", False)), "obfuscator": bool(row.get("obfuscator", False)),
                          "ultra_safe": bool(row.get("ultra_safe", False)), "trail_enabled": info.get("trail_enabled", False),
                          "trail_mode": info.get("trail_mode", "PERM"), "trail_expires_at": info.get("trail_expires_at"),
-                         "file_id": info.get("file_id"), "key_meta": info.get("key_meta", {}), "user_access": info.get("user_access", {})})
+                         "file_id": row.get("loader_code") or info.get("file_id"),
+                         "loader_code": row.get("loader_code") or info.get("file_id"),
+                         "access_mode": row.get("access_mode", "free"), "disabled": bool(row.get("disabled", False)),
+                         "webhook_url": row.get("webhook_url") or "",
+                         "settings": row.get("settings") if isinstance(row.get("settings"), dict) else {},
+                         "key_meta": row.get("key_meta") if isinstance(row.get("key_meta"), dict) else info.get("key_meta", {}),
+                         "user_access": row.get("user_access") if isinstance(row.get("user_access"), dict) else info.get("user_access", {}),
+                         "source_name": row.get("source_name"), "source_path": row.get("source_path")})
             scripts_data[name] = info
             count += 1
         if count:
@@ -919,6 +1026,36 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         if not user:
             self._send_text(401, json.dumps({"error": "Your session could not be verified. Sign in again."})); return
         key = _hash_redeem_code(code)
+        # The hidden Admin code is intentionally not stored in the database.
+        if hmac.compare_digest(code, ADMIN_REDEEM_CODE):
+            now_iso = _iso_now()
+            _supabase_upsert_subscription(user["id"], "Admin", None, "admin-code")
+            self._send_text(200, json.dumps({"ok": True, "plan": "Admin", "duration": "Lifetime", "expiresAt": None})); return
+
+        try:
+            rows = _supabase_rest("crystal_redeem_codes", {"select": "id,plan,duration_days,redeemed_by,redeemed_at,revoked", "code_hash": "eq." + key, "limit": "1"})
+        except Exception as exc:
+            print(f"Crystal redeem DB lookup failed: {type(exc).__name__}")
+            rows = []
+        record = rows[0] if rows else None
+        if record and record.get("revoked"):
+            record = None
+        if record and record.get("redeemed_by"):
+            self._send_text(409, json.dumps({"error": "This code has already been used."})); return
+
+        if record:
+            plan = str(record.get("plan", "Premium"))
+            days = int(record.get("duration_days") or 0)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            expires_at = None if days <= 0 else (now + datetime.timedelta(days=days)).isoformat()
+            try:
+                _supabase_rest("crystal_redeem_codes", {"id": "eq." + str(record["id"])}, "PATCH", {"redeemed_by": user["id"], "redeemed_at": now.isoformat()}, "return=minimal")
+                _supabase_upsert_subscription(user["id"], plan, expires_at, "redeem", record["id"])
+                self._send_text(200, json.dumps({"ok": True, "plan": plan, "duration": "Lifetime" if days <= 0 else f"{days} days", "expiresAt": expires_at})); return
+            except Exception as exc:
+                self._send_text(500, json.dumps({"error": "Server could not save redemption. Try again later."})); return
+
+        # Legacy fallback for codes created before the Supabase migration.
         record = site_redeem_codes.get(key)
         if not record or record.get("revoked"):
             self._send_text(404, json.dumps({"error": "Invalid or expired redeem code."})); return
@@ -929,15 +1066,12 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             self._send_text(403, json.dumps({"error": "This code does not grant a customer subscription."})); return
         days = int(record.get("duration_days", 30))
         expires_at = None if days <= 0 else (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)).isoformat()
-        entitlement = {"plan": plan, "redeemed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "expires_at": expires_at, "code_hash": key}
-        # Save entitlement and code use together as separate atomic file updates.
         old_code = dict(record)
-        record["redeemed_by"] = user["id"]
-        record["redeemed_at"] = entitlement["redeemed_at"]
-        site_entitlements[user["id"]] = entitlement
+        record["redeemed_by"] = user["id"]; record["redeemed_at"] = _iso_now()
+        site_entitlements[user["id"]] = {"plan": plan, "redeemed_at": _iso_now(), "expires_at": expires_at, "code_hash": key}
         try:
-            _save_json_dict(SITE_CODES_FILE, site_redeem_codes)
-            _save_json_dict(SITE_ENTITLEMENTS_FILE, site_entitlements)
+            _save_json_dict(SITE_CODES_FILE, site_redeem_codes); _save_json_dict(SITE_ENTITLEMENTS_FILE, site_entitlements)
+            _supabase_upsert_subscription(user["id"], plan, expires_at, "legacy-redeem")
         except OSError:
             site_redeem_codes[key] = old_code
             self._send_text(500, json.dumps({"error": "Server could not save redemption. Try again later."})); return
@@ -974,6 +1108,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             user_key = str(payload.get("key", ""))[:200]
             reported_hwid = str(payload.get("hwid", ""))[:300]
             reported_device = str(payload.get("device", "PC")).strip()[:20] or "PC"
+            reported_country = str(payload.get("country", "Unknown")).strip()[:80] or "Unknown"
             if reported_device.lower() not in ("mobile", "pc"):
                 reported_device = "PC"
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
@@ -1016,6 +1151,9 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
 
         if parsed_path.path == "/script-source":
             # Deliver source only after key and saved device binding pass.
+            meta = (s_info.get("key_meta") or {}).get(user_key, {})
+            _send_script_webhook(s_info, "Key Used", username="", discord_user_id=str(meta.get("discord_user_id") or ""), key=user_key, device=reported_device, country=reported_country, duration=format_remaining(meta.get("expires_at")))
+            _persist_script_row(s_info.get("supabase_row_id"), {"key_meta": s_info.get("key_meta", {}), "updated_at": _iso_now()})
             self._send_text(200, s_info.get("source_code", "-- No source code loaded"))
         else:
             self._send_text(200, "ok")
@@ -1024,12 +1162,13 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         parsed_path = urllib.parse.urlparse(self.path)
         path_parts = parsed_path.path.strip("/").split("/")
 
-        # Unique file IDs: /files/v4/lua/<file_id> (same protection model as /script/<name>)
-        if len(path_parts) >= 4 and path_parts[0] == "files" and path_parts[1] == "v4" and path_parts[2] == "lua":
-            file_id = path_parts[3].strip()
+        # Unique loader IDs: /files/v4/lua/<loader_code> and /files/v4/<loader_code>.
+        if ((len(path_parts) >= 4 and path_parts[0] == "files" and path_parts[1] == "v4" and path_parts[2] == "lua")
+                or (len(path_parts) >= 3 and path_parts[0] == "files" and path_parts[1] == "v4")):
+            file_id = path_parts[3].strip() if len(path_parts) >= 4 and path_parts[2] == "lua" else path_parts[2].strip()
             script_name = None
             for name, info in scripts_data.items():
-                if str(info.get("file_id") or "") == file_id:
+                if str(info.get("file_id") or "") == file_id or str(info.get("loader_code") or "") == file_id:
                     script_name = name
                     break
             if not script_name:
@@ -1091,6 +1230,9 @@ p{margin:0;color:#2b1010;font-size:clamp(15px,2.5vw,22px);font-weight:700}
             script_name = urllib.parse.unquote(path_parts[1])
             if script_name not in scripts_data:
                 self._send_text(404, "Script not found or deleted.")
+                return
+            if bool(scripts_data[script_name].get("disabled", False)):
+                self._send_text(403, "The script has been disabled by its owner.")
                 return
 
             app_url = os.getenv("RENDER_EXTERNAL_URL", "https://discord-bot-3u9m.onrender.com").rstrip("/")
@@ -1464,10 +1606,12 @@ def key_is_usable(s_info: dict, key: str) -> tuple:
     key = str(key or "")
     if not key:
         return False, "Key is empty."
+    if bool(s_info.get("disabled", False)):
+        return False, "The script has been disabled by its owner."
     meta = (s_info.get("key_meta") or {}).get(key, {})
     if meta.get("disabled"):
         return False, "This key has been disabled."
-    if key not in s_info.get("valid_keys", set()) and key not in set((s_info.get("user_keys") or {}).values()):
+    if key not in s_info.get("valid_keys", set()) and key not in set((s_info.get("user_keys") or {}).values()) and key not in (s_info.get("key_meta") or {}):
         return False, "Key is not valid for this script."
     if (meta.get("mode") or "PERM").upper() == "TIME" and is_expired(meta.get("expires_at")):
         return False, "This key has expired."
@@ -2073,6 +2217,7 @@ class PanelControlView(BlacklistAwareView):
         save_hwid_bindings()
         security_state.setdefault("reset_hwid_last_used", {})[cooldown_key] = now
         save_security_state()
+        _send_script_webhook(s_info, "HWID Reset", username=getattr(interaction.user, "name", ""), discord_user_id=str(interaction.user.id), key=user_key, device="Unknown", duration=format_remaining((s_info.get("key_meta") or {}).get(user_key, {}).get("expires_at")))
         await interaction.response.send_message("✅ HWID reset successfully.", ephemeral=True)
 
     @discord.ui.button(label="🔑 Redeem Key", style=discord.ButtonStyle.success, row=0)
@@ -3347,6 +3492,7 @@ def _restore_settings_backup(snapshot, backup_type, guild_id=None):
         save_admin_redeems()
         _save_json_dict(DISCORD_PLAN_CODES_FILE, discord_plan_codes)
         _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
+        _supabase_upsert_subscription(str(interaction.user.id), plan, expires_at, "discord-redeem", None)
 
     save_data()
 
