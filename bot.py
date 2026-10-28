@@ -22,7 +22,7 @@ import aiohttp
 import discord
 from discord import app_commands
 from discord.http import Route
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # Render keeps only files under a mounted persistent disk. Set
 # CRYSTAL_HUB_DATA_DIR=/var/data on Render after attaching that disk.
@@ -644,7 +644,7 @@ def _load_script_from_supabase_api_key(api_key: str) -> dict:
         # live inside bot_data; selecting them as top-level columns causes HTTP 400
         # on databases where those optional columns were never created.
         rows = _supabase_rest("crystal_scripts", {
-            "select": "id,name,api_key,source_code,script,user_id,discord_user_id,discord_username,fast_mode,obfuscator,ultra_safe,bot_data,loader_code,access_mode,disabled,webhook_url,settings,key_meta,user_access,source_name,source_path",
+            "select": "id,name,api_key,source_code,script,user_id,discord_user_id,discord_username,fast_mode,obfuscator,ultra_safe,bot_data,loader_code,access_mode,disabled,webhook_url,settings,key_meta,source_name,source_path",
             "api_key": "eq." + key, "limit": "1"
         })
     except RuntimeError as exc:
@@ -663,16 +663,20 @@ def _load_script_from_supabase_api_key(api_key: str) -> dict:
     row = rows[0]
     bot_data = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
     source = row.get("source_code") or row.get("script") or "-- Default Script"
+    access_mode = str(row.get("access_mode") or "free").lower()
     return {"name": row.get("name", "Imported Script"), "source_code": source,
             "version": bot_data.get("version", "1.0.0"), "buyer_role_id": bot_data.get("buyer_role_id"),
             "admin_role_id": bot_data.get("admin_role_id"), "_api_key": key,
             "_supabase_user_id": row.get("user_id"), "_supabase_row_id": row.get("id"),
             "_discord_user_id": row.get("discord_user_id"),
-            "loader_code": row.get("loader_code"), "access_mode": row.get("access_mode", "free"),
+            "loader_code": row.get("loader_code"), "access_mode": access_mode,
             "disabled": bool(row.get("disabled", False)), "webhook_url": row.get("webhook_url") or "",
             "settings": row.get("settings") if isinstance(row.get("settings"), dict) else {},
             "key_meta": row.get("key_meta") if isinstance(row.get("key_meta"), dict) else {},
-            "user_access": row.get("user_access") if isinstance(row.get("user_access"), dict) else {},
+            "user_access": bot_data.get("user_access") if isinstance(bot_data.get("user_access"), dict) else {},
+            "trail_enabled": bool(bot_data.get("trail_enabled", access_mode == "free")),
+            "trail_mode": bot_data.get("trail_mode", "PERM"),
+            "trail_expires_at": bot_data.get("trail_expires_at"),
             "source_name": row.get("source_name"), "source_path": row.get("source_path")}
 
 
@@ -708,10 +712,14 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
                "webhook_url": str(info.get("webhook_url") or "")[:2000],
                "settings": info.get("settings", {}) if isinstance(info.get("settings", {}), dict) else {},
                "key_meta": info.get("key_meta", {}) if isinstance(info.get("key_meta", {}), dict) else {},
-               "user_access": {str(k): v for k,v in (info.get("user_access") or {}).items()},
                "source_name": info.get("source_name"), "source_path": info.get("source_path"),
                "bot_data": {"version": info.get("version", "1.0.0"), "buyer_role_id": info.get("buyer_role_id"),
-                            "admin_role_id": info.get("admin_role_id"), "created_by": str(discord_user_id)}}
+                            "admin_role_id": info.get("admin_role_id"), "created_by": str(discord_user_id),
+                            "trail_enabled": bool(info.get("trail_enabled", str(info.get("access_mode", "free")).lower()=="free")),
+                            "trail_mode": info.get("trail_mode", "PERM"),
+                            "trail_expires_at": info.get("trail_expires_at"),
+                            "user_access": {str(k): v for k,v in (info.get("user_access") or {}).items()},
+                            "hwid_bindings": info.get("hwid_bindings", {}) if isinstance(info.get("hwid_bindings", {}), dict) else {}}}
         info["loader_code"] = str(row.get("loader_code") or info.get("file_id") or secrets.token_urlsafe(12).replace("-", "").replace("_", ""))
         info["file_id"] = info["loader_code"]
         row["loader_code"] = info["loader_code"]
@@ -742,7 +750,7 @@ def _sync_dashboard_scripts_from_supabase():
         user_map = {str(x.get("supabase_user_id")): str(x.get("discord_user_id"))
                     for x in links if x.get("supabase_user_id") and x.get("discord_user_id")}
         rows = _supabase_rest("crystal_scripts", {
-            "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data,fast_mode,obfuscator,ultra_safe,loader_code,access_mode,disabled,webhook_url,settings,key_meta,user_access,source_name,source_path"
+            "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data,fast_mode,obfuscator,ultra_safe,loader_code,access_mode,disabled,webhook_url,settings,key_meta,source_name,source_path"
         })
         count = 0
         for row in rows:
@@ -763,16 +771,18 @@ def _sync_dashboard_scripts_from_supabase():
                          "user_keys": info.get("user_keys", {}), "created_by": owner, "api_key": row.get("api_key", ""),
                          "supabase_user_id": str(row.get("user_id") or ""), "supabase_row_id": row.get("id"),
                          "fast_mode": bool(row.get("fast_mode", False)), "obfuscator": bool(row.get("obfuscator", False)),
-                         "ultra_safe": bool(row.get("ultra_safe", False)), "trail_enabled": info.get("trail_enabled", False),
-                         "trail_mode": info.get("trail_mode", "PERM"), "trail_expires_at": info.get("trail_expires_at"),
+                         "ultra_safe": bool(row.get("ultra_safe", False)),
                          "file_id": row.get("loader_code") or info.get("file_id"),
                          "loader_code": row.get("loader_code") or info.get("file_id"),
-                         "access_mode": row.get("access_mode", "free"), "disabled": bool(row.get("disabled", False)),
+                         "access_mode": str(row.get("access_mode") or "free").lower(), "disabled": bool(row.get("disabled", False)),
                          "webhook_url": row.get("webhook_url") or "",
                          "settings": row.get("settings") if isinstance(row.get("settings"), dict) else {},
                          "key_meta": row.get("key_meta") if isinstance(row.get("key_meta"), dict) else info.get("key_meta", {}),
-                         "user_access": row.get("user_access") if isinstance(row.get("user_access"), dict) else info.get("user_access", {}),
-                         "source_name": row.get("source_name"), "source_path": row.get("source_path")})
+                         "user_access": bot_data.get("user_access") if isinstance(bot_data.get("user_access"), dict) else info.get("user_access", {}),
+                         "trail_enabled": bool(bot_data.get("trail_enabled", str(row.get("access_mode") or "free").lower()=="free")),
+                         "trail_mode": bot_data.get("trail_mode", "PERM"), "trail_expires_at": bot_data.get("trail_expires_at"),
+                         "source_name": row.get("source_name"), "source_path": row.get("source_path"),
+                         "hwid_bindings": bot_data.get("hwid_bindings") if isinstance(bot_data.get("hwid_bindings"), dict) else info.get("hwid_bindings", {})})
             scripts_data[name] = info
             count += 1
         if count:
@@ -1126,6 +1136,14 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         ok_key, reason = key_is_usable(s_info, user_key)
         if not ok_key:
             self._send_text(403, "denied: " + reason)
+            return
+
+        # Trial/Free is public: no per-user HWID binding is created for the literal trail key.
+        if user_key.strip().lower() == "trail" and trail_is_active(s_info):
+            if parsed_path.path == "/script-source":
+                self._send_text(200, s_info.get("source_code", "-- No source code loaded"))
+            else:
+                self._send_text(200, "ok")
             return
 
         binding_key = f"{script_name}:{user_key}"
@@ -1592,12 +1610,24 @@ def file_public_url(file_id: str) -> str:
 
 
 def trail_is_active(s_info: dict) -> bool:
+    # Dashboard Free is the authoritative Trial switch. Paid means key-only.
+    if str(s_info.get("access_mode") or "free").lower() == "free":
+        s_info["trail_enabled"] = True
     if not s_info.get("trail_enabled"):
         return False
-    if (s_info.get("trail_mode") or "PERM").upper() == "TIME":
-        if is_expired(s_info.get("trail_expires_at")):
-            s_info["trail_enabled"] = False
-            return False
+    if (s_info.get("trail_mode") or "PERM").upper() == "TIME" and is_expired(s_info.get("trail_expires_at")):
+        s_info["trail_enabled"] = False
+        s_info["trail_mode"] = "PERM"
+        s_info["trail_expires_at"] = None
+        s_info["access_mode"] = "paid"
+        try:
+            save_data()
+            owner = str(s_info.get("created_by") or s_info.get("_discord_user_id") or "")
+            if owner:
+                _sync_script_to_supabase("", s_info, owner, "", None)
+        except Exception:
+            pass
+        return False
     return True
 
 
@@ -1608,6 +1638,8 @@ def key_is_usable(s_info: dict, key: str) -> tuple:
         return False, "Key is empty."
     if bool(s_info.get("disabled", False)):
         return False, "The script has been disabled by its owner."
+    if key.strip().lower() == "trail" and trail_is_active(s_info):
+        return True, ""
     meta = (s_info.get("key_meta") or {}).get(key, {})
     if meta.get("disabled"):
         return False, "This key has been disabled."
@@ -1619,7 +1651,11 @@ def key_is_usable(s_info: dict, key: str) -> tuple:
 
 
 def user_access_ok(s_info: dict, user_id: int) -> tuple:
-    """Check whitelist / key access including TIME expiry. Returns (ok, reason, key)."""
+    """Check whitelist / key access including TIME expiry. Trial is public while active."""
+    if bool(s_info.get("disabled", False)):
+        return False, "The script has been disabled by its owner.", None
+    if trail_is_active(s_info):
+        return True, "", "trail"
     uid = int(user_id)
     access = (s_info.get("user_access") or {}).get(uid)
     key = (s_info.get("user_keys") or {}).get(uid)
@@ -2110,6 +2146,11 @@ class PanelControlView(BlacklistAwareView):
         )
 
     def _get_user_key(self, s_info: dict, user_id: int):
+        if bool(s_info.get("disabled", False)):
+            return None, "The script has been disabled by its owner."
+        if trail_is_active(s_info):
+            ensure_file_id(self.script_name, s_info)
+            return "trail", ""
         ok, reason, user_key = user_access_ok(s_info, user_id)
         if not ok:
             return None, reason
@@ -2128,13 +2169,6 @@ class PanelControlView(BlacklistAwareView):
             return
 
         user_key, reason = self._get_user_key(s_info, interaction.user.id)
-        if not user_key and trail_is_active(s_info):
-            mode = str(s_info.get("trail_mode") or "PERM").upper()
-            expires_at = s_info.get("trail_expires_at") if mode == "TIME" else None
-            user_key = generate_random_key()
-            register_key(s_info, user_key, mode, expires_at, created_by=interaction.user.id)
-            grant_user_access(s_info, interaction.user.id, user_key, mode, expires_at)
-            save_data()
         if not user_key:
             await interaction.response.send_message(f"❌ {reason}", ephemeral=True)
             return
@@ -2215,6 +2249,7 @@ class PanelControlView(BlacklistAwareView):
         user_key = s_info["user_keys"][user_id]
         hwid_bindings.pop(f"{self.script_name}:{user_key}", None)
         save_hwid_bindings()
+        s_info["hwid_bindings"] = {k:v for k,v in hwid_bindings.items() if str(k).startswith(self.script_name + ":")}
         security_state.setdefault("reset_hwid_last_used", {})[cooldown_key] = now
         save_security_state()
         _send_script_webhook(s_info, "HWID Reset", username=getattr(interaction.user, "name", ""), discord_user_id=str(interaction.user.id), key=user_key, device="Unknown", duration=format_remaining((s_info.get("key_meta") or {}).get(user_key, {}).get("expires_at")))
@@ -2318,6 +2353,19 @@ async def _refresh_saved_panels_after_startup():
         save_data()
 
 @bot.event
+async def _crystal_dashboard_sync_loop():
+    # Supabase is the shared source of truth. Import dashboard edits frequently so
+    # Free/Paid, disabled state, webhook, key metadata and loader changes reach Discord
+    # without requiring a bot restart. Bot-originated changes are written back by the
+    # command handlers through _sync_script_to_supabase.
+    while True:
+        await asyncio.sleep(20)
+        try:
+            await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
+        except Exception as exc:
+            print(f"Crystal dashboard background sync failed: {type(exc).__name__}: {exc}")
+
+
 async def on_ready():
     if not getattr(bot, "_crystal_admin_view_registered", False):
         bot.add_view(AdminGuideLanguageView())
@@ -2341,6 +2389,9 @@ async def on_ready():
 
     print(f"Bot connected successfully as: {bot.user}")
     await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
+    if not getattr(bot, "_crystal_dashboard_sync_started", False):
+        bot._crystal_dashboard_sync_started = True
+        asyncio.create_task(_crystal_dashboard_sync_loop())
     if not getattr(bot, "_crystal_panels_refreshed_this_process", False):
         bot._crystal_panels_refreshed_this_process = True
         await _refresh_saved_panels_after_startup()
@@ -2379,6 +2430,7 @@ async def generate_key_command(
     new_key = generate_random_key()
     register_key(scripts_data[script], new_key, mode, expires_at, created_by=interaction.user.id)
     save_data()
+    _sync_script_to_supabase(script, scripts_data[script], str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
     _quota_increment(interaction.user.id, "keys")
     when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
     await interaction.response.send_message(
@@ -2419,6 +2471,7 @@ async def key_command(
     new_key = generate_random_key()
     register_key(scripts_data[script], new_key, mode, expires_at, created_by=interaction.user.id)
     save_data()
+    _sync_script_to_supabase(script, scripts_data[script], str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
     _quota_increment(interaction.user.id, "keys")
     when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
     await interaction.response.send_message(
@@ -2518,8 +2571,10 @@ async def trail_command(
         s_info["trail_enabled"] = False
         s_info["trail_mode"] = "PERM"
         s_info["trail_expires_at"] = None
+        s_info["access_mode"] = "paid"
         save_data()
-        await interaction.response.send_message(f"✅ Trail **OFF** for `{script}`.", ephemeral=True)
+        _sync_script_to_supabase(script, s_info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
+        await interaction.response.send_message(f"✅ Trail **OFF** for `{script}` — Paid/Key access is active again on Dashboard and Discord.", ephemeral=True)
         return
     mode = (duration_type.value if duration_type else "PERM").upper()
     try:
@@ -2530,11 +2585,13 @@ async def trail_command(
     s_info["trail_enabled"] = True
     s_info["trail_mode"] = mode
     s_info["trail_expires_at"] = expires_at
+    s_info["access_mode"] = "free"
     ensure_file_id(script, s_info)
     save_data()
+    _sync_script_to_supabase(script, s_info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
     when = "permanent" if mode == "PERM" else f"TIME — ends in {format_remaining(expires_at)}"
     await interaction.response.send_message(
-        f"✅ Trail **ON** for `{script}` ({when}).",
+        f"✅ Trail **ON** for `{script}` ({when}) — Free access is now active on Dashboard and Discord.",
         ephemeral=True
     )
 
