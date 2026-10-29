@@ -1027,6 +1027,27 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             self._send_text(500, json.dumps({"error": "Could not save code changes."})); return
         self._send_text(200, json.dumps({"ok": True}))
 
+    def _guest_plan(self):
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        guest_id = str((query.get("guestId") or [""])[0]).strip()[:128]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", guest_id):
+            self._send_text(400, json.dumps({"error": "invalid guest id"})); return
+        try:
+            rows = _supabase_rest("crystal_guest_subscriptions", {
+                "select": "plan,expires_at,created_at,updated_at",
+                "guest_id": "eq." + urllib.parse.quote(guest_id, safe=""), "limit": "1"
+            })
+            record = rows[0] if rows else None
+            if not record:
+                self._send_text(200, json.dumps({"ok": True, "plan": "Free", "expiresAt": None})); return
+            expires = record.get("expires_at")
+            if expires and datetime.datetime.fromisoformat(str(expires).replace("Z", "+00:00")) <= datetime.datetime.now(datetime.timezone.utc):
+                self._send_text(200, json.dumps({"ok": True, "plan": "Free", "expiresAt": expires})); return
+            self._send_text(200, json.dumps({"ok": True, "plan": record.get("plan", "Free"), "expiresAt": expires}, ensure_ascii=False))
+        except Exception as exc:
+            print(f"Guest plan lookup failed: {type(exc).__name__}: {exc}")
+            self._send_text(200, json.dumps({"ok": True, "plan": "Free", "expiresAt": None}))
+
     def _redeem_site_code(self):
         # Basic per-IP throttle; code validation and user identity are checked server-side.
         ip = self.client_address[0] if self.client_address else "unknown"
@@ -1047,27 +1068,30 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             access_token = str(payload.get("accessToken", ""))[:8192]
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             self._send_text(400, json.dumps({"error": "Invalid request."})); return
-        if not code or not access_token:
-            self._send_text(400, json.dumps({"error": "Enter a code and sign in first."})); return
-        user = _verify_supabase_access_token(access_token)
-        if not user:
-            self._send_text(401, json.dumps({"error": "Your session could not be verified. Sign in again."})); return
+        guest_id = str(payload.get("guestId", "")).strip()[:128]
+        if guest_id and not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", guest_id):
+            self._send_text(400, json.dumps({"error": "Invalid Guest ID."})); return
+        user = _verify_supabase_access_token(access_token) if access_token else None
+        if not user and not guest_id:
+            self._send_text(401, json.dumps({"error": "Sign in or use Guest mode."})); return
         key = _hash_redeem_code(code)
-        # The hidden Admin code is intentionally not stored in the database.
+        # The hidden Admin code is intentionally account-only.
         if hmac.compare_digest(code, ADMIN_REDEEM_CODE):
+            if not user:
+                self._send_text(403, json.dumps({"error": "The Admin code requires a signed-in account."})); return
             now_iso = _iso_now()
             _supabase_upsert_subscription(user["id"], "Admin", None, "admin-code")
             self._send_text(200, json.dumps({"ok": True, "plan": "Admin", "duration": "Lifetime", "expiresAt": None})); return
 
         try:
-            rows = _supabase_rest("crystal_redeem_codes", {"select": "id,plan,duration_days,redeemed_by,redeemed_at,revoked", "code_hash": "eq." + key, "limit": "1"})
+            rows = _supabase_rest("crystal_redeem_codes", {"select": "id,plan,duration_days,redeemed_by,redeemed_guest_id,redeemed_at,revoked", "code_hash": "eq." + key, "limit": "1"})
         except Exception as exc:
             print(f"Crystal redeem DB lookup failed: {type(exc).__name__}")
             rows = []
         record = rows[0] if rows else None
         if record and record.get("revoked"):
             record = None
-        if record and record.get("redeemed_by"):
+        if record and (record.get("redeemed_by") or record.get("redeemed_guest_id")):
             self._send_text(409, json.dumps({"error": "This code has already been used."})); return
 
         if record:
@@ -1076,10 +1100,19 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             now = datetime.datetime.now(datetime.timezone.utc)
             expires_at = None if days <= 0 else (now + datetime.timedelta(days=days)).isoformat()
             try:
-                _supabase_rest("crystal_redeem_codes", {"id": "eq." + str(record["id"])}, "PATCH", {"redeemed_by": user["id"], "redeemed_at": now.isoformat()}, "return=minimal")
-                _supabase_upsert_subscription(user["id"], plan, expires_at, "redeem", record["id"])
+                patch = {"redeemed_at": now.isoformat()}
+                if user:
+                    patch["redeemed_by"] = user["id"]
+                else:
+                    patch["redeemed_guest_id"] = guest_id
+                _supabase_rest("crystal_redeem_codes", {"id": "eq." + str(record["id"])}, "PATCH", patch, "return=minimal")
+                if user:
+                    _supabase_upsert_subscription(user["id"], plan, expires_at, "redeem", record["id"])
+                else:
+                    _supabase_rest("crystal_guest_subscriptions", {}, "POST", {"guest_id": guest_id, "plan": plan, "expires_at": expires_at, "source": "redeem", "redeem_code_id": str(record["id"]), "updated_at": now.isoformat()}, "resolution=merge-duplicates,return=minimal")
                 self._send_text(200, json.dumps({"ok": True, "plan": plan, "duration": "Lifetime" if days <= 0 else f"{days} days", "expiresAt": expires_at})); return
             except Exception as exc:
+                print(f"Guest redemption save failed: {type(exc).__name__}: {exc}")
                 self._send_text(500, json.dumps({"error": "Server could not save redemption. Try again later."})); return
 
         # Legacy fallback for codes created before the Supabase migration.
@@ -1158,10 +1191,105 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_text(500, json.dumps({"error":"Dashboard sync failed: "+str(exc)[:300]}))
 
+
+    def _guest_script_sync(self):
+        """Persist a Guest dashboard script in Supabase without requiring Supabase Auth."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 2_000_000:
+                self._send_text(400, json.dumps({"error": "invalid request size"})); return
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                self._send_text(400, json.dumps({"error": "invalid request"})); return
+            guest_id = str(body.get("guestId", "")).strip()[:128]
+            data = body.get("script") if isinstance(body.get("script"), dict) else body
+            name = str(data.get("name", "")).strip()[:100]
+            api_key = str(data.get("api_key", "")).strip()[:200]
+            if not guest_id or not name or not api_key:
+                self._send_text(400, json.dumps({"error": "guestId, name and api_key are required"})); return
+            if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", guest_id):
+                self._send_text(400, json.dumps({"error": "invalid guest id"})); return
+            # Guest keys are generated by the dashboard, but the server is the source of truth.
+            row = {
+                "guest_id": guest_id, "user_id": None,
+                "name": name, "api_key": api_key,
+                "script": str(data.get("script") or data.get("source_code") or ""),
+                "source_code": str(data.get("source_code") or data.get("script") or ""),
+                "fast_mode": bool(data.get("fast_mode", False)),
+                "obfuscator": bool(data.get("obfuscator", False)),
+                "ultra_safe": bool(data.get("ultra_safe", False)),
+                "discord_user_id": None, "discord_username": None,
+                "loader_code": str(data.get("loader_code") or "")[:300] or None,
+                "access_mode": "paid" if str(data.get("access_mode", "free")).lower() == "paid" else "free",
+                "disabled": bool(data.get("disabled", False)),
+                "webhook_url": str(data.get("webhook_url") or "")[:2000],
+                "settings": data.get("settings") if isinstance(data.get("settings"), dict) else {},
+                "key_meta": data.get("key_meta") if isinstance(data.get("key_meta"), dict) else {},
+                "source_name": str(data.get("source_name") or "")[:255] or None,
+                "source_path": "guest-supabase",
+                "bot_data": data.get("bot_data") if isinstance(data.get("bot_data"), dict) else {},
+                "updated_at": _iso_now(),
+            }
+            bd = dict(row["bot_data"]); bd["guest_id"] = guest_id; bd["trail_enabled"] = row["access_mode"] == "free"; row["bot_data"] = bd
+            existing = _supabase_rest("crystal_scripts", {
+                "select": "id", "guest_id": "eq." + urllib.parse.quote(guest_id, safe=""),
+                "api_key": "eq." + urllib.parse.quote(api_key, safe=""), "limit": "1"
+            })
+            if existing:
+                _supabase_rest("crystal_scripts", {"id": "eq." + str(existing[0]["id"])}, "PATCH", row, "return=minimal")
+                row_id = existing[0]["id"]
+            else:
+                created = _supabase_rest("crystal_scripts", {}, "POST", row, "return=representation")
+                row_id = created[0].get("id") if created else None
+            self._send_text(200, json.dumps({"ok": True, "id": row_id, "script": {**row, "id": row_id}}, ensure_ascii=False))
+        except Exception as exc:
+            print(f"Guest script sync failed: {type(exc).__name__}: {exc}")
+            self._send_text(500, json.dumps({"error": "Guest script sync failed: " + str(exc)[:300]}))
+
+    def _guest_scripts_list(self):
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        guest_id = str((query.get("guestId") or [""])[0]).strip()[:128]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", guest_id):
+            self._send_text(400, json.dumps({"error": "invalid guest id"})); return
+        try:
+            rows = _supabase_rest("crystal_scripts", {
+                "select": "*", "guest_id": "eq." + urllib.parse.quote(guest_id, safe=""),
+                "order": "created_at.desc"
+            })
+            self._send_text(200, json.dumps({"ok": True, "scripts": rows}, ensure_ascii=False))
+        except Exception as exc:
+            print(f"Guest script list failed: {type(exc).__name__}: {exc}")
+            self._send_text(500, json.dumps({"error": "Could not load Guest scripts."}))
+
+    def _guest_script_delete(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 8192:
+                self._send_text(400, json.dumps({"error": "invalid request"})); return
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            guest_id = str(body.get("guestId", "")).strip()[:128]
+            script_id = str(body.get("id", "")).strip()[:100]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", guest_id) or not script_id:
+                self._send_text(400, json.dumps({"error": "invalid guest id or script id"})); return
+            _supabase_rest("crystal_scripts", {
+                "id": "eq." + urllib.parse.quote(script_id, safe=""),
+                "guest_id": "eq." + urllib.parse.quote(guest_id, safe="")
+            }, "DELETE", None, "return=minimal")
+            self._send_text(200, json.dumps({"ok": True}))
+        except Exception as exc:
+            print(f"Guest script delete failed: {type(exc).__name__}: {exc}")
+            self._send_text(500, json.dumps({"error": "Could not delete Guest script."}))
+
     def do_POST(self):
         parsed_path = urllib.parse.urlparse(self.path)
         if parsed_path.path == "/api/dashboard-script-sync":
             self._dashboard_script_sync()
+            return
+        if parsed_path.path == "/api/guest-script-sync":
+            self._guest_script_sync()
+            return
+        if parsed_path.path == "/api/guest-script-delete":
+            self._guest_script_delete()
             return
         if parsed_path.path == "/api/redeem-code":
             self._redeem_site_code()
@@ -1253,6 +1381,12 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_path = urllib.parse.urlparse(self.path)
         path_parts = parsed_path.path.strip("/").split("/")
+        if parsed_path.path == "/api/guest-scripts":
+            self._guest_scripts_list()
+            return
+        if parsed_path.path == "/api/guest-plan":
+            self._guest_plan()
+            return
 
         # Unique loader IDs: /files/v4/lua/<loader_code> and /files/v4/<loader_code>.
         if ((len(path_parts) >= 4 and path_parts[0] == "files" and path_parts[1] == "v4" and path_parts[2] == "lua")
