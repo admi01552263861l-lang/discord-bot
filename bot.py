@@ -1861,7 +1861,7 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
         return False
 
     # Gate bot-management slash commands with the server-wide role. Keep user-facing
-    # commands (such as /my-plan and /redeem) available; quota checks remain in place.
+    # commands (such as /redeem and /hwid) available; quota checks remain in place.
     command_name = getattr(getattr(interaction, "command", None), "name", "")
     management_commands = {
         "generate-key", "key", "whitelist", "see-keys", "delete-key",
@@ -3017,9 +3017,91 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
 
 
 # 7. إعداد البانل
-@bot.tree.command(name="my-plan", description="Show your Crystal Hub plan and monthly usage")
-async def my_plan_command(interaction: discord.Interaction):
-    await interaction.response.send_message(_quota_status(interaction.user.id), ephemeral=True)
+@bot.tree.command(name="hwid", description="Reset your Crystal Hub HWID binding")
+@app_commands.describe(script="Optional script to reset. Leave empty to reset all your linked script keys.")
+@app_commands.autocomplete(script=script_autocomplete)
+async def hwid_command(interaction: discord.Interaction, script: Optional[str] = None):
+    uid = str(interaction.user.id)
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    last_used = int((security_state.get("reset_hwid_last_used") or {}).get(uid, 0) or 0)
+    cooldown = int(security_state.get("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN) or 0)
+    if cooldown > 0 and last_used > 0 and now - last_used < cooldown:
+        remaining = cooldown - (now - last_used)
+        await interaction.response.send_message(
+            f"⏳ You can reset your HWID again in **{format_duration(remaining)}**.",
+            ephemeral=True
+        )
+        return
+
+    target_name = str(script or "").strip()
+    if target_name and target_name not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+        return
+
+    removed = 0
+    touched_scripts = []
+    for name, info in scripts_data.items():
+        if target_name and name != target_name:
+            continue
+        meta = info.get("key_meta") if isinstance(info.get("key_meta"), dict) else {}
+        access = info.get("user_access") if isinstance(info.get("user_access"), dict) else {}
+        keys_for_user = set()
+        for key_value, key_meta in meta.items():
+            if isinstance(key_meta, dict) and str(key_meta.get("discord_user_id") or "") == uid:
+                keys_for_user.add(str(key_value))
+        access_entry = access.get(uid)
+        if isinstance(access_entry, dict):
+            for field in ("key", "api_key", "script_key"):
+                if access_entry.get(field):
+                    keys_for_user.add(str(access_entry[field]))
+        elif isinstance(access_entry, str) and access_entry.strip():
+            keys_for_user.add(access_entry.strip())
+
+        for key_value in keys_for_user:
+            binding_key = f"{name}:{key_value}"
+            if binding_key in hwid_bindings:
+                hwid_bindings.pop(binding_key, None)
+                removed += 1
+        if keys_for_user:
+            touched_scripts.append(name)
+            try:
+                _persist_script_row(info.get("supabase_row_id"), {
+                    "bot_data": {
+                        "version": info.get("version", "1.0.0"),
+                        "buyer_role_id": info.get("buyer_role_id"),
+                        "admin_role_id": info.get("admin_role_id"),
+                        "created_by": str(info.get("created_by") or ""),
+                        "trail_enabled": bool(info.get("trail_enabled", False)),
+                        "trail_mode": info.get("trail_mode", "PERM"),
+                        "trail_expires_at": info.get("trail_expires_at"),
+                        "user_access": info.get("user_access") if isinstance(info.get("user_access"), dict) else {},
+                        "hwid_bindings": {k: v for k, v in hwid_bindings.items() if str(k).startswith(str(name) + ":")}
+                    },
+                    "updated_at": _iso_now()
+                })
+            except Exception:
+                pass
+
+    security_state.setdefault("reset_hwid_last_used", {})[uid] = now
+    try:
+        save_hwid_bindings()
+        save_security_state()
+    except OSError:
+        await interaction.response.send_message("❌ Could not save the HWID reset. Please try again.", ephemeral=True)
+        return
+
+    if removed:
+        scope = f"for **{', '.join(touched_scripts[:5])}**" if touched_scripts else ""
+        more = " and more" if len(touched_scripts) > 5 else ""
+        await interaction.response.send_message(
+            f"✅ HWID reset successfully {scope}{more}. You can now run your key from the new device.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "ℹ️ No HWID binding was found for your account. Your next key use will bind normally.",
+            ephemeral=True
+        )
 
 
 @bot.tree.command(name="avatar-bot", description="Change the bot profile for this server")
