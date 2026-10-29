@@ -24,6 +24,8 @@ from discord import app_commands
 from discord.http import Route
 from discord.ext import commands, tasks
 
+BUILD_TAG = "CrystalHub-2026-10-29-SUPABASE-HWID-V2"
+
 # Render keeps only files under a mounted persistent disk. Set
 # CRYSTAL_HUB_DATA_DIR=/var/data on Render after attaching that disk.
 # Changing the working directory before any data files are loaded places every
@@ -466,7 +468,7 @@ def _hash_redeem_code(code):
 
 def _verify_supabase_access_token(access_token):
     """Verify identity with Supabase Auth; never trust a user ID sent by the browser."""
-    project_url = os.getenv("SUPABASE_URL", "https://qhxlclqcfncgkglwqwpx.supabase.co").rstrip("/")
+    project_url = (os.getenv("CRYSTAL_SUPABASE_URL", "").strip() or os.getenv("SUPABASE_URL", "").strip() or "https://qhxlclqcfncgkglwqwpx.supabase.co").rstrip("/")
     publishable_key = (os.getenv("SUPABASE_KEY", "").strip()
                        or os.getenv("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_GiQrr4SPvTJJtHjjxisC1w_TfFe7vjq").strip())
     if not publishable_key or not access_token:
@@ -546,7 +548,7 @@ def format_duration(seconds: int) -> str:
 
 def _supabase_rest(table: str, query: dict = None, method: str = "GET", payload=None, prefer: str = ""):
     """Server-side Supabase REST helper. The private key is read only from Render env vars."""
-    base = os.getenv("SUPABASE_URL", "https://qhxlclqcfncgkglwqwpx.supabase.co").strip().rstrip("/")
+    base = (os.getenv("CRYSTAL_SUPABASE_URL", "").strip() or os.getenv("SUPABASE_URL", "").strip() or "https://qhxlclqcfncgkglwqwpx.supabase.co").rstrip("/")
     secret = (os.getenv("SUPA_PRIVATE", "").strip()
               or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip())
     if not base or not secret:
@@ -654,9 +656,22 @@ def _load_script_from_supabase_api_key(api_key: str) -> dict:
         # secret is invalid, a column is missing, or the table/policy is wrong.
         raise ValueError(f"Supabase API-key lookup failed: {exc}") from exc
     if not rows:
-        # A bot-generated key can be imported from the local database as a fallback.
+        try:
+            retry_rows = _supabase_rest("crystal_scripts", {
+                "select": "id,name,api_key,source_code,script,user_id,discord_user_id,bot_data,loader_code,access_mode,disabled,webhook_url,settings,key_meta,source_name,source_path",
+                "api_key": "ilike." + urllib.parse.quote(key, safe=""), "limit": "1"
+            })
+        except RuntimeError:
+            retry_rows = []
+        if retry_rows:
+            rows = retry_rows
+    if not rows:
+        try:
+            _sync_dashboard_scripts_from_supabase()
+        except Exception:
+            pass
         for local_name, info in scripts_data.items():
-            if secrets.compare_digest(str(info.get("api_key", "")), key):
+            if secrets.compare_digest(str(info.get("api_key", "")).strip(), key):
                 return {"name": local_name, "source_code": info.get("source_code", "-- Default Script"),
                         "version": info.get("version", "1.0.0"), "buyer_role_id": info.get("buyer_role_id"),
                         "admin_role_id": info.get("admin_role_id"), "_api_key": key,
@@ -2426,7 +2441,31 @@ async def _crystal_dashboard_sync_loop():
             print(f"Crystal dashboard background sync failed: {type(exc).__name__}: {exc}")
 
 
+async def _remove_stale_global_commands():
+    """Delete legacy global commands that are no longer registered in this build."""
+    token = os.getenv("DISCORD_TOKEN", "").strip()
+    app_id = getattr(bot, "application_id", None)
+    if not token or not app_id:
+        return
+    url = f"https://discord.com/api/v10/applications/{int(app_id)}/commands"
+    try:
+        headers = {"Authorization": f"Bot {token}", "User-Agent": "CrystalHub/1.0"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status != 200:
+                    print(f"Crystal slash cleanup list failed: HTTP {resp.status}")
+                    return
+                commands_list = await resp.json()
+            for cmd in commands_list if isinstance(commands_list, list) else []:
+                if str(cmd.get("name", "")).lower() == "my-plan":
+                    async with session.delete(url + "/" + str(cmd.get("id")), timeout=10) as resp:
+                        print(f"Crystal slash cleanup /my-plan: HTTP {resp.status}")
+    except Exception as exc:
+        print(f"Crystal slash cleanup failed: {type(exc).__name__}: {exc}")
+
 async def on_ready():
+    print(f"Crystal Hub build: {BUILD_TAG}")
+    await _remove_stale_global_commands()
     if not getattr(bot, "_crystal_admin_view_registered", False):
         bot.add_view(AdminGuideLanguageView())
         bot._crystal_admin_view_registered = True
