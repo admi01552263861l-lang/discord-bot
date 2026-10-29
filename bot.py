@@ -643,9 +643,11 @@ def _load_script_from_supabase_api_key(api_key: str) -> dict:
         # Only select columns present in the shared schema. Version and role IDs
         # live inside bot_data; selecting them as top-level columns causes HTTP 400
         # on databases where those optional columns were never created.
+        # Lookup by API key uses only core columns so optional schema changes
+        # (for example user_access) cannot make a valid key look missing.
         rows = _supabase_rest("crystal_scripts", {
             "select": "id,name,api_key,source_code,script,user_id,discord_user_id,discord_username,fast_mode,obfuscator,ultra_safe,bot_data,loader_code,access_mode,disabled,webhook_url,settings,key_meta,source_name,source_path",
-            "api_key": "eq." + key, "limit": "1"
+            "api_key": "eq." + urllib.parse.quote(key, safe=""), "limit": "1"
         })
     except RuntimeError as exc:
         # Preserve the actual PostgREST error so Render logs/UI reveal whether the
@@ -2418,7 +2420,8 @@ async def _crystal_dashboard_sync_loop():
     while True:
         await asyncio.sleep(20)
         try:
-            await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
+            imported_count = await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
+            print(f"Crystal Hub API-key sync ready: imported {imported_count} Dashboard script(s).")
         except Exception as exc:
             print(f"Crystal dashboard background sync failed: {type(exc).__name__}: {exc}")
 
