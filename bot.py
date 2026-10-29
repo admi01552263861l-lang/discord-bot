@@ -2770,6 +2770,53 @@ async def _crystal_dashboard_sync_loop():
             print(f"Crystal dashboard background sync failed: {type(exc).__name__}: {exc}")
 
 
+async def _force_remove_stale_remote_commands():
+    """Remove remote slash commands that no longer exist in this bot.py.
+
+    This is intentionally based on the current command tree instead of a
+    hard-coded command name, so deleted commands are actually removed from
+    Discord rather than merely becoming non-functional.
+    """
+    import aiohttp
+
+    token = os.getenv("DISCORD_TOKEN", "").strip()
+    app_id = str(getattr(bot.user, "id", "") or "")
+    if not token or not app_id:
+        return
+
+    current_names = {str(cmd.name) for cmd in bot.tree.get_commands()}
+    headers = {"Authorization": f"Bot {token}"}
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        targets = [(
+            f"https://discord.com/api/v10/applications/{app_id}/commands",
+            "global",
+        )]
+        targets.extend((
+            f"https://discord.com/api/v10/applications/{app_id}/guilds/{guild.id}/commands",
+            f"guild:{guild.id}",
+        ) for guild in bot.guilds)
+
+        for url, label in targets:
+            try:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        print(f"Could not read {label} commands: HTTP {resp.status}")
+                        continue
+                    remote = await resp.json()
+
+                for cmd in remote if isinstance(remote, list) else []:
+                    name = str(cmd.get("name", ""))
+                    command_id = str(cmd.get("id", ""))
+                    if command_id and name not in current_names:
+                        async with session.delete(f"{url}/{command_id}") as delete_resp:
+                            if delete_resp.status in (200, 204):
+                                print(f"Removed stale {label} slash command: {name}")
+                            else:
+                                print(f"Failed removing stale {label} command {name}: HTTP {delete_resp.status}")
+            except Exception as exc:
+                print(f"Stale-command cleanup failed for {label}: {type(exc).__name__}: {exc}")
+
 async def _sync_crystal_guild_commands(guild):
     """Sync the current slash-command tree to a guild for fast visibility."""
     try:
@@ -2787,7 +2834,8 @@ async def on_ready():
         bot.add_view(AdminGuideLanguageView())
         bot._crystal_admin_view_registered = True
 
-    # Sync the current tree globally and per-guild so the current commands are available.
+    # First remove commands that were deleted from bot.py, then sync the current tree.
+    await _force_remove_stale_remote_commands()
     try:
         global_synced = await bot.tree.sync()
         print("Crystal global slash commands:", ", ".join(sorted(str(c.name) for c in global_synced)))
