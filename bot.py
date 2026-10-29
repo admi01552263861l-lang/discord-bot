@@ -2205,7 +2205,8 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
         return False
 
     # Gate bot-management slash commands with the server-wide role. Keep user-facing
-    # commands (such as /redeem and /hwid) available; quota checks remain in place.
+    # commands (/api, /hwid, /redeem) available to everyone; quota checks remain in place.
+    # /my-plan has been permanently removed — use /api to link Dashboard account.
     command_name = getattr(getattr(interaction, "command", None), "name", "")
     management_commands = {
         "generate-key", "key", "whitelist", "see-keys", "delete-key",
@@ -2773,9 +2774,8 @@ async def _crystal_dashboard_sync_loop():
 async def _force_remove_stale_remote_commands():
     """Remove remote slash commands that no longer exist in this bot.py.
 
-    This is intentionally based on the current command tree instead of a
-    hard-coded command name, so deleted commands are actually removed from
-    Discord rather than merely becoming non-functional.
+    Also permanently purges retired commands (e.g. my-plan) so they never stay
+    visible after a bot update. /api replaces the old plan-check command.
     """
     import aiohttp
 
@@ -2784,7 +2784,11 @@ async def _force_remove_stale_remote_commands():
     if not token or not app_id:
         return
 
-    current_names = {str(cmd.name) for cmd in bot.tree.get_commands()}
+    # Permanently retired — never keep these on Discord.
+    FORCED_DELETE = {
+        "my-plan", "my_plan", "myplan", "plan", "plans",
+    }
+    current_names = {str(cmd.name) for cmd in bot.tree.get_commands()} - FORCED_DELETE
     headers = {"Authorization": f"Bot {token}"}
 
     async with aiohttp.ClientSession(headers=headers) as session:
@@ -2808,12 +2812,15 @@ async def _force_remove_stale_remote_commands():
                 for cmd in remote if isinstance(remote, list) else []:
                     name = str(cmd.get("name", ""))
                     command_id = str(cmd.get("id", ""))
-                    if command_id and name not in current_names:
+                    if not command_id:
+                        continue
+                    if name in FORCED_DELETE or name not in current_names:
                         async with session.delete(f"{url}/{command_id}") as delete_resp:
                             if delete_resp.status in (200, 204):
-                                print(f"Removed stale {label} slash command: {name}")
+                                reason = "retired" if name in FORCED_DELETE else "stale"
+                                print(f"Removed {reason} {label} slash command: {name}")
                             else:
-                                print(f"Failed removing stale {label} command {name}: HTTP {delete_resp.status}")
+                                print(f"Failed removing {label} command {name}: HTTP {delete_resp.status}")
             except Exception as exc:
                 print(f"Stale-command cleanup failed for {label}: {type(exc).__name__}: {exc}")
 
@@ -3418,26 +3425,38 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
 
 
 # API account linking — connects a Dashboard API key to this Discord account.
-@bot.tree.command(name="api", description="Link or unlink a Crystal Hub Dashboard API account")
+@bot.tree.command(name="api", description="Link Discord to your Crystal Hub Dashboard API (or unlink + reset key)")
 @app_commands.describe(
-    acc="The Crystal Hub API key from your Dashboard",
-    unlink="Set true to unlink this API account and automatically reset the API key on the Dashboard",
+    acc="Your Crystal Hub API key from the Dashboard (e.g. CH-xxxxxxxx)",
+    unlink="Turn ON to unlink this Discord account and reset the API key on the Dashboard",
 )
 async def api_account_command(interaction: discord.Interaction, acc: str, unlink: bool = False):
+    """User-facing account link. Replaces the old /my-plan command."""
+    acc = str(acc or "").strip()
+    if not acc:
+        await interaction.response.send_message(
+            "❌ Provide your Dashboard API key.\n"
+            "Example: `/api` → `acc:` `CH-xxxxxxxx`\n"
+            "Unlink: same command with **unlink** turned on.",
+            ephemeral=True,
+        )
+        return
     try:
         if unlink:
             result = await asyncio.to_thread(_api_account_reset, acc, '', '', str(interaction.user.id))
             await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
             await interaction.response.send_message(
-                f"✅ API account unlinked. The old API key was removed and the Dashboard generated a new API key for **{result.get('name','script')}**.\n"
-                "Open the Dashboard to copy the new key.", ephemeral=True
+                f"✅ Unlinked. Old API key removed; Dashboard created a **new** API key for **{result.get('name', 'script')}**.\n"
+                "Open the Dashboard and copy the new key.",
+                ephemeral=True,
             )
             return
         script = await asyncio.to_thread(_api_account_link, acc, str(interaction.user.id), str(interaction.user))
         await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
         await interaction.response.send_message(
-            f"✅ API account linked to **{script.get('name','script')}**.\n"
-            "Dashboard and Discord are now connected for this API key.", ephemeral=True
+            f"✅ Linked to **{script.get('name', 'script')}**.\n"
+            "Discord is now synced with your Crystal Hub Dashboard (scripts, data, plan).",
+            ephemeral=True,
         )
     except PermissionError as exc:
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
@@ -3445,12 +3464,15 @@ async def api_account_command(interaction: discord.Interaction, acc: str, unlink
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
     except Exception as exc:
         print(f"API account command failed: {type(exc).__name__}: {exc}")
-        await interaction.response.send_message("❌ Could not update the API account. Check that the Dashboard API key is valid.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Could not update the API account. Check that the Dashboard API key is valid.",
+            ephemeral=True,
+        )
 
 
 # 7. إعداد البانل
-@bot.tree.command(name="hwid", description="Reset your Crystal Hub HWID binding")
-@app_commands.describe(script="Optional script to reset. Leave empty to reset all your linked script keys.")
+@bot.tree.command(name="hwid", description="Reset HWID binding so your key can lock to a new device")
+@app_commands.describe(script="Optional: one script only. Leave empty to reset HWID for all your keys.")
 @app_commands.autocomplete(script=script_autocomplete)
 async def hwid_command(interaction: discord.Interaction, script: Optional[str] = None):
     uid = str(interaction.user.id)
