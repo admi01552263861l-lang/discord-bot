@@ -2770,54 +2770,8 @@ async def _crystal_dashboard_sync_loop():
             print(f"Crystal dashboard background sync failed: {type(exc).__name__}: {exc}")
 
 
-async def _remove_stale_global_commands():
-    """Delete legacy global commands that are no longer registered in this build."""
-    token = os.getenv("DISCORD_TOKEN", "").strip()
-    app_id = getattr(bot, "application_id", None)
-    if not token or not app_id:
-        return
-    url = f"https://discord.com/api/v10/applications/{int(app_id)}/commands"
-    try:
-        headers = {"Authorization": f"Bot {token}", "User-Agent": "CrystalHub/1.0"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status != 200:
-                    print(f"Crystal slash cleanup list failed: HTTP {resp.status}")
-                    return
-                commands_list = await resp.json()
-            for cmd in commands_list if isinstance(commands_list, list) else []:
-                if str(cmd.get("name", "")).lower() == "my-plan":
-                    async with session.delete(url + "/" + str(cmd.get("id")), timeout=10) as resp:
-                        print(f"Crystal slash cleanup /my-plan: HTTP {resp.status}")
-    except Exception as exc:
-        print(f"Crystal slash cleanup failed: {type(exc).__name__}: {exc}")
-
-async def _remove_named_global_commands(names):
-    """Remove legacy global copies of commands that are now synced per-guild for instant visibility."""
-    app_id = str(bot.user.id) if bot.user else ""
-    token = os.getenv("DISCORD_TOKEN", "")
-    if not app_id or not token:
-        return
-    wanted = {str(x).lower() for x in names}
-    url = f"https://discord.com/api/v10/applications/{app_id}/commands"
-    headers = {"Authorization": f"Bot {token}"}
-    try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status != 200:
-                    print(f"Crystal global command cleanup list failed: HTTP {resp.status}")
-                    return
-                items = await resp.json()
-            for cmd in items if isinstance(items, list) else []:
-                if str(cmd.get("name", "")).lower() not in wanted:
-                    continue
-                async with session.delete(url + "/" + str(cmd.get("id")), timeout=10) as resp:
-                    print(f"Crystal removed legacy global /{cmd.get('name')}: HTTP {resp.status}")
-    except Exception as exc:
-        print(f"Crystal global command cleanup failed: {type(exc).__name__}: {exc}")
-
 async def _sync_crystal_guild_commands(guild):
-    """Copy the current command tree to a guild so new slash commands appear immediately."""
+    """Sync the current slash-command tree to a guild for fast visibility."""
     try:
         bot.tree.clear_commands(guild=guild)
         bot.tree.copy_global_to(guild=guild)
@@ -2829,14 +2783,11 @@ async def _sync_crystal_guild_commands(guild):
 
 async def on_ready():
     print(f"Crystal Hub build: {BUILD_TAG}")
-    # Remove legacy global copies so the new per-guild commands do not appear twice.
-    await _remove_named_global_commands({"my-plan"})
     if not getattr(bot, "_crystal_admin_view_registered", False):
         bot.add_view(AdminGuideLanguageView())
         bot._crystal_admin_view_registered = True
 
-    # Remove only the deleted legacy /my-plan command. Keep /api and /hwid.
-    # Sync the current tree globally and per-guild so /api and /hwid are available.
+    # Sync the current tree globally and per-guild so the current commands are available.
     try:
         global_synced = await bot.tree.sync()
         print("Crystal global slash commands:", ", ".join(sorted(str(c.name) for c in global_synced)))
