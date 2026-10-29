@@ -24,15 +24,17 @@ from discord import app_commands
 from discord.http import Route
 from discord.ext import commands, tasks
 
-BUILD_TAG = "CrystalHub-2026-10-29-API-ACCOUNT-HWID-V3"
+BUILD_TAG = "CrystalHub-2026-10-29-API-ACCOUNT-HWID-V4-GUILD-SYNC"
 
 # Render keeps only files under a mounted persistent disk. Set
 # CRYSTAL_HUB_DATA_DIR=/var/data on Render after attaching that disk.
 # Changing the working directory before any data files are loaded places every
 # relative JSON file (users, plans, sources, panels, keys, redeem codes, etc.) there.
 _DATA_DIR = os.getenv("CRYSTAL_HUB_DATA_DIR", "").strip()
-if not _DATA_DIR and os.path.isdir("/var/data"):
-    _DATA_DIR = "/var/data"
+# Do not auto-select /var/data on Render: an unmounted /var/data path can be
+# present but unwritable and crash the bot before Supabase sync starts.
+if not _DATA_DIR:
+    _DATA_DIR = os.getcwd()
 if _DATA_DIR:
     os.makedirs(_DATA_DIR, exist_ok=True)
     os.chdir(_DATA_DIR)
@@ -2790,29 +2792,54 @@ async def _remove_stale_global_commands():
     except Exception as exc:
         print(f"Crystal slash cleanup failed: {type(exc).__name__}: {exc}")
 
+async def _remove_named_global_commands(names):
+    """Remove legacy global copies of commands that are now synced per-guild for instant visibility."""
+    app_id = str(bot.user.id) if bot.user else ""
+    token = os.getenv("DISCORD_TOKEN", "")
+    if not app_id or not token:
+        return
+    wanted = {str(x).lower() for x in names}
+    url = f"https://discord.com/api/v10/applications/{app_id}/commands"
+    headers = {"Authorization": f"Bot {token}"}
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status != 200:
+                    print(f"Crystal global command cleanup list failed: HTTP {resp.status}")
+                    return
+                items = await resp.json()
+            for cmd in items if isinstance(items, list) else []:
+                if str(cmd.get("name", "")).lower() not in wanted:
+                    continue
+                async with session.delete(url + "/" + str(cmd.get("id")), timeout=10) as resp:
+                    print(f"Crystal removed legacy global /{cmd.get('name')}: HTTP {resp.status}")
+    except Exception as exc:
+        print(f"Crystal global command cleanup failed: {type(exc).__name__}: {exc}")
+
+async def _sync_crystal_guild_commands(guild):
+    """Copy the current command tree to a guild so new slash commands appear immediately."""
+    try:
+        bot.tree.clear_commands(guild=guild)
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        print(f"Synced {len(synced)} guild slash commands for {guild.id} ({guild.name}).")
+        print("Crystal guild commands:", ", ".join(sorted(str(c.name) for c in synced)))
+    except Exception as exc:
+        print(f"Could not sync guild commands for {getattr(guild, 'id', '?')}: {type(exc).__name__}: {exc}")
+
 async def on_ready():
     print(f"Crystal Hub build: {BUILD_TAG}")
-    await _remove_stale_global_commands()
+    # Remove legacy global copies so the new per-guild commands do not appear twice.
+    await _remove_named_global_commands({"api", "hwid", "my-plan"})
     if not getattr(bot, "_crystal_admin_view_registered", False):
         bot.add_view(AdminGuideLanguageView())
         bot._crystal_admin_view_registered = True
-    # Remove old guild-specific copies first; registering the same commands
-    # globally and per-guild made Discord show duplicate slash commands.
-    for guild in bot.guilds:
-        try:
-            bot.tree.clear_commands(guild=guild)
-            await bot.tree.sync(guild=guild)
-            print(f"Cleared old guild-specific slash commands for {guild.id} ({guild.name}).")
-        except Exception as e:
-            print(f"Could not clear old guild commands for {guild.id}: {type(e).__name__}: {e}")
 
-    # Register commands globally only, so each command is listed once.
-    try:
-        global_synced = await bot.tree.sync()
-        print(f"Synced {len(global_synced)} global slash commands successfully.")
-        print('Crystal slash commands:', ', '.join(sorted(str(c.name) for c in global_synced)))
-    except Exception as e:
-        print(f"Error syncing global slash commands: {type(e).__name__}: {e}")
+    # IMPORTANT: sync the current global command tree into every guild.
+    # The previous build cleared guild commands and then synced an empty guild tree,
+    # which is why /api and /hwid never appeared. Guild sync is immediate.
+    for guild in bot.guilds:
+        await _sync_crystal_guild_commands(guild)
 
     print(f"Bot connected successfully as: {bot.user}")
     await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
@@ -2822,6 +2849,10 @@ async def on_ready():
     if not getattr(bot, "_crystal_panels_refreshed_this_process", False):
         bot._crystal_panels_refreshed_this_process = True
         await _refresh_saved_panels_after_startup()
+
+@bot.event
+async def on_guild_join(guild):
+    await _sync_crystal_guild_commands(guild)
 
 
 # 1. Generate key (/generate-key and /key)
