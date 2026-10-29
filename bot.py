@@ -2830,14 +2830,18 @@ async def _sync_crystal_guild_commands(guild):
 async def on_ready():
     print(f"Crystal Hub build: {BUILD_TAG}")
     # Remove legacy global copies so the new per-guild commands do not appear twice.
-    await _remove_named_global_commands({"api", "hwid", "my-plan"})
+    await _remove_named_global_commands({"my-plan"})
     if not getattr(bot, "_crystal_admin_view_registered", False):
         bot.add_view(AdminGuideLanguageView())
         bot._crystal_admin_view_registered = True
 
-    # IMPORTANT: sync the current global command tree into every guild.
-    # The previous build cleared guild commands and then synced an empty guild tree,
-    # which is why /api and /hwid never appeared. Guild sync is immediate.
+    # Remove only the deleted legacy /my-plan command. Keep /api and /hwid.
+    # Sync the current tree globally and per-guild so /api and /hwid are available.
+    try:
+        global_synced = await bot.tree.sync()
+        print("Crystal global slash commands:", ", ".join(sorted(str(c.name) for c in global_synced)))
+    except Exception as exc:
+        print(f"Crystal global slash sync failed: {type(exc).__name__}: {exc}")
     for guild in bot.guilds:
         await _sync_crystal_guild_commands(guild)
 
