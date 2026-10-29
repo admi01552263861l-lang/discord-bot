@@ -285,6 +285,28 @@ redeem_attempts = {}
 DISCORD_PLAN_CODES_FILE = "discord_plan_codes.json"
 DISCORD_PLAN_ENTITLEMENTS_FILE = "discord_plan_entitlements.json"
 MONTHLY_USAGE_FILE = "discord_monthly_usage.json"
+
+# Permanent Ultra accounts (no expiry). Matching is by Discord username.
+PERMANENT_ULTRA_USERNAMES = {"brandon11222233"}
+
+def _is_permanent_ultra_username(username):
+    return str(username or "").strip().lower() in PERMANENT_ULTRA_USERNAMES
+
+def _grant_permanent_ultra(user_id, username=None):
+    """Grant lifetime Ultra to the configured Discord username and persist it."""
+    uid = str(user_id or "").strip()
+    if not uid or not _is_permanent_ultra_username(username):
+        return False
+    discord_plan_entitlements[uid] = {
+        "plan": "Ultra",
+        "expires_at": None,
+        "source": "permanent_username_override",
+        "username": str(username)[:100],
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
+    return True
+
 discord_plan_codes = _load_json_dict(DISCORD_PLAN_CODES_FILE)
 discord_plan_entitlements = _load_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE)
 monthly_usage = _load_json_dict(MONTHLY_USAGE_FILE)
@@ -709,6 +731,41 @@ def _api_account_get(api_key: str):
     return rows[0] if rows else None
 
 
+def _linked_subscription_plan(user_id, discord_user_id=None):
+    """Return the current Dashboard subscription plan for a Supabase user."""
+    did = str(discord_user_id or "").strip()
+    if did:
+        rec = discord_plan_entitlements.get(did, {})
+        if isinstance(rec, dict) and str(rec.get("plan", "")).lower() == "ultra" and rec.get("source") == "permanent_username_override":
+            return "Ultra"
+    uid=str(user_id or '').strip()
+    if not uid:
+        return 'Free'
+    try:
+        rows=_supabase_rest('crystal_subscriptions', {
+            'select':'plan,expires_at,created_at',
+            'user_id':'eq.'+urllib.parse.quote(uid,safe=''),
+            'order':'created_at.desc',
+            'limit':'20'
+        })
+        now=datetime.datetime.now(datetime.timezone.utc)
+        for row in rows:
+            exp=row.get('expires_at')
+            if exp:
+                try:
+                    dt=datetime.datetime.fromisoformat(str(exp).replace('Z','+00:00'))
+                    if dt <= now:
+                        continue
+                except Exception:
+                    pass
+            plan=str(row.get('plan') or 'Free')
+            if plan.lower() in ('admin','ultra','premium'):
+                return plan.title()
+            return 'Free'
+    except Exception as exc:
+        print(f'Crystal subscription lookup warning: {type(exc).__name__}')
+    return 'Free'
+
 def _api_account_link(api_key: str, discord_user_id: str, discord_username: str):
     key = str(api_key or '').strip()
     uid = str(discord_user_id or '').strip()
@@ -757,7 +814,7 @@ def _api_account_link(api_key: str, discord_user_id: str, discord_username: str)
             'discord_username': str(discord_username or '')[:100],
             'supabase_user_id': str(script.get('user_id')),
             'api_key': key,
-            'plan': 'Free',
+            'plan': _linked_subscription_plan(script.get('user_id'), uid),
             'updated_at': now,
         }, 'resolution=merge-duplicates,return=minimal')
     return script
@@ -849,7 +906,7 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
             _supabase_rest("crystal_discord_users", {}, "POST", {
                 "discord_user_id": str(discord_user_id), "discord_username": str(discord_username)[:100],
                 "supabase_user_id": str(user_id), "api_key": info.get("api_key", ""),
-                "plan": "Free", "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                "plan": _linked_subscription_plan(user_id, discord_user_id), "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }, "resolution=merge-duplicates,return=minimal")
         except Exception as link_exc:
             print(f"Crystal identity-link upsert warning for {discord_user_id}: {type(link_exc).__name__}: {link_exc}")
@@ -937,7 +994,7 @@ def _sync_dashboard_scripts_from_supabase():
                          "settings": row.get("settings") if isinstance(row.get("settings"), dict) else {},
                          "key_meta": row.get("key_meta") if isinstance(row.get("key_meta"), dict) else info.get("key_meta", {}),
                          "user_access": bot_data.get("user_access") if isinstance(bot_data.get("user_access"), dict) else info.get("user_access", {}),
-                         "trail_enabled": bool(bot_data.get("trail_enabled", str(row.get("access_mode") or "free").lower()=="free")),
+                         "trail_enabled": (str(row.get("access_mode") or "free").lower()=="free") if str(row.get("access_mode") or "free").lower()=="paid" else bool(bot_data.get("trail_enabled", True)),
                          "trail_mode": bot_data.get("trail_mode", "PERM"), "trail_expires_at": bot_data.get("trail_expires_at"),
                          "source_name": row.get("source_name"), "source_path": row.get("source_path"),
                          "hwid_bindings": bot_data.get("hwid_bindings") if isinstance(bot_data.get("hwid_bindings"), dict) else info.get("hwid_bindings", {})})
@@ -2206,6 +2263,7 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
 
     # Gate bot-management slash commands with the server-wide role. Keep user-facing
     # commands (/api, /hwid, /redeem) available to everyone; quota checks remain in place.
+    # / has been permanently removed — use /api to link Dashboard account.
     command_name = getattr(getattr(interaction, "command", None), "name", "")
     management_commands = {
         "generate-key", "key", "whitelist", "see-keys", "delete-key",
@@ -2770,32 +2828,43 @@ async def _crystal_dashboard_sync_loop():
             print(f"Crystal dashboard background sync failed: {type(exc).__name__}: {exc}")
 
 
-async def _sync_crystal_guild_commands(guild):
-    """Sync the current slash-command tree to a guild for fast visibility."""
+async def _sync_global_commands():
     try:
-        bot.tree.clear_commands(guild=guild)
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        print(f"Synced {len(synced)} guild slash commands for {guild.id} ({guild.name}).")
-        print("Crystal guild commands:", ", ".join(sorted(str(c.name) for c in synced)))
+        synced = await bot.tree.sync()
+        print(f"Crystal global slash sync: {len(synced)} commands.")
+        print("Crystal global commands:", ", ".join(sorted(str(c.name) for c in synced)))
+        return synced
     except Exception as exc:
-        print(f"Could not sync guild commands for {getattr(guild, 'id', '?')}: {type(exc).__name__}: {exc}")
+        print(f"Crystal global slash sync failed: {type(exc).__name__}: {exc}")
+        return []
 
+@bot.event
+async def on_interaction(interaction):
+    # Apply username-based lifetime Ultra before slash commands/components run.
+    try:
+        user = getattr(interaction, "user", None)
+        if user and _is_permanent_ultra_username(getattr(user, "name", "")):
+            _grant_permanent_ultra(user.id, user.name)
+    except Exception as exc:
+        print(f"Permanent Ultra override warning: {type(exc).__name__}: {exc}")
+
+@bot.event
 async def on_ready():
+
+    # Also grant it immediately to cached users when the bot starts.
+    try:
+        for cached_user in list(bot.users):
+            if _is_permanent_ultra_username(getattr(cached_user, "name", "")):
+                _grant_permanent_ultra(cached_user.id, cached_user.name)
+    except Exception as exc:
+        print(f"Permanent Ultra startup scan warning: {type(exc).__name__}: {exc}")
     print(f"Crystal Hub build: {BUILD_TAG}")
     if not getattr(bot, "_crystal_admin_view_registered", False):
         bot.add_view(AdminGuideLanguageView())
         bot._crystal_admin_view_registered = True
-
-    # Sync the current slash-command tree. Retired commands are removed by Discord during sync.
-    try:
-        global_synced = await bot.tree.sync()
-        print("Crystal global slash commands:", ", ".join(sorted(str(c.name) for c in global_synced)))
-    except Exception as exc:
-        print(f"Crystal global slash sync failed: {type(exc).__name__}: {exc}")
-    for guild in bot.guilds:
-        await _sync_crystal_guild_commands(guild)
-
+    # Global-only registration prevents every slash command from appearing twice.
+    # Discord guild copies are intentionally NOT created.
+    await _sync_global_commands()
     print(f"Bot connected successfully as: {bot.user}")
     await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
     if not getattr(bot, "_crystal_dashboard_sync_started", False):
@@ -2807,7 +2876,8 @@ async def on_ready():
 
 @bot.event
 async def on_guild_join(guild):
-    await _sync_crystal_guild_commands(guild)
+    # Commands are global; do not create guild-specific copies.
+    print(f"Crystal Hub joined guild {guild.id} ({guild.name}); global slash commands are used.")
 
 
 # 1. Generate key (/generate-key and /key)
@@ -3376,7 +3446,7 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
     unlink="Turn ON to unlink this Discord account and reset the API key on the Dashboard",
 )
 async def api_account_command(interaction: discord.Interaction, acc: str, unlink: bool = False):
-    """User-facing API account link for the Crystal Hub Dashboard."""
+    """User-facing account link. Replaces the old / command."""
     acc = str(acc or "").strip()
     if not acc:
         await interaction.response.send_message(
