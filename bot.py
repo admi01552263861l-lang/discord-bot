@@ -24,7 +24,7 @@ from discord import app_commands
 from discord.http import Route
 from discord.ext import commands, tasks
 
-BUILD_TAG = "CrystalHub-2026-10-29-SUPABASE-HWID-V2"
+BUILD_TAG = "CrystalHub-2026-10-29-API-ACCOUNT-HWID-V3"
 
 # Render keeps only files under a mounted persistent disk. Set
 # CRYSTAL_HUB_DATA_DIR=/var/data on Render after attaching that disk.
@@ -697,6 +697,138 @@ def _load_script_from_supabase_api_key(api_key: str) -> dict:
             "source_name": row.get("source_name"), "source_path": row.get("source_path")}
 
 
+def _api_account_get(api_key: str):
+    key = str(api_key or '').strip()
+    if not key:
+        return None
+    rows = _supabase_rest('crystal_api_accounts', {
+        'select': '*', 'api_key': 'eq.' + urllib.parse.quote(key, safe=''), 'limit': '1'
+    })
+    return rows[0] if rows else None
+
+
+def _api_account_link(api_key: str, discord_user_id: str, discord_username: str):
+    key = str(api_key or '').strip()
+    uid = str(discord_user_id or '').strip()
+    if not key or not uid:
+        raise ValueError('API key and Discord user are required.')
+    rows = _supabase_rest('crystal_scripts', {
+        'select': 'id,name,api_key,user_id,guest_id,discord_user_id,discord_username,bot_data',
+        'api_key': 'eq.' + urllib.parse.quote(key, safe=''), 'limit': '1'
+    })
+    if not rows:
+        raise ValueError('API key not found. Copy the API key from the Dashboard.')
+    script = rows[0]
+    existing = _api_account_get(key)
+    if existing and str(existing.get('discord_user_id') or '') not in ('', uid):
+        raise ValueError('This API key is already linked to another Discord account.')
+    owner = str(script.get('discord_user_id') or '')
+    if owner and owner != uid:
+        raise ValueError('This script is already linked to another Discord account.')
+    now = _iso_now()
+    bd = script.get('bot_data') if isinstance(script.get('bot_data'), dict) else {}
+    bd = dict(bd)
+    bd['api_account_linked'] = True
+    bd['api_account_discord_user_id'] = uid
+    _supabase_rest('crystal_scripts', {'id': 'eq.' + str(script['id'])}, 'PATCH', {
+        'discord_user_id': uid,
+        'discord_username': str(discord_username or '')[:100],
+        'bot_data': bd,
+        'updated_at': now,
+    }, 'return=minimal')
+    _supabase_rest('crystal_api_accounts', {}, 'POST', {
+        'api_key': key,
+        'script_id': str(script['id']),
+        'discord_user_id': uid,
+        'discord_username': str(discord_username or '')[:100],
+        'supabase_user_id': str(script.get('user_id') or '') or None,
+        'guest_id': str(script.get('guest_id') or '') or None,
+        'updated_at': now,
+        'linked_at': (existing or {}).get('linked_at') or now,
+    }, 'resolution=merge-duplicates,return=minimal')
+    # Keep the existing identity bridge in sync when this API key belongs to a
+    # logged-in Dashboard account. Some Discord-created scripts have no Supabase
+    # user yet, so do not insert a NULL supabase_user_id into that legacy table.
+    if script.get('user_id'):
+        _supabase_rest('crystal_discord_users', {}, 'POST', {
+            'discord_user_id': uid,
+            'discord_username': str(discord_username or '')[:100],
+            'supabase_user_id': str(script.get('user_id')),
+            'api_key': key,
+            'plan': 'Free',
+            'updated_at': now,
+        }, 'resolution=merge-duplicates,return=minimal')
+    return script
+
+
+def _api_account_reset(api_key: str, owner_user_id: str = '', guest_id: str = '', discord_user_id: str = ''):
+    key = str(api_key or '').strip()
+    if not key:
+        raise ValueError('API key is required.')
+    rows = _supabase_rest('crystal_scripts', {
+        'select': 'id,name,api_key,user_id,guest_id,discord_user_id,discord_username,bot_data',
+        'api_key': 'eq.' + urllib.parse.quote(key, safe=''), 'limit': '1'
+    })
+    if not rows:
+        raise ValueError('API key not found.')
+    script = rows[0]
+    if owner_user_id and str(script.get('user_id') or '') != str(owner_user_id):
+        raise PermissionError('This API key does not belong to your account.')
+    if guest_id and str(script.get('guest_id') or '') != str(guest_id):
+        raise PermissionError('This API key does not belong to this Guest account.')
+    if discord_user_id and str(script.get('discord_user_id') or '') not in ('', str(discord_user_id)):
+        raise PermissionError('This API key is linked to another Discord account.')
+    new_key = 'CH-' + secrets.token_urlsafe(24).replace('-', '').replace('_', '')[:28] + '-' + secrets.token_hex(5)
+    while _supabase_rest('crystal_scripts', {'select': 'id', 'api_key': 'eq.' + urllib.parse.quote(new_key, safe=''), 'limit': '1'}):
+        new_key = 'CH-' + secrets.token_urlsafe(24).replace('-', '').replace('_', '')[:28] + '-' + secrets.token_hex(5)
+    _supabase_rest('crystal_api_accounts', {'api_key': 'eq.' + urllib.parse.quote(key, safe='')}, 'DELETE', None, 'return=minimal')
+    # Remove the old API key from the Discord identity bridge as well.
+    try:
+        _supabase_rest('crystal_discord_users', {'api_key': 'eq.' + urllib.parse.quote(key, safe='')}, 'DELETE', None, 'return=minimal')
+    except Exception:
+        pass
+    bd = script.get('bot_data') if isinstance(script.get('bot_data'), dict) else {}
+    bd = dict(bd)
+    bd.pop('api_account_linked', None)
+    bd.pop('api_account_discord_user_id', None)
+    _supabase_rest('crystal_scripts', {'id': 'eq.' + str(script['id'])}, 'PATCH', {
+        'api_key': new_key,
+        'discord_user_id': None,
+        'discord_username': None,
+        'bot_data': bd,
+        'updated_at': _iso_now(),
+    }, 'return=minimal')
+    # Update the live bot copy immediately so the old API disappears without waiting
+    # for the next background sync cycle.
+    try:
+        for local_name, local_info in scripts_data.items():
+            if str(local_info.get('supabase_row_id') or '') == str(script['id']) or str(local_info.get('api_key') or '') == key:
+                local_info['api_key'] = new_key
+                local_info.pop('supabase_row_id', None) if not script.get('id') else None
+                local_info['created_by'] = local_info.get('created_by')
+                local_info['discord_user_id'] = None
+                local_info['discord_username'] = None
+                local_info['api_account_linked'] = False
+        save_data()
+    except Exception as exc:
+        print(f'API reset local-state warning: {type(exc).__name__}: {exc}')
+    return {**script, 'api_key': new_key, 'discord_user_id': None, 'discord_username': None}
+
+
+def _api_account_reset_from_script(script_id: str, owner_user_id: str = '', guest_id: str = ''):
+    sid = str(script_id or '').strip()
+    if not sid:
+        raise ValueError('Script id is required.')
+    rows = _supabase_rest('crystal_scripts', {
+        'select': 'id,name,api_key,user_id,guest_id,discord_user_id,discord_username,bot_data',
+        'id': 'eq.' + urllib.parse.quote(sid, safe=''), 'limit': '1'
+    })
+    if not rows:
+        raise ValueError('Script not found.')
+    script = rows[0]
+    return _api_account_reset(str(script.get('api_key') or ''), owner_user_id, guest_id)
+
+
 def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str, discord_username: str, guild_id=None):
     """Push bot-created/updated scripts into the dashboard table when the account is linked."""
     try:
@@ -766,6 +898,13 @@ def _sync_dashboard_scripts_from_supabase():
         links = _supabase_rest("crystal_discord_users", {"select": "discord_user_id,supabase_user_id"})
         user_map = {str(x.get("supabase_user_id")): str(x.get("discord_user_id"))
                     for x in links if x.get("supabase_user_id") and x.get("discord_user_id")}
+        try:
+            api_links = _supabase_rest("crystal_api_accounts", {"select": "discord_user_id,supabase_user_id"})
+            for x in api_links:
+                if x.get("supabase_user_id") and x.get("discord_user_id"):
+                    user_map[str(x.get("supabase_user_id"))] = str(x.get("discord_user_id"))
+        except Exception:
+            pass
         rows = _supabase_rest("crystal_scripts", {
             "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data,fast_mode,obfuscator,ultra_safe,loader_code,access_mode,disabled,webhook_url,settings,key_meta,source_name,source_path"
         })
@@ -1280,8 +1419,59 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             print(f"Guest script delete failed: {type(exc).__name__}: {exc}")
             self._send_text(500, json.dumps({"error": "Could not delete Guest script."}))
 
+    def _api_account_status(self):
+        try:
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            api_key = str((query.get('apiKey') or [''])[0]).strip()
+            token = str((query.get('accessToken') or [''])[0]).strip() or str(self.headers.get('X-Access-Token','')).strip()
+            guest_id = str((query.get('guestId') or [''])[0]).strip()[:128]
+            user = _verify_supabase_access_token(token) if token else None
+            rows = _supabase_rest('crystal_scripts', {
+                'select': 'id,name,api_key,user_id,guest_id,discord_user_id,discord_username',
+                'api_key': 'eq.' + urllib.parse.quote(api_key, safe=''), 'limit': '1'
+            })
+            if not rows:
+                self._send_text(404, json.dumps({'error':'API key not found.'})); return
+            row = rows[0]
+            if user and str(row.get('user_id') or '') != str(user['id']):
+                self._send_text(403, json.dumps({'error':'This API key does not belong to your account.'})); return
+            if not user and guest_id and str(row.get('guest_id') or '') != guest_id:
+                self._send_text(403, json.dumps({'error':'This API key does not belong to this Guest account.'})); return
+            if not user and not guest_id:
+                self._send_text(401, json.dumps({'error':'Login or Guest account required.'})); return
+            account = _api_account_get(api_key)
+            self._send_text(200, json.dumps({'ok':True,'script':row,'account':account}, ensure_ascii=False));
+        except Exception as exc:
+            print(f'API account status failed: {type(exc).__name__}: {exc}')
+            self._send_text(500, json.dumps({'error':'Could not load API account status.'}))
+
+    def _api_account_reset_http(self):
+        try:
+            length = int(self.headers.get('Content-Length','0'))
+            if length <= 0 or length > 32768:
+                self._send_text(400, json.dumps({'error':'invalid request'})); return
+            body = json.loads(self.rfile.read(length).decode('utf-8'))
+            api_key = str(body.get('apiKey','')).strip()
+            token = str(body.get('accessToken','')).strip()
+            guest_id = str(body.get('guestId','')).strip()[:128]
+            user = _verify_supabase_access_token(token) if token else None
+            if not user and not guest_id:
+                self._send_text(401, json.dumps({'error':'Login or Guest account required.'})); return
+            result = _api_account_reset(api_key, str(user['id']) if user else '', guest_id)
+            self._send_text(200, json.dumps({'ok':True,'script':result}, ensure_ascii=False))
+        except PermissionError as exc:
+            self._send_text(403, json.dumps({'error':str(exc)}));
+        except ValueError as exc:
+            self._send_text(404, json.dumps({'error':str(exc)}));
+        except Exception as exc:
+            print(f'API account reset failed: {type(exc).__name__}: {exc}')
+            self._send_text(500, json.dumps({'error':'Could not reset the API key.'}))
+
     def do_POST(self):
         parsed_path = urllib.parse.urlparse(self.path)
+        if parsed_path.path == '/api/api-account-reset':
+            self._api_account_reset_http()
+            return
         if parsed_path.path == "/api/dashboard-script-sync":
             self._dashboard_script_sync()
             return
@@ -1380,6 +1570,9 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed_path = urllib.parse.urlparse(self.path)
+        if parsed_path.path == '/api/api-account':
+            self._api_account_status()
+            return
         path_parts = parsed_path.path.strip("/").split("/")
         if parsed_path.path == "/api/guest-scripts":
             self._guest_scripts_list()
@@ -2617,6 +2810,7 @@ async def on_ready():
     try:
         global_synced = await bot.tree.sync()
         print(f"Synced {len(global_synced)} global slash commands successfully.")
+        print('Crystal slash commands:', ', '.join(sorted(str(c.name) for c in global_synced)))
     except Exception as e:
         print(f"Error syncing global slash commands: {type(e).__name__}: {e}")
 
@@ -3187,6 +3381,37 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
         "It does **not** bypass Free/Premium/Ultra quotas or redeem-code requirements.",
         ephemeral=True,
     )
+
+
+# API account linking — connects a Dashboard API key to this Discord account.
+@bot.tree.command(name="api", description="Link or unlink a Crystal Hub Dashboard API account")
+@app_commands.describe(
+    acc="The Crystal Hub API key from your Dashboard",
+    unlink="Set true to unlink this API account and automatically reset the API key on the Dashboard",
+)
+async def api_account_command(interaction: discord.Interaction, acc: str, unlink: bool = False):
+    try:
+        if unlink:
+            result = await asyncio.to_thread(_api_account_reset, acc, '', '', str(interaction.user.id))
+            await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
+            await interaction.response.send_message(
+                f"✅ API account unlinked. The old API key was removed and the Dashboard generated a new API key for **{result.get('name','script')}**.\n"
+                "Open the Dashboard to copy the new key.", ephemeral=True
+            )
+            return
+        script = await asyncio.to_thread(_api_account_link, acc, str(interaction.user.id), str(interaction.user))
+        await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
+        await interaction.response.send_message(
+            f"✅ API account linked to **{script.get('name','script')}**.\n"
+            "Dashboard and Discord are now connected for this API key.", ephemeral=True
+        )
+    except PermissionError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+    except Exception as exc:
+        print(f"API account command failed: {type(exc).__name__}: {exc}")
+        await interaction.response.send_message("❌ Could not update the API account. Check that the Dashboard API key is valid.", ephemeral=True)
 
 
 # 7. إعداد البانل
