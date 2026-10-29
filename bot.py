@@ -24,7 +24,7 @@ from discord import app_commands
 from discord.http import Route
 from discord.ext import commands, tasks
 
-BUILD_TAG = "CrystalHub-2026-10-29-API-ACCOUNT-HWID-V4-GUILD-SYNC"
+BUILD_TAG = "CrystalHub-2026-10-29-API-ACCOUNT-HWID-DEDUPED-SYNC-V5"
 
 # Render keeps only files under a mounted persistent disk. Set
 # CRYSTAL_HUB_DATA_DIR=/var/data on Render after attaching that disk.
@@ -766,7 +766,7 @@ def _linked_subscription_plan(user_id, discord_user_id=None):
         print(f'Crystal subscription lookup warning: {type(exc).__name__}')
     return 'Free'
 
-def _api_account_link(api_key: str, discord_user_id: str, discord_username: str):
+def _api_account_link(api_key: str, discord_user_id: str, discord_username: str, discord_avatar_url: str = ""):
     key = str(api_key or '').strip()
     uid = str(discord_user_id or '').strip()
     if not key or not uid:
@@ -789,6 +789,8 @@ def _api_account_link(api_key: str, discord_user_id: str, discord_username: str)
     bd = dict(bd)
     bd['api_account_linked'] = True
     bd['api_account_discord_user_id'] = uid
+    if discord_avatar_url:
+        bd['api_account_discord_avatar_url'] = str(discord_avatar_url)[:1000]
     _supabase_rest('crystal_scripts', {'id': 'eq.' + str(script['id'])}, 'PATCH', {
         'discord_user_id': uid,
         'discord_username': str(discord_username or '')[:100],
@@ -1486,7 +1488,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             guest_id = str((query.get('guestId') or [''])[0]).strip()[:128]
             user = _verify_supabase_access_token(token) if token else None
             rows = _supabase_rest('crystal_scripts', {
-                'select': 'id,name,api_key,user_id,guest_id,discord_user_id,discord_username',
+                'select': 'id,name,api_key,user_id,guest_id,discord_user_id,discord_username,bot_data',
                 'api_key': 'eq.' + urllib.parse.quote(api_key, safe=''), 'limit': '1'
             })
             if not rows:
@@ -1499,6 +1501,11 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             if not user and not guest_id:
                 self._send_text(401, json.dumps({'error':'Login or Guest account required.'})); return
             account = _api_account_get(api_key)
+            if account is None and row.get('discord_user_id'):
+                account = {'api_key': api_key, 'discord_user_id': row.get('discord_user_id'), 'discord_username': row.get('discord_username')}
+            if account is not None:
+                bot_data = row.get('bot_data') if isinstance(row.get('bot_data'), dict) else {}
+                account['discord_avatar_url'] = str(bot_data.get('api_account_discord_avatar_url') or '')
             self._send_text(200, json.dumps({'ok':True,'script':row,'account':account}, ensure_ascii=False));
         except Exception as exc:
             print(f'API account status failed: {type(exc).__name__}: {exc}')
@@ -2828,6 +2835,22 @@ async def _crystal_dashboard_sync_loop():
             print(f"Crystal dashboard background sync failed: {type(exc).__name__}: {exc}")
 
 
+async def _clear_legacy_guild_command_copies():
+    """Remove old guild-scoped copies so each command exists only globally.
+
+    Older builds synced commands both globally and per-guild, making every slash
+    command appear twice. Current builds use global commands only. This startup
+    migration clears remote guild command lists; it does not delete global commands
+    and it does not expose a cleanup slash command to users.
+    """
+    for guild in list(bot.guilds):
+        try:
+            bot.tree.clear_commands(guild=guild)
+            await bot.tree.sync(guild=guild)
+            print(f"Crystal legacy guild commands cleared: {guild.name} ({guild.id})")
+        except Exception as exc:
+            print(f"Could not clear legacy guild commands for {guild.id}: {type(exc).__name__}: {exc}")
+
 async def _sync_global_commands():
     try:
         synced = await bot.tree.sync()
@@ -2862,8 +2885,11 @@ async def on_ready():
     if not getattr(bot, "_crystal_admin_view_registered", False):
         bot.add_view(AdminGuideLanguageView())
         bot._crystal_admin_view_registered = True
-    # Global-only registration prevents every slash command from appearing twice.
-    # Discord guild copies are intentionally NOT created.
+    # First remove legacy guild-scoped copies created by older builds, then sync
+    # one canonical global command set. This prevents duplicate slash commands.
+    if not getattr(bot, "_crystal_legacy_guild_copies_cleared", False):
+        await _clear_legacy_guild_command_copies()
+        bot._crystal_legacy_guild_copies_cleared = True
     await _sync_global_commands()
     print(f"Bot connected successfully as: {bot.user}")
     await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
@@ -2876,7 +2902,12 @@ async def on_ready():
 
 @bot.event
 async def on_guild_join(guild):
-    # Commands are global; do not create guild-specific copies.
+    # Keep new servers free of legacy guild-specific command copies too.
+    try:
+        bot.tree.clear_commands(guild=guild)
+        await bot.tree.sync(guild=guild)
+    except Exception as exc:
+        print(f"Could not clear guild-specific commands for {guild.id}: {type(exc).__name__}: {exc}")
     print(f"Crystal Hub joined guild {guild.id} ({guild.name}); global slash commands are used.")
 
 
@@ -3466,7 +3497,7 @@ async def api_account_command(interaction: discord.Interaction, acc: str, unlink
                 ephemeral=True,
             )
             return
-        script = await asyncio.to_thread(_api_account_link, acc, str(interaction.user.id), str(interaction.user))
+        script = await asyncio.to_thread(_api_account_link, acc, str(interaction.user.id), str(interaction.user), str(interaction.user.display_avatar.url))
         await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
         await interaction.response.send_message(
             f"✅ Linked to **{script.get('name', 'script')}**.\n"
