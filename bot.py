@@ -2206,7 +2206,6 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
 
     # Gate bot-management slash commands with the server-wide role. Keep user-facing
     # commands (/api, /hwid, /redeem) available to everyone; quota checks remain in place.
-    # /my-plan has been permanently removed — use /api to link Dashboard account.
     command_name = getattr(getattr(interaction, "command", None), "name", "")
     management_commands = {
         "generate-key", "key", "whitelist", "see-keys", "delete-key",
@@ -2771,59 +2770,6 @@ async def _crystal_dashboard_sync_loop():
             print(f"Crystal dashboard background sync failed: {type(exc).__name__}: {exc}")
 
 
-async def _force_remove_stale_remote_commands():
-    """Remove remote slash commands that no longer exist in this bot.py.
-
-    Also permanently purges retired commands (e.g. my-plan) so they never stay
-    visible after a bot update. /api replaces the old plan-check command.
-    """
-    import aiohttp
-
-    token = os.getenv("DISCORD_TOKEN", "").strip()
-    app_id = str(getattr(bot.user, "id", "") or "")
-    if not token or not app_id:
-        return
-
-    # Permanently retired — never keep these on Discord.
-    FORCED_DELETE = {
-        "my-plan", "my_plan", "myplan", "plan", "plans",
-    }
-    current_names = {str(cmd.name) for cmd in bot.tree.get_commands()} - FORCED_DELETE
-    headers = {"Authorization": f"Bot {token}"}
-
-    async with aiohttp.ClientSession(headers=headers) as session:
-        targets = [(
-            f"https://discord.com/api/v10/applications/{app_id}/commands",
-            "global",
-        )]
-        targets.extend((
-            f"https://discord.com/api/v10/applications/{app_id}/guilds/{guild.id}/commands",
-            f"guild:{guild.id}",
-        ) for guild in bot.guilds)
-
-        for url, label in targets:
-            try:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        print(f"Could not read {label} commands: HTTP {resp.status}")
-                        continue
-                    remote = await resp.json()
-
-                for cmd in remote if isinstance(remote, list) else []:
-                    name = str(cmd.get("name", ""))
-                    command_id = str(cmd.get("id", ""))
-                    if not command_id:
-                        continue
-                    if name in FORCED_DELETE or name not in current_names:
-                        async with session.delete(f"{url}/{command_id}") as delete_resp:
-                            if delete_resp.status in (200, 204):
-                                reason = "retired" if name in FORCED_DELETE else "stale"
-                                print(f"Removed {reason} {label} slash command: {name}")
-                            else:
-                                print(f"Failed removing {label} command {name}: HTTP {delete_resp.status}")
-            except Exception as exc:
-                print(f"Stale-command cleanup failed for {label}: {type(exc).__name__}: {exc}")
-
 async def _sync_crystal_guild_commands(guild):
     """Sync the current slash-command tree to a guild for fast visibility."""
     try:
@@ -2841,8 +2787,7 @@ async def on_ready():
         bot.add_view(AdminGuideLanguageView())
         bot._crystal_admin_view_registered = True
 
-    # First remove commands that were deleted from bot.py, then sync the current tree.
-    await _force_remove_stale_remote_commands()
+    # Sync the current slash-command tree. Retired commands are removed by Discord during sync.
     try:
         global_synced = await bot.tree.sync()
         print("Crystal global slash commands:", ", ".join(sorted(str(c.name) for c in global_synced)))
@@ -3431,7 +3376,7 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
     unlink="Turn ON to unlink this Discord account and reset the API key on the Dashboard",
 )
 async def api_account_command(interaction: discord.Interaction, acc: str, unlink: bool = False):
-    """User-facing account link. Replaces the old /my-plan command."""
+    """User-facing API account link for the Crystal Hub Dashboard."""
     acc = str(acc or "").strip()
     if not acc:
         await interaction.response.send_message(
