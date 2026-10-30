@@ -1,3 +1,4 @@
+# Crystal Hub Bot v4 — Guest redeem + plan quota enforcement
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import asyncio
@@ -24,7 +25,7 @@ from discord import app_commands
 from discord.http import Route
 from discord.ext import commands, tasks
 
-BUILD_TAG = "CrystalHub-2026-10-29-API-ACCOUNT-HWID-V4-GUILD-SYNC"
+BUILD_TAG = "CrystalHub-2026-10-30-DURABLE-SUPABASE-SCRIPTS-V1"
 
 # Render keeps only files under a mounted persistent disk. Set
 # CRYSTAL_HUB_DATA_DIR=/var/data on Render after attaching that disk.
@@ -699,6 +700,96 @@ def _load_script_from_supabase_api_key(api_key: str) -> dict:
             "source_name": row.get("source_name"), "source_path": row.get("source_path")}
 
 
+def _account_api_generate():
+    return 'CA-' + secrets.token_urlsafe(36).replace('-', '').replace('_', '')[:48]
+
+
+def _account_api_get_by_owner(user_id: str = '', guest_id: str = ''):
+    uid = str(user_id or '').strip()
+    gid = str(guest_id or '').strip()
+    if uid:
+        rows = _supabase_rest('crystal_api_accounts', {
+            'select': '*', 'account_type': 'eq.account',
+            'supabase_user_id': 'eq.' + urllib.parse.quote(uid, safe=''), 'limit': '1'
+        })
+    elif gid:
+        rows = _supabase_rest('crystal_api_accounts', {
+            'select': '*', 'account_type': 'eq.account',
+            'guest_id': 'eq.' + urllib.parse.quote(gid, safe=''), 'limit': '1'
+        })
+    else:
+        return None
+    return rows[0] if rows else None
+
+
+def _account_api_get_or_create(user_id: str = '', guest_id: str = '', discord_user_id: str = '', discord_username: str = ''):
+    uid = str(user_id or '').strip()
+    gid = str(guest_id or '').strip()
+    if not uid and not gid:
+        raise ValueError('Account identity is required.')
+    existing = _account_api_get_by_owner(uid, gid)
+    now = _iso_now()
+    if existing:
+        patch = {'updated_at': now}
+        if discord_user_id:
+            patch['discord_user_id'] = str(discord_user_id)
+            patch['discord_username'] = str(discord_username or '')[:100]
+        _supabase_rest('crystal_api_accounts', {'id': 'eq.' + str(existing.get('id'))}, 'PATCH', patch, 'return=minimal')
+        return {**existing, **patch}
+    key = _account_api_generate()
+    while _supabase_rest('crystal_api_accounts', {'select': 'id', 'api_key': 'eq.' + urllib.parse.quote(key, safe=''), 'limit': '1'}):
+        key = _account_api_generate()
+    payload = {
+        'account_type': 'account', 'api_key': key,
+        'supabase_user_id': uid or None, 'guest_id': gid or None,
+        'discord_user_id': str(discord_user_id or '') or None,
+        'discord_username': str(discord_username or '')[:100] or None,
+        'linked_at': now, 'updated_at': now,
+    }
+    rows = _supabase_rest('crystal_api_accounts', {}, 'POST', payload, 'resolution=merge-duplicates,return=representation')
+    return rows[0] if rows else payload
+
+
+def _account_api_reset(user_id: str = '', guest_id: str = ''):
+    old = _account_api_get_by_owner(user_id, guest_id)
+    if not old:
+        return _account_api_get_or_create(user_id, guest_id)
+    key = _account_api_generate()
+    while _supabase_rest('crystal_api_accounts', {'select': 'id', 'api_key': 'eq.' + urllib.parse.quote(key, safe=''), 'limit': '1'}):
+        key = _account_api_generate()
+    patch = {'api_key': key, 'discord_user_id': None, 'discord_username': None, 'linked_at': _iso_now(), 'updated_at': _iso_now()}
+    rows = _supabase_rest('crystal_api_accounts', {'id': 'eq.' + str(old.get('id'))}, 'PATCH', patch, 'return=representation')
+    return rows[0] if rows else {**old, **patch}
+
+
+def _account_api_link(api_key: str, discord_user_id: str, discord_username: str):
+    key = str(api_key or '').strip()
+    uid = str(discord_user_id or '').strip()
+    if not key or not uid:
+        raise ValueError('API key and Discord user are required.')
+    rows = _supabase_rest('crystal_api_accounts', {
+        'select': '*', 'api_key': 'eq.' + urllib.parse.quote(key, safe=''),
+        'account_type': 'eq.account', 'limit': '1'
+    })
+    if not rows:
+        raise ValueError('Account API key not found. Generate it from Dashboard Settings.')
+    account = rows[0]
+    owner = str(account.get('discord_user_id') or '')
+    if owner and owner != uid:
+        raise ValueError('This Account API key is already linked to another Discord account.')
+    patch = {'discord_user_id': uid, 'discord_username': str(discord_username or '')[:100], 'linked_at': _iso_now(), 'updated_at': _iso_now()}
+    updated = _supabase_rest('crystal_api_accounts', {'id': 'eq.' + str(account.get('id'))}, 'PATCH', patch, 'return=representation')
+    # Link the Discord identity to the Dashboard account without tying the Account API to a script.
+    if account.get('supabase_user_id'):
+        _supabase_rest('crystal_discord_users', {}, 'POST', {
+            'discord_user_id': uid, 'discord_username': str(discord_username or '')[:100],
+            'supabase_user_id': str(account.get('supabase_user_id')),
+            'api_key': key, 'plan': _linked_subscription_plan(account.get('supabase_user_id')),
+            'updated_at': _iso_now(),
+        }, 'resolution=merge-duplicates,return=minimal')
+    return updated[0] if updated else {**account, **patch}
+
+
 def _api_account_get(api_key: str):
     key = str(api_key or '').strip()
     if not key:
@@ -862,54 +953,101 @@ def _api_account_reset_from_script(script_id: str, owner_user_id: str = '', gues
 
 
 def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str, discord_username: str, guild_id=None):
-    """Push bot-created/updated scripts into the dashboard table when the account is linked."""
+    """Persist a bot script in Supabase even when the Discord user has no Dashboard login yet.
+
+    Supabase is the durable source of truth for scripts. The complete bot-side state is
+    stored in bot_data so keys, whitelist grants, panels, trial/access state and HWID
+    bindings survive Render redeploys and bot updates.
+    """
     try:
-        user_id = info.get("supabase_user_id")
-        if not user_id:
-            linked = _supabase_rest("crystal_discord_users", {
-                "select": "supabase_user_id", "discord_user_id": "eq." + str(discord_user_id), "limit": "1"
-            })
-            user_id = linked[0].get("supabase_user_id") if linked else None
-        if not user_id:
-            print(f"Crystal sync: Discord user {discord_user_id} is not linked to a Supabase account; script kept locally.")
-            return False
-        info["supabase_user_id"] = str(user_id)
-        # Persist the Discord <-> Supabase identity bridge so future dashboard scripts sync too.
-        try:
-            _supabase_rest("crystal_discord_users", {}, "POST", {
-                "discord_user_id": str(discord_user_id), "discord_username": str(discord_username)[:100],
-                "supabase_user_id": str(user_id), "api_key": info.get("api_key", ""),
-                "plan": _linked_subscription_plan(user_id), "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
-            }, "resolution=merge-duplicates,return=minimal")
-        except Exception as link_exc:
-            print(f"Crystal identity-link upsert warning for {discord_user_id}: {type(link_exc).__name__}: {link_exc}")
-        row = {"user_id": str(user_id), "name": script_name, "api_key": info.get("api_key", ""),
-               "script": info.get("source_code", ""), "source_code": info.get("source_code", ""),
-               "fast_mode": bool(info.get("fast_mode", False)), "obfuscator": bool(info.get("obfuscator", False)),
-               "ultra_safe": bool(info.get("ultra_safe", False)), "discord_user_id": str(discord_user_id),
-               "discord_username": str(discord_username)[:100], "guild_id": str(guild_id) if guild_id else None,
-               "loader_code": info.get("loader_code") or info.get("file_id") or secrets.token_urlsafe(12).replace("-", "").replace("_", ""),
-               "access_mode": info.get("access_mode", "free"), "disabled": bool(info.get("disabled", False)),
-               "webhook_url": str(info.get("webhook_url") or "")[:2000],
-               "settings": info.get("settings", {}) if isinstance(info.get("settings", {}), dict) else {},
-               "key_meta": info.get("key_meta", {}) if isinstance(info.get("key_meta", {}), dict) else {},
-               "source_name": info.get("source_name"), "source_path": info.get("source_path"),
-               "bot_data": {"version": info.get("version", "1.0.0"), "buyer_role_id": info.get("buyer_role_id"),
-                            "admin_role_id": info.get("admin_role_id"), "created_by": str(discord_user_id),
-                            "trail_enabled": bool(info.get("trail_enabled", str(info.get("access_mode", "free")).lower()=="free")),
-                            "trail_mode": info.get("trail_mode", "PERM"),
-                            "trail_expires_at": info.get("trail_expires_at"),
-                            "user_access": {str(k): v for k,v in (info.get("user_access") or {}).items()},
-                            "hwid_bindings": info.get("hwid_bindings", {}) if isinstance(info.get("hwid_bindings", {}), dict) else {}}}
-        info["loader_code"] = str(row.get("loader_code") or info.get("file_id") or secrets.token_urlsafe(12).replace("-", "").replace("_", ""))
+        discord_user_id = str(discord_user_id or info.get("created_by") or "").strip()
+        discord_username = str(discord_username or "")[:100]
+        user_id = info.get("supabase_user_id") or None
+        if not user_id and discord_user_id:
+            try:
+                linked = _supabase_rest("crystal_discord_users", {
+                    "select": "supabase_user_id", "discord_user_id": "eq." + urllib.parse.quote(discord_user_id, safe=""), "limit": "1"
+                })
+                user_id = linked[0].get("supabase_user_id") if linked else None
+            except Exception:
+                user_id = None
+        if user_id:
+            info["supabase_user_id"] = str(user_id)
+            try:
+                _supabase_rest("crystal_discord_users", {}, "POST", {
+                    "discord_user_id": discord_user_id, "discord_username": discord_username,
+                    "supabase_user_id": str(user_id), "api_key": info.get("api_key", ""),
+                    "plan": _linked_subscription_plan(user_id),
+                    "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                }, "resolution=merge-duplicates,return=minimal")
+            except Exception as link_exc:
+                print(f"Crystal identity-link upsert warning for {discord_user_id}: {type(link_exc).__name__}: {link_exc}")
+
+        # JSONB-safe snapshot of ALL bot-only state. Sets/dict keys are normalized.
+        bot_data = {
+            "crystal_bot_state_version": 2,
+            "version": info.get("version", "1.0.0"),
+            "buyer_role_id": info.get("buyer_role_id"),
+            "admin_role_id": info.get("admin_role_id"),
+            "created_by": str(info.get("created_by") or discord_user_id),
+            "panel_created_by": info.get("panel_created_by"),
+            "panel_guild_id": info.get("panel_guild_id"),
+            "panel_channel_id": info.get("panel_channel_id"),
+            "panel_message_id": info.get("panel_message_id"),
+            "panel_name": info.get("panel_name"),
+            "panel_description": info.get("panel_description", ""),
+            "panel_instances": info.get("panel_instances", []) if isinstance(info.get("panel_instances", []), list) else [],
+            "valid_keys": sorted(str(x) for x in (info.get("valid_keys") or set())),
+            "whitelisted_users": sorted(str(x) for x in (info.get("whitelisted_users") or set())),
+            "user_keys": {str(k): v for k, v in (info.get("user_keys") or {}).items()},
+            "key_meta": info.get("key_meta", {}) if isinstance(info.get("key_meta"), dict) else {},
+            "user_access": {str(k): v for k, v in (info.get("user_access") or {}).items()},
+            "hwid_bindings": info.get("hwid_bindings", {}) if isinstance(info.get("hwid_bindings"), dict) else {},
+            "trail_enabled": bool(info.get("trail_enabled", str(info.get("access_mode", "free")).lower() == "free")),
+            "trail_mode": info.get("trail_mode", "PERM"),
+            "trail_expires_at": info.get("trail_expires_at"),
+            "file_id": info.get("file_id"),
+            "source_obfuscated": bool(info.get("source_obfuscated", False)),
+            "api_key": info.get("api_key", ""),
+            "fast_mode": bool(info.get("fast_mode", False)),
+            "obfuscator": bool(info.get("obfuscator", False)),
+            "ultra_safe": bool(info.get("ultra_safe", False)),
+        }
+        row = {
+            "user_id": str(user_id) if user_id else None,
+            "name": script_name,
+            "api_key": info.get("api_key", ""),
+            "script": info.get("source_code", ""),
+            "source_code": info.get("source_code", ""),
+            "fast_mode": bool(info.get("fast_mode", False)),
+            "obfuscator": bool(info.get("obfuscator", False)),
+            "ultra_safe": bool(info.get("ultra_safe", False)),
+            "discord_user_id": discord_user_id or None,
+            "discord_username": discord_username or None,
+            "guild_id": str(guild_id) if guild_id else info.get("guild_id"),
+            "loader_code": info.get("loader_code") or info.get("file_id") or secrets.token_urlsafe(12).replace("-", "").replace("_", ""),
+            "access_mode": info.get("access_mode", "free"),
+            "disabled": bool(info.get("disabled", False)),
+            "webhook_url": str(info.get("webhook_url") or "")[:2000],
+            "settings": info.get("settings", {}) if isinstance(info.get("settings", {}), dict) else {},
+            "key_meta": info.get("key_meta", {}) if isinstance(info.get("key_meta", {}), dict) else {},
+            "source_name": info.get("source_name"),
+            "source_path": info.get("source_path"),
+            "bot_data": bot_data,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        info["loader_code"] = str(row["loader_code"])
         info["file_id"] = info["loader_code"]
-        row["loader_code"] = info["loader_code"]
+
         row_id = info.get("supabase_row_id")
         if row_id:
             updated = _supabase_rest("crystal_scripts", {"id": "eq." + str(row_id)}, "PATCH", row, "return=representation")
             if updated:
                 return True
-        existing = _supabase_rest("crystal_scripts", {"select": "id", "api_key": "eq." + str(row["api_key"]), "limit": "1"}) if row["api_key"] else []
+        api_key = str(row.get("api_key") or "").strip()
+        existing = _supabase_rest("crystal_scripts", {
+            "select": "id", "api_key": "eq." + urllib.parse.quote(api_key, safe=""), "limit": "1"
+        }) if api_key else []
         if existing:
             updated = _supabase_rest("crystal_scripts", {"id": "eq." + str(existing[0]["id"])}, "PATCH", row, "return=representation")
             if updated:
@@ -925,7 +1063,7 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
 
 
 def _sync_dashboard_scripts_from_supabase():
-    """Import dashboard scripts whose Supabase account is linked to a Discord user."""
+    """Load durable Crystal Hub scripts from Supabase into the bot's runtime state."""
     try:
         links = _supabase_rest("crystal_discord_users", {"select": "discord_user_id,supabase_user_id"})
         user_map = {str(x.get("supabase_user_id")): str(x.get("discord_user_id"))
@@ -937,45 +1075,98 @@ def _sync_dashboard_scripts_from_supabase():
                     user_map[str(x.get("supabase_user_id"))] = str(x.get("discord_user_id"))
         except Exception:
             pass
+
         rows = _supabase_rest("crystal_scripts", {
             "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data,fast_mode,obfuscator,ultra_safe,loader_code,access_mode,disabled,webhook_url,settings,key_meta,source_name,source_path"
         })
         count = 0
         for row in rows:
-            owner = str(row.get("discord_user_id") or user_map.get(str(row.get("user_id")), ""))
+            bot_data = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
+            owner = str(row.get("discord_user_id") or bot_data.get("created_by") or user_map.get(str(row.get("user_id")), ""))
             name = str(row.get("name") or "").strip()
             if not owner or not name:
                 continue
+
             info = scripts_data.get(name, {})
-            # Do not overwrite a same-name script owned by another Discord user.
+            # Never let another owner's script with the same name be overwritten.
             if info and str(info.get("created_by", "")) not in ("", owner):
                 continue
-            bot_data = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
-            info.update({"version": bot_data.get("version", "1.0.0"),
-                         "source_code": row.get("source_code") or row.get("script") or "-- Default Script",
-                         "buyer_role_id": bot_data.get("buyer_role_id"),
-                         "admin_role_id": bot_data.get("admin_role_id"),
-                         "valid_keys": info.get("valid_keys", set()), "whitelisted_users": info.get("whitelisted_users", set()),
-                         "user_keys": info.get("user_keys", {}), "created_by": owner, "api_key": row.get("api_key", ""),
-                         "supabase_user_id": str(row.get("user_id") or ""), "supabase_row_id": row.get("id"),
-                         "fast_mode": bool(row.get("fast_mode", False)), "obfuscator": bool(row.get("obfuscator", False)),
-                         "ultra_safe": bool(row.get("ultra_safe", False)),
-                         "file_id": row.get("loader_code") or info.get("file_id"),
-                         "loader_code": row.get("loader_code") or info.get("file_id"),
-                         "access_mode": str(row.get("access_mode") or "free").lower(), "disabled": bool(row.get("disabled", False)),
-                         "webhook_url": row.get("webhook_url") or "",
-                         "settings": row.get("settings") if isinstance(row.get("settings"), dict) else {},
-                         "key_meta": row.get("key_meta") if isinstance(row.get("key_meta"), dict) else info.get("key_meta", {}),
-                         "user_access": bot_data.get("user_access") if isinstance(bot_data.get("user_access"), dict) else info.get("user_access", {}),
-                         "trail_enabled": (str(row.get("access_mode") or "free").lower()=="free") if str(row.get("access_mode") or "free").lower()=="paid" else bool(bot_data.get("trail_enabled", True)),
-                         "trail_mode": bot_data.get("trail_mode", "PERM"), "trail_expires_at": bot_data.get("trail_expires_at"),
-                         "source_name": row.get("source_name"), "source_path": row.get("source_path"),
-                         "hwid_bindings": bot_data.get("hwid_bindings") if isinstance(bot_data.get("hwid_bindings"), dict) else info.get("hwid_bindings", {})})
+
+            def _int_set(value):
+                out = set()
+                for x in (value or []):
+                    try: out.add(int(x))
+                    except (TypeError, ValueError): out.add(x)
+                return out
+
+            valid_keys = set(str(x) for x in (bot_data.get("valid_keys") or []))
+            whitelisted = _int_set(bot_data.get("whitelisted_users"))
+            user_keys = {}
+            for k, v in (bot_data.get("user_keys") or {}).items():
+                try: user_keys[int(k)] = v
+                except (TypeError, ValueError): pass
+            user_access = {}
+            for k, v in (bot_data.get("user_access") or {}).items():
+                try: user_access[int(k)] = v
+                except (TypeError, ValueError): pass
+
+            # Backward compatibility: older rows stored only some state in top-level columns.
+            if not valid_keys and info.get("valid_keys"):
+                valid_keys = set(str(x) for x in info.get("valid_keys", set()))
+            if not whitelisted and info.get("whitelisted_users"):
+                whitelisted = info.get("whitelisted_users", set())
+            if not user_keys and info.get("user_keys"):
+                user_keys = info.get("user_keys", {})
+            if not user_access and isinstance(bot_data.get("user_access"), dict) is False:
+                user_access = info.get("user_access", {})
+
+            info.update({
+                "version": bot_data.get("version", "1.0.0"),
+                "source_code": row.get("source_code") or row.get("script") or "-- Default Script",
+                "buyer_role_id": bot_data.get("buyer_role_id"),
+                "admin_role_id": bot_data.get("admin_role_id"),
+                "valid_keys": valid_keys,
+                "whitelisted_users": whitelisted,
+                "user_keys": user_keys,
+                "created_by": owner,
+                "panel_created_by": bot_data.get("panel_created_by"),
+                "panel_guild_id": bot_data.get("panel_guild_id"),
+                "panel_channel_id": bot_data.get("panel_channel_id"),
+                "panel_message_id": bot_data.get("panel_message_id"),
+                "panel_name": bot_data.get("panel_name"),
+                "panel_description": bot_data.get("panel_description", ""),
+                "panel_instances": bot_data.get("panel_instances", []) if isinstance(bot_data.get("panel_instances", []), list) else [],
+                "api_key": row.get("api_key", ""),
+                "supabase_user_id": str(row.get("user_id") or "") or None,
+                "supabase_row_id": row.get("id"),
+                "fast_mode": bool(row.get("fast_mode", bot_data.get("fast_mode", False))),
+                "obfuscator": bool(row.get("obfuscator", bot_data.get("obfuscator", False))),
+                "ultra_safe": bool(row.get("ultra_safe", bot_data.get("ultra_safe", False))),
+                "file_id": row.get("loader_code") or bot_data.get("file_id") or info.get("file_id"),
+                "loader_code": row.get("loader_code") or bot_data.get("file_id") or info.get("loader_code"),
+                "access_mode": str(row.get("access_mode") or "free").lower(),
+                "disabled": bool(row.get("disabled", False)),
+                "webhook_url": row.get("webhook_url") or "",
+                "settings": row.get("settings") if isinstance(row.get("settings"), dict) else {},
+                "key_meta": row.get("key_meta") if isinstance(row.get("key_meta"), dict) else (bot_data.get("key_meta") if isinstance(bot_data.get("key_meta"), dict) else {}),
+                "user_access": user_access,
+                "trail_enabled": bool(bot_data.get("trail_enabled", str(row.get("access_mode") or "free").lower() == "free")),
+                "trail_mode": bot_data.get("trail_mode", "PERM"),
+                "trail_expires_at": bot_data.get("trail_expires_at"),
+                "source_name": row.get("source_name"),
+                "source_path": row.get("source_path"),
+                "source_obfuscated": bool(bot_data.get("source_obfuscated", info.get("source_obfuscated", False))),
+                "guild_id": row.get("guild_id"),
+                "discord_user_id": owner,
+                "discord_username": row.get("discord_username"),
+            })
+            info["hwid_bindings"] = bot_data.get("hwid_bindings") if isinstance(bot_data.get("hwid_bindings"), dict) else info.get("hwid_bindings", {})
             scripts_data[name] = info
             count += 1
+
         if count:
             save_data()
-        print(f"Crystal sync: imported {count} linked dashboard scripts.")
+        print(f"Crystal durable sync: restored {count} script(s) from Supabase.")
         return count
     except Exception as exc:
         print(f"Crystal sync from Supabase failed: {type(exc).__name__}: {exc}")
@@ -1246,12 +1437,25 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         if not user and not guest_id:
             self._send_text(401, json.dumps({"error": "Sign in or use Guest mode."})); return
         key = _hash_redeem_code(code)
-        # The hidden Admin code is intentionally account-only.
+        # The hidden Admin code can be redeemed from the website without creating an account.
+        # Signed-in users are stored against their Supabase account; guests are stored against
+        # their stable guest_id so the Admin entitlement survives page reloads on that device.
         if hmac.compare_digest(code, ADMIN_REDEEM_CODE):
-            if not user:
-                self._send_text(403, json.dumps({"error": "The Admin code requires a signed-in account."})); return
-            now_iso = _iso_now()
-            _supabase_upsert_subscription(user["id"], "Admin", None, "admin-code")
+            if user:
+                _supabase_upsert_subscription(user["id"], "Admin", None, "admin-code")
+            else:
+                now_iso = _iso_now()
+                try:
+                    _supabase_rest(
+                        "crystal_guest_subscriptions",
+                        {},
+                        "POST",
+                        {"guest_id": guest_id, "plan": "Admin", "expires_at": None, "source": "admin-code", "updated_at": now_iso.isoformat() if hasattr(now_iso, "isoformat") else str(now_iso)},
+                        "resolution=merge-duplicates,return=minimal"
+                    )
+                except Exception as exc:
+                    print(f"Guest Admin redemption save failed: {type(exc).__name__}: {exc}")
+                    self._send_text(500, json.dumps({"error": "Server could not save Admin redemption. Try again later."})); return
             self._send_text(200, json.dumps({"ok": True, "plan": "Admin", "duration": "Lifetime", "expiresAt": None})); return
 
         try:
@@ -1298,11 +1502,28 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         days = int(record.get("duration_days", 30))
         expires_at = None if days <= 0 else (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)).isoformat()
         old_code = dict(record)
-        record["redeemed_by"] = user["id"]; record["redeemed_at"] = _iso_now()
-        site_entitlements[user["id"]] = {"plan": plan, "redeemed_at": _iso_now(), "expires_at": expires_at, "code_hash": key}
+        now_redeemed = _iso_now()
         try:
+            if user:
+                record["redeemed_by"] = user["id"]
+                record["redeemed_guest_id"] = None
+                site_entitlements[user["id"]] = {"plan": plan, "redeemed_at": now_redeemed, "expires_at": expires_at, "code_hash": key}
+                _supabase_upsert_subscription(user["id"], plan, expires_at, "legacy-redeem")
+            else:
+                # Legacy website codes must also work in Guest mode. Never require
+                # a Supabase account just to redeem a customer subscription.
+                record["redeemed_by"] = None
+                record["redeemed_guest_id"] = guest_id
+                site_entitlements["guest:" + guest_id] = {"plan": plan, "redeemed_at": now_redeemed, "expires_at": expires_at, "code_hash": key}
+                try:
+                    _supabase_rest("crystal_guest_subscriptions", {}, "POST", {
+                        "guest_id": guest_id, "plan": plan, "expires_at": expires_at,
+                        "source": "legacy-redeem", "updated_at": now_redeemed
+                    }, "resolution=merge-duplicates,return=minimal")
+                except Exception:
+                    pass
+            record["redeemed_at"] = now_redeemed
             _save_json_dict(SITE_CODES_FILE, site_redeem_codes); _save_json_dict(SITE_ENTITLEMENTS_FILE, site_entitlements)
-            _supabase_upsert_subscription(user["id"], plan, expires_at, "legacy-redeem")
         except OSError:
             site_redeem_codes[key] = old_code
             self._send_text(500, json.dumps({"error": "Server could not save redemption. Try again later."})); return
@@ -1451,6 +1672,35 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             print(f"Guest script delete failed: {type(exc).__name__}: {exc}")
             self._send_text(500, json.dumps({"error": "Could not delete Guest script."}))
 
+    def _account_api_http(self):
+        try:
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            token = str((query.get('accessToken') or [''])[0]).strip() or str(self.headers.get('X-Access-Token','')).strip()
+            guest_id = str((query.get('guestId') or [''])[0]).strip()[:128]
+            user = _verify_supabase_access_token(token) if token else None
+            if not user and not guest_id:
+                self._send_text(401, json.dumps({'error':'Login or Guest account required.'})); return
+            account = _account_api_get_or_create(str(user['id']) if user else '', guest_id)
+            self._send_text(200, json.dumps({'ok':True,'account':account}, ensure_ascii=False))
+        except Exception as exc:
+            print(f'Account API get failed: {type(exc).__name__}: {exc}')
+            self._send_text(500, json.dumps({'error':'Could not load Account API.'}))
+
+    def _account_api_reset_http(self):
+        try:
+            length=int(self.headers.get('Content-Length','0'))
+            body=json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+            token=str(body.get('accessToken','')).strip() or str(self.headers.get('X-Access-Token','')).strip()
+            guest_id=str(body.get('guestId','')).strip()[:128]
+            user=_verify_supabase_access_token(token) if token else None
+            if not user and not guest_id:
+                self._send_text(401,json.dumps({'error':'Login or Guest account required.'})); return
+            account=_account_api_reset(str(user['id']) if user else '',guest_id)
+            self._send_text(200,json.dumps({'ok':True,'account':account},ensure_ascii=False))
+        except Exception as exc:
+            print(f'Account API reset failed: {type(exc).__name__}: {exc}')
+            self._send_text(500,json.dumps({'error':'Could not reset Account API.'}))
+
     def _api_account_status(self):
         try:
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -1499,10 +1749,81 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             print(f'API account reset failed: {type(exc).__name__}: {exc}')
             self._send_text(500, json.dumps({'error':'Could not reset the API key.'}))
 
+    def _admin_script_action(self):
+        """Admin dashboard bridge: apply script changes to the same Supabase rows used by Discord."""
+        try:
+            length=int(self.headers.get('Content-Length','0'))
+            if length<=0 or length>32768:
+                self._send_text(400,json.dumps({'error':'invalid request'})); return
+            body=json.loads(self.rfile.read(length).decode('utf-8'))
+            if not isinstance(body,dict):
+                self._send_text(400,json.dumps({'error':'invalid request'})); return
+            token=str(body.get('accessToken','')).strip()
+            guest_id=str(body.get('guestId','')).strip()[:128]
+            user=_verify_supabase_access_token(token) if token else None
+            admin=False
+            if user:
+                admin=_linked_subscription_plan(str(user.get('id'))) == 'Admin'
+            elif re.fullmatch(r'[A-Za-z0-9_-]{16,128}',guest_id):
+                rows=_supabase_rest('crystal_guest_subscriptions',{'select':'plan,expires_at','guest_id':'eq.'+urllib.parse.quote(guest_id,safe=''),'limit':'1'})
+                if rows:
+                    plan=str(rows[0].get('plan') or 'Free')
+                    exp=rows[0].get('expires_at')
+                    active=True
+                    if exp:
+                        try: active=datetime.datetime.fromisoformat(str(exp).replace('Z','+00:00'))>datetime.datetime.now(datetime.timezone.utc)
+                        except Exception: pass
+                    admin=active and plan.lower()=='admin'
+            if not admin:
+                self._send_text(403,json.dumps({'error':'Admin plan required.'})); return
+            action=str(body.get('action','')).strip().lower()
+            sid=str(body.get('id','')).strip()
+            if not sid:
+                self._send_text(400,json.dumps({'error':'script id is required'})); return
+            q={'select':'id,name,user_id,guest_id,bot_data,access_mode,disabled,source_code,script,api_key,loader_code,discord_user_id,discord_username,settings,key_meta,source_name,source_path'}
+            q['id']='eq.'+urllib.parse.quote(sid,safe='')
+            rows=_supabase_rest('crystal_scripts',q)
+            if not rows:
+                self._send_text(404,json.dumps({'error':'Script not found.'})); return
+            row=rows[0]
+            patch={'updated_at':_iso_now()}
+            if action=='set_access':
+                mode=str(body.get('access_mode','free')).lower()
+                if mode not in ('free','paid'):
+                    self._send_text(400,json.dumps({'error':'access_mode must be free or paid'})); return
+                patch['access_mode']=mode
+                bd=dict(row.get('bot_data') if isinstance(row.get('bot_data'),dict) else {})
+                bd['trail_enabled']=(mode=='free')
+                if mode=='paid':
+                    bd['trail_mode']='PERM'; bd['trail_expires_at']=None
+                patch['bot_data']=bd
+            elif action=='set_disabled':
+                patch['disabled']=bool(body.get('disabled'))
+            elif action=='delete':
+                _supabase_rest('crystal_scripts',{'id':'eq.'+urllib.parse.quote(sid,safe='')},'DELETE',None,'return=minimal')
+                scripts_data.pop(str(row.get('name') or ''),None); save_data()
+                self._send_text(200,json.dumps({'ok':True,'deleted':True})); return
+            elif action=='sync':
+                pass
+            else:
+                self._send_text(400,json.dumps({'error':'Unknown admin action.'})); return
+            _supabase_rest('crystal_scripts',{'id':'eq.'+urllib.parse.quote(sid,safe='')},'PATCH',patch,'return=minimal')
+            _sync_dashboard_scripts_from_supabase()
+            self._send_text(200,json.dumps({'ok':True,'action':action,'script':row.get('name')}))
+        except Exception as exc:
+            print(f'Admin dashboard action failed: {type(exc).__name__}: {exc}')
+            self._send_text(500,json.dumps({'error':'Admin action failed: '+str(exc)[:300]}))
+
     def do_POST(self):
         parsed_path = urllib.parse.urlparse(self.path)
+        if parsed_path.path == '/api/account-api-reset':
+            self._account_api_reset_http()
+            return
         if parsed_path.path == '/api/api-account-reset':
             self._api_account_reset_http()
+            return
+        if parsed_path.path == "/api/admin-script-action":
+            self._admin_script_action()
             return
         if parsed_path.path == "/api/dashboard-script-sync":
             self._dashboard_script_sync()
@@ -1602,6 +1923,9 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed_path = urllib.parse.urlparse(self.path)
+        if parsed_path.path == '/api/account-api':
+            self._account_api_http()
+            return
         if parsed_path.path == '/api/api-account':
             self._api_account_status()
             return
@@ -2786,19 +3110,31 @@ async def _refresh_saved_panels_after_startup():
     if changed:
         save_data()
 
+def _push_all_local_scripts_to_supabase():
+    """Backfill and continuously persist every bot-created script, including unlinked users."""
+    pushed = 0
+    for name, info in list(scripts_data.items()):
+        owner = str(info.get("created_by") or info.get("discord_user_id") or "").strip()
+        if not owner:
+            continue
+        username = str(info.get("discord_username") or "")
+        if _sync_script_to_supabase(name, info, owner, username, info.get("guild_id")):
+            pushed += 1
+    return pushed
+
+
 @bot.event
 async def _crystal_dashboard_sync_loop():
-    # Supabase is the shared source of truth. Import dashboard edits frequently so
-    # Free/Paid, disabled state, webhook, key metadata and loader changes reach Discord
-    # without requiring a bot restart. Bot-originated changes are written back by the
-    # command handlers through _sync_script_to_supabase.
+    # Import remote state first so a redeploy never overwrites newer Supabase data
+    # with an old local snapshot. Then push the complete local state back.
     while True:
         await asyncio.sleep(20)
         try:
             imported_count = await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
-            print(f"Crystal Hub API-key sync ready: imported {imported_count} Dashboard script(s).")
+            pushed_count = await asyncio.to_thread(_push_all_local_scripts_to_supabase)
+            print(f"Crystal durable sync: restored {imported_count}, persisted {pushed_count} script(s).")
         except Exception as exc:
-            print(f"Crystal dashboard background sync failed: {type(exc).__name__}: {exc}")
+            print(f"Crystal durable sync failed: {type(exc).__name__}: {exc}")
 
 
 async def _sync_global_commands():
@@ -2822,6 +3158,8 @@ async def on_ready():
     await _sync_global_commands()
     print(f"Bot connected successfully as: {bot.user}")
     await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
+    # Backfill older local scripts into Supabase immediately on first startup.
+    await asyncio.to_thread(_push_all_local_scripts_to_supabase)
     if not getattr(bot, "_crystal_dashboard_sync_started", False):
         bot._crystal_dashboard_sync_started = True
         asyncio.create_task(_crystal_dashboard_sync_loop())
@@ -3161,8 +3499,18 @@ async def delete_script_command(interaction: discord.Interaction, script: str):
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
         return
 
+    deleted_info = scripts_data.get(script, {})
+    row_id = deleted_info.get("supabase_row_id")
+    api_key = str(deleted_info.get("api_key") or "").strip()
     del scripts_data[script]
     save_data()
+    try:
+        if row_id:
+            _supabase_rest("crystal_scripts", {"id": "eq." + str(row_id)}, "DELETE", None, "return=minimal")
+        elif api_key:
+            _supabase_rest("crystal_scripts", {"api_key": "eq." + urllib.parse.quote(api_key, safe="")}, "DELETE", None, "return=minimal")
+    except Exception as exc:
+        print(f"Crystal Supabase delete warning for {script}: {type(exc).__name__}: {exc}")
     await interaction.response.send_message(
         f"🗑️ Deleted `{script}` from the bot database. Its `/script/{urllib.parse.quote(script)}` route now returns 404.",
         ephemeral=True
@@ -3413,6 +3761,11 @@ async def api_account_command(interaction: discord.Interaction, acc: str, unlink
         return
     try:
         if unlink:
+            acct = await asyncio.to_thread(_account_api_get_by_owner, '', str(interaction.user.id))
+            if acct and str(acct.get('api_key') or '') == acc:
+                await asyncio.to_thread(_supabase_rest, 'crystal_api_accounts', {'id':'eq.'+str(acct.get('id'))}, 'PATCH', {'discord_user_id':None,'discord_username':None,'updated_at':_iso_now()}, 'return=minimal')
+                await interaction.response.send_message('✅ Account API unlinked. Your Dashboard scripts were not changed.', ephemeral=True)
+                return
             result = await asyncio.to_thread(_api_account_reset, acc, '', '', str(interaction.user.id))
             await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
             await interaction.response.send_message(
@@ -3421,11 +3774,11 @@ async def api_account_command(interaction: discord.Interaction, acc: str, unlink
                 ephemeral=True,
             )
             return
-        script = await asyncio.to_thread(_api_account_link, acc, str(interaction.user.id), str(interaction.user))
+        account = await asyncio.to_thread(_account_api_link, acc, str(interaction.user.id), str(interaction.user))
         await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
         await interaction.response.send_message(
-            f"✅ Linked to **{script.get('name', 'script')}**.\n"
-            "Discord is now synced with your Crystal Hub Dashboard (scripts, data, plan).",
+            '✅ Account API linked successfully. Your Discord account is now connected to your Dashboard scripts and plan.\n'
+            'Your Script API keys were not changed.',
             ephemeral=True,
         )
     except PermissionError as exc:
