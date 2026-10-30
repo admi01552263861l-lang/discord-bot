@@ -1885,6 +1885,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             detail = str(exc).strip() or type(exc).__name__
             print(f'Account create failed: {type(exc).__name__}: {detail}')
             safe_detail = re.sub(r'(SUPA_PRIVATE|SUPABASE_SERVICE_ROLE_KEY|Authorization)\s*[:=]\s*[^\s,;]+', '[hidden]', detail, flags=re.I)
+            # Keep the real backend error visible to the dashboard while never exposing secrets.
             self._send_text(500,json.dumps({'error':'Could not create account.','detail':safe_detail[:500]},ensure_ascii=False))
 
     def _account_login_http(self):
@@ -5375,21 +5376,27 @@ async def ai_bot_command_error(interaction: discord.Interaction, error):
 
 
 
-# /explain tutorial videos (same three videos used by the Dashboard tutorial)
-EXPLAIN_VIDEO_FILES = {
-    "website": "videos/create-script-in-website.mp4",
-    "commands": "videos/how-to-create-script-by-commands.mp4",
-    "key": "videos/how-to-create-key-or-whitelist.mp4",
+# /explain tutorial videos
+# Videos are NOT stored inside the bot ZIP. Configure each source as either:
+#   1) a Discord message URL containing the tutorial video, or
+#   2) a direct https:// video URL.
+# The bot then relays the source message content/attachment URL instead of uploading a local file.
+EXPLAIN_VIDEO_SOURCES = {
+    "website": os.getenv("CRYSTAL_EXPLAIN_VIDEO_WEBSITE", "").strip(),
+    "commands": os.getenv("CRYSTAL_EXPLAIN_VIDEO_COMMANDS", "").strip(),
+    "key": os.getenv("CRYSTAL_EXPLAIN_VIDEO_KEY", "").strip(),
 }
 
 
-def _explain_video_path(key: str):
-    base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, EXPLAIN_VIDEO_FILES[key])
+def _parse_discord_message_url(value: str):
+    m = re.match(r"^https?://(?:www\.)?discord\.com/channels/(\d+)/(\d+)/(\d+)/?$", str(value or "").strip())
+    if not m:
+        return None
+    return int(m.group(2)), int(m.group(3))
 
 
 class ExplainVideosView(BlacklistAwareView):
-    """Three tutorial videos matching the Dashboard Tutorial videos."""
+    """Tutorial video menu. Sources live in Discord; no MP4 files are bundled with the bot."""
     def __init__(self, language="en"):
         super().__init__(timeout=900)
         self.language = language
@@ -5400,21 +5407,55 @@ class ExplainVideosView(BlacklistAwareView):
         self.language_btn.label = "English" if language == "ar" else "العربية"
 
     async def _send_video(self, interaction, key: str):
-        path = _explain_video_path(key)
-        if not os.path.isfile(path):
-            msg = "الفيديو غير موجود في ملفات البوت." if self.language == "ar" else "This tutorial video is missing from the bot files."
+        source = EXPLAIN_VIDEO_SOURCES.get(key, "").strip()
+        labels = {
+            "website": "إنشاء سكربت من الموقع" if self.language == "ar" else "Create script in website",
+            "commands": "إنشاء سكربت بالأوامر" if self.language == "ar" else "How to create script by commands",
+            "key": "إنشاء Key أو Whitelist" if self.language == "ar" else "How to create key or whitelist",
+        }
+        if not source:
+            msg = ("مصدر هذا الفيديو غير مضبوط في Render. ضع رابط رسالة Discord للفيديو في "
+                   f"CRYSTAL_EXPLAIN_VIDEO_{key.upper()}.") if self.language == "ar" else (
+                   "This tutorial source is not configured in Render. Set "
+                   f"CRYSTAL_EXPLAIN_VIDEO_{key.upper()} to the Discord message URL containing the video."
+            )
             await interaction.response.send_message(msg, ephemeral=True)
             return
-        labels = {
-            "website": ("إنشاء سكربت من الموقع" if self.language == "ar" else "Create script in website"),
-            "commands": ("إنشاء سكربت بالأوامر" if self.language == "ar" else "How to create script by commands"),
-            "key": ("إنشاء Key أو Whitelist" if self.language == "ar" else "How to create key or whitelist"),
-        }
-        await interaction.response.send_message(
-            content=f"🎥 **{labels[key]}**",
-            file=discord.File(path, filename=os.path.basename(path)),
-            ephemeral=False,
-        )
+
+        message_info = _parse_discord_message_url(source)
+        try:
+            if message_info:
+                channel_id, message_id = message_info
+                channel = bot.get_channel(channel_id)
+                if channel is None:
+                    channel = await bot.fetch_channel(channel_id)
+                message = await channel.fetch_message(message_id)
+                parts = []
+                if message.content:
+                    parts.append(message.content)
+                attachment_urls = [a.url for a in message.attachments]
+                if attachment_urls:
+                    parts.extend(attachment_urls)
+                if not parts:
+                    parts.append(message.jump_url)
+                content = "\n".join(parts)
+            else:
+                content = source
+
+            if len(content) > 1900:
+                content = content[:1890] + "…"
+            await interaction.response.send_message(
+                content=f"🎥 **{labels[key]}**\n{content}",
+                ephemeral=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as exc:
+            print(f"Explain video relay failed ({key}): {type(exc).__name__}: {exc}")
+            msg = "تعذر إعادة إرسال الفيديو. تأكد أن رابط رسالة Discord صحيح وأن البوت يستطيع رؤية القناة." if self.language == "ar" else "Could not relay this tutorial video. Check the Discord message URL and make sure the bot can access that channel."
+            if not interaction.response.is_done():
+                await interaction.response.send_message(msg, ephemeral=True)
+            else:
+                await interaction.followup.send(msg, ephemeral=True)
 
     @discord.ui.button(label="Create script in website", style=discord.ButtonStyle.primary, custom_id="crystal_explain_video_website")
     async def website_btn(self, interaction, button):
