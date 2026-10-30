@@ -709,6 +709,36 @@ def _api_account_get(api_key: str):
     return rows[0] if rows else None
 
 
+def _linked_subscription_plan(user_id):
+    """Return the current Dashboard subscription plan for a Supabase user."""
+    uid=str(user_id or '').strip()
+    if not uid:
+        return 'Free'
+    try:
+        rows=_supabase_rest('crystal_subscriptions', {
+            'select':'plan,expires_at,created_at',
+            'user_id':'eq.'+urllib.parse.quote(uid,safe=''),
+            'order':'created_at.desc',
+            'limit':'20'
+        })
+        now=datetime.datetime.now(datetime.timezone.utc)
+        for row in rows:
+            exp=row.get('expires_at')
+            if exp:
+                try:
+                    dt=datetime.datetime.fromisoformat(str(exp).replace('Z','+00:00'))
+                    if dt <= now:
+                        continue
+                except Exception:
+                    pass
+            plan=str(row.get('plan') or 'Free')
+            if plan.lower() in ('admin','ultra','premium'):
+                return plan.title()
+            return 'Free'
+    except Exception as exc:
+        print(f'Crystal subscription lookup warning: {type(exc).__name__}')
+    return 'Free'
+
 def _api_account_link(api_key: str, discord_user_id: str, discord_username: str):
     key = str(api_key or '').strip()
     uid = str(discord_user_id or '').strip()
@@ -757,7 +787,7 @@ def _api_account_link(api_key: str, discord_user_id: str, discord_username: str)
             'discord_username': str(discord_username or '')[:100],
             'supabase_user_id': str(script.get('user_id')),
             'api_key': key,
-            'plan': 'Free',
+            'plan': _linked_subscription_plan(script.get('user_id')),
             'updated_at': now,
         }, 'resolution=merge-duplicates,return=minimal')
     return script
@@ -849,7 +879,7 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
             _supabase_rest("crystal_discord_users", {}, "POST", {
                 "discord_user_id": str(discord_user_id), "discord_username": str(discord_username)[:100],
                 "supabase_user_id": str(user_id), "api_key": info.get("api_key", ""),
-                "plan": "Free", "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                "plan": _linked_subscription_plan(user_id), "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }, "resolution=merge-duplicates,return=minimal")
         except Exception as link_exc:
             print(f"Crystal identity-link upsert warning for {discord_user_id}: {type(link_exc).__name__}: {link_exc}")
@@ -937,7 +967,7 @@ def _sync_dashboard_scripts_from_supabase():
                          "settings": row.get("settings") if isinstance(row.get("settings"), dict) else {},
                          "key_meta": row.get("key_meta") if isinstance(row.get("key_meta"), dict) else info.get("key_meta", {}),
                          "user_access": bot_data.get("user_access") if isinstance(bot_data.get("user_access"), dict) else info.get("user_access", {}),
-                         "trail_enabled": bool(bot_data.get("trail_enabled", str(row.get("access_mode") or "free").lower()=="free")),
+                         "trail_enabled": (str(row.get("access_mode") or "free").lower()=="free") if str(row.get("access_mode") or "free").lower()=="paid" else bool(bot_data.get("trail_enabled", True)),
                          "trail_mode": bot_data.get("trail_mode", "PERM"), "trail_expires_at": bot_data.get("trail_expires_at"),
                          "source_name": row.get("source_name"), "source_path": row.get("source_path"),
                          "hwid_bindings": bot_data.get("hwid_bindings") if isinstance(bot_data.get("hwid_bindings"), dict) else info.get("hwid_bindings", {})})
@@ -2205,7 +2235,8 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
         return False
 
     # Gate bot-management slash commands with the server-wide role. Keep user-facing
-    # commands (such as /redeem and /hwid) available; quota checks remain in place.
+    # commands (/api, /hwid, /redeem) available to everyone; quota checks remain in place.
+    # / has been permanently removed — use /api to link Dashboard account.
     command_name = getattr(getattr(interaction, "command", None), "name", "")
     management_commands = {
         "generate-key", "key", "whitelist", "see-keys", "delete-key",
@@ -2770,307 +2801,25 @@ async def _crystal_dashboard_sync_loop():
             print(f"Crystal dashboard background sync failed: {type(exc).__name__}: {exc}")
 
 
-async def _sync_crystal_commands_once():
-    """Keep exactly one command set: global commands only, with guild copies cleared."""
+async def _sync_global_commands():
     try:
-        # Clear guild-scoped copies first; these were the source of duplicate commands.
-        for guild in list(bot.guilds):
-            try:
-                bot.tree.clear_commands(guild=guild)
-                cleared = await bot.tree.sync(guild=guild)
-                print(f"Cleared guild-scoped Crystal commands in {guild.id}: {len(cleared)}")
-            except Exception as exc:
-                print(f"Could not clear guild commands for {getattr(guild, 'id', '?')}: {type(exc).__name__}: {exc}")
         synced = await bot.tree.sync()
-        print(f"Synced exactly one global Crystal command set: {len(synced)} commands.")
+        print(f"Crystal global slash sync: {len(synced)} commands.")
         print("Crystal global commands:", ", ".join(sorted(str(c.name) for c in synced)))
+        return synced
     except Exception as exc:
-        print(f"Crystal global command sync failed: {type(exc).__name__}: {exc}")
-
-# ==================== Crystal Hub Welcome / Help UI ==================== #
-
-FREE_FEATURES_EN = [
-    "5 scripts",
-    "5 panels",
-    "20 sources / month",
-    "100 keys / whitelist",
-    "No avatars",
-    "Free trial access",
-]
-FREE_FEATURES_AR = [
-    "5 سكربتات",
-    "5 بانلات",
-    "20 سورس شهريًا",
-    "100 مفتاح / وايت ليست",
-    "بدون أفاتار",
-    "وصول تجريبي مجاني",
-]
-PREMIUM_FEATURES_EN = [
-    "10 scripts",
-    "10 panels",
-    "100 sources / month",
-    "500 keys / whitelist",
-    "5 avatars / month",
-    "Premium features",
-]
-PREMIUM_FEATURES_AR = [
-    "10 سكربتات",
-    "10 بانلات",
-    "100 سورس شهريًا",
-    "500 مفتاح / وايت ليست",
-    "5 أفاتارات شهريًا",
-    "مميزات Premium",
-]
-ULTRA_FEATURES_EN = [
-    "Unlimited scripts",
-    "Unlimited panels",
-    "Unlimited sources",
-    "Unlimited keys / whitelist",
-    "Unlimited avatars",
-    "Ultra-only AI features",
-]
-ULTRA_FEATURES_AR = [
-    "سكربتات غير محدودة",
-    "بانلات غير محدودة",
-    "سورس غير محدود",
-    "مفاتيح / وايت ليست غير محدودة",
-    "أفاتارات غير محدودة",
-    "مميزات الذكاء الاصطناعي الخاصة بـ Ultra",
-]
-
-COMMAND_PAGES_EN = [
-    ("Page 1 — Core", [
-        "`/create-script` — Create your own script to sell or keep free.",
-        "`/admin-role` — Set the server administrator role that manages Crystal Hub commands.",
-        "`/ai-bot` — Enable or disable the AI feature. Ultra only.",
-        "`/ai-information` — Add information/instructions for the AI.",
-        "`/api` — Link the Dashboard API account with the Discord bot.",
-        "`/avatar-bot` — Change the bot avatar/profile. Premium and Ultra only.",
-    ]),
-    ("Page 2 — Scripts", [
-        "`/delete-script` — Delete a script.",
-        "`/generate-key` — Generate a key for a script.",
-        "`/hwid` — Manage/reset the HWID binding for your script access.",
-        "`/invite-reward` — Give invited friends a script reward for the configured duration.",
-        "`/panel-setup` — Create the management panel for your script.",
-    ]),
-    ("Page 3 — Buyers & Sources", [
-        "`/set-buyer-role` — Set the role given to buyers.",
-        "`/source-setup` — Upload/set the source file for the script.",
-        "`/trail` — Make the script free for a chosen duration or permanently.",
-        "`/update-script` — Publish an announcement for a script update.",
-        "`/whitelist` — Whitelist a user and give them the buyer role for the script.",
-    ]),
-    ("Page 4 — Access", [
-        "`/redeem` — Redeem a Crystal Hub subscription code.",
-        "`/api` — Your API key connects the Dashboard script with your Discord account.",
-        "`/explain` — Open this complete command explanation. Administrator permission is required to run the command.",
-        "Admin tools are available only to authorized Admin users and server administrators.",
-    ]),
-]
-COMMAND_PAGES_AR = [
-    ("الصفحة 1 — الأساسيات", [
-        "`/create-script` — إنشاء سكربتك الخاص لبيعه أو جعله مجانيًا.",
-        "`/admin-role` — تحديد رتبة الإدارة التي تتحكم في أوامر Crystal Hub.",
-        "`/ai-bot` — تفعيل أو تعطيل ميزة الذكاء الاصطناعي، ومتاحة لـ Ultra فقط.",
-        "`/ai-information` — إضافة معلومات وتعليمات للذكاء الاصطناعي.",
-        "`/api` — ربط حساب الـ API بين الموقع والبوت.",
-        "`/avatar-bot` — تغيير صورة وشكل البوت، ومتاحة لـ Premium وUltra فقط.",
-    ]),
-    ("الصفحة 2 — السكربتات", [
-        "`/delete-script` — حذف السكربت.",
-        "`/generate-key` — إنشاء مفتاح للسكربت.",
-        "`/hwid` — إدارة أو إعادة ضبط ربط HWID للوصول إلى السكربت.",
-        "`/invite-reward` — إعطاء مكافأة سكربت للأصدقاء الذين يتم دعوتهم للمدة المحددة.",
-        "`/panel-setup` — إنشاء بانل إدارة للسكربت.",
-    ]),
-    ("الصفحة 3 — المشترون والسورس", [
-        "`/set-buyer-role` — تحديد الرتبة التي يحصل عليها المشتري.",
-        "`/source-setup` — رفع أو تحديد ملف السورس الخاص بالسكربت.",
-        "`/trail` — جعل السكربت مجانيًا لمدة تختارها أو إلى الأبد.",
-        "`/update-script` — نشر إعلان عن التحديث الذي قمت به للسكربت.",
-        "`/whitelist` — إضافة المستخدم للوايت ليست وإعطاؤه رتبة المشتري للسكربت.",
-    ]),
-    ("الصفحة 4 — الوصول", [
-        "`/redeem` — استخدام كود اشتراك Crystal Hub.",
-        "`/api` — ربط مفتاح API الخاص بك بين الموقع وحساب Discord.",
-        "`/explain` — فتح شرح الأوامر كاملًا. يلزم صلاحية Administrator لتشغيل الأمر.",
-        "أدوات Admin متاحة فقط للمستخدمين المصرح لهم ولإدارة السيرفر.",
-    ]),
-]
-
-TUTORIAL_PAGES_EN = [
-    ("Tutorial — Page 1", "1. Use `/create-script` to create a script entry.\n2. Choose Free or Paid access.\n3. Open the Dashboard to edit the script and its settings."),
-    ("Tutorial — Page 2", "1. Use `/source-setup` to attach your source file.\n2. Use `/generate-key` for paid access keys.\n3. Use `/trial` when you want temporary or permanent free access."),
-    ("Tutorial — Page 3", "1. Use `/panel-setup` to create your script panel.\n2. Use `/set-buyer-role` for the buyer role.\n3. Use `/whitelist` to grant access to a buyer."),
-    ("Tutorial — Page 4", "1. Use `/api` to link the Dashboard API.\n2. Use `/update-script` to announce updates.\n3. Use `/hwid` to manage HWID resets."),
-]
-TUTORIAL_PAGES_AR = [
-    ("الشرح — الصفحة 1", "1. استخدم `/create-script` لإنشاء السكربت.\n2. اختر Free أو Paid.\n3. افتح الموقع لتعديل السكربت والإعدادات."),
-    ("الشرح — الصفحة 2", "1. استخدم `/source-setup` لإضافة ملف السورس.\n2. استخدم `/generate-key` لإنشاء مفاتيح للمدفوع.\n3. استخدم `/trail` لجعل الوصول مجانيًا مؤقتًا أو دائمًا."),
-    ("الشرح — الصفحة 3", "1. استخدم `/panel-setup` لإنشاء بانل السكربت.\n2. استخدم `/set-buyer-role` لتحديد رتبة المشتري.\n3. استخدم `/whitelist` لإعطاء المشتري الوصول."),
-    ("الشرح — الصفحة 4", "1. استخدم `/api` لربط الموقع بالبوت.\n2. استخدم `/update-script` للإعلان عن التحديثات.\n3. استخدم `/hwid` لإدارة إعادة ضبط HWID."),
-]
-
-def _welcome_embed():
-    return discord.Embed(
-        title="Crystal Hub",
-        description=(
-            "Welcome to **Crystal Hub**.\n\n"
-            "Use the buttons below to view subscriptions, learn how to make a script, or read the command explanation.\n\n"
-            "You can switch the language from every guide screen."
-        ),
-        color=discord.Color.red(),
-    )
-
-class CrystalWelcomeView(BlacklistAwareView):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Subscribers", style=discord.ButtonStyle.danger, custom_id="crystal_welcome_subscribers")
-    async def subscribers(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(embed=_subscription_embed(0, "en"), view=CrystalSubscriptionView())
-
-    @discord.ui.button(label="Tutorial — How to make script", style=discord.ButtonStyle.secondary, custom_id="crystal_welcome_tutorial")
-    async def tutorial(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(embed=_tutorial_embed(0, "en"), view=CrystalTutorialView())
-
-    @discord.ui.button(label="Explanation of Commands", style=discord.ButtonStyle.secondary, custom_id="crystal_welcome_commands")
-    async def commands(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(embed=_command_embed(0, "en"), view=CrystalCommandsView())
-
-    @discord.ui.button(label="العربية", style=discord.ButtonStyle.secondary, custom_id="crystal_welcome_arabic")
-    async def arabic(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(embed=_welcome_embed_ar(), view=CrystalWelcomeArabicView())
-
-def _welcome_embed_ar():
-    return discord.Embed(
-        title="Crystal Hub",
-        description=(
-            "مرحبًا بك في **Crystal Hub**.\n\n"
-            "استخدم الأزرار بالأسفل لمشاهدة الاشتراكات، تعلم طريقة عمل السكربت، أو شرح الأوامر.\n\n"
-            "يمكنك تغيير اللغة من داخل كل صفحة."
-        ), color=discord.Color.red())
-
-class CrystalWelcomeArabicView(BlacklistAwareView):
-    def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label="الاشتراكات", style=discord.ButtonStyle.danger, custom_id="crystal_welcome_ar_subscribers")
-    async def ar_subscribers(self, interaction, button):
-        await interaction.response.edit_message(embed=_subscription_embed(0, "ar"), view=CrystalSubscriptionView())
-    @discord.ui.button(label="شرح — كيف أسوي سكربت", style=discord.ButtonStyle.secondary, custom_id="crystal_welcome_ar_tutorial")
-    async def ar_tutorial(self, interaction, button):
-        await interaction.response.edit_message(embed=_tutorial_embed(0, "ar"), view=CrystalTutorialView())
-    @discord.ui.button(label="شرح الأوامر", style=discord.ButtonStyle.secondary, custom_id="crystal_welcome_ar_commands")
-    async def ar_commands(self, interaction, button):
-        await interaction.response.edit_message(embed=_command_embed(0, "ar"), view=CrystalCommandsView())
-    @discord.ui.button(label="English", style=discord.ButtonStyle.secondary, custom_id="crystal_welcome_ar_english")
-    async def ar_english(self, interaction, button):
-        await interaction.response.edit_message(embed=_welcome_embed(), view=CrystalWelcomeView())
-
-def _nav_footer(page, total, lang):
-    return f"page={page}|total={total}|lang={lang}"
-
-def _parse_footer(message):
-    try:
-        text=(message.embeds[0].footer.text or "")
-        vals=dict(x.split("=",1) for x in text.split("|") if "=" in x)
-        return int(vals.get("page","0")), int(vals.get("total","1")), vals.get("lang","en")
-    except Exception: return 0,1,"en"
-
-def _subscription_embed(page, lang):
-    pages_en=[("Free",FREE_FEATURES_EN,"Free plan — the standard starting tier."),("Premium",PREMIUM_FEATURES_EN,"Premium plan with more scripts, panels, sources and avatars."),("Ultra",ULTRA_FEATURES_EN,"Ultra plan with unlimited resources and Ultra-only AI features.")]
-    pages_ar=[("Free",FREE_FEATURES_AR,"الخطة المجانية — الخطة الأساسية للبدء."),("Premium",PREMIUM_FEATURES_AR,"خطة Premium بمميزات وحدود أعلى."),("Ultra",ULTRA_FEATURES_AR,"خطة Ultra بموارد غير محدودة ومميزات AI الخاصة بها.")]
-    data=(pages_ar if lang=="ar" else pages_en)[max(0,min(page,2))]
-    desc=data[2]+"\n\n"+"\n".join(f"• {x}" for x in data[1])
-    e=discord.Embed(title=(f"Crystal Hub | الاشتراك — {data[0]}" if lang=="ar" else f"Crystal Hub | Subscription — {data[0]}"),description=desc,color=discord.Color.red())
-    e.set_footer(text=_nav_footer(max(0,min(page,2)),3,lang)); return e
-
-class CrystalSubscriptionView(BlacklistAwareView):
-    def __init__(self): super().__init__(timeout=None)
-    async def _render(self, interaction, delta=0, lang=None):
-        page,total,oldlang=_parse_footer(interaction.message); lang=lang or oldlang; page=max(0,min(2,page+delta)); await interaction.response.edit_message(embed=_subscription_embed(page,lang),view=self)
-    @discord.ui.button(label="◀",style=discord.ButtonStyle.secondary,custom_id="crystal_sub_prev")
-    async def prev(self,i,b): await self._render(i,-1)
-    @discord.ui.button(label="▶",style=discord.ButtonStyle.secondary,custom_id="crystal_sub_next")
-    async def next(self,i,b): await self._render(i,1)
-    @discord.ui.button(label="Back",style=discord.ButtonStyle.secondary,custom_id="crystal_sub_back")
-    async def back(self,i,b):
-        _,_,lang=_parse_footer(i.message); await i.response.edit_message(embed=_welcome_embed_ar() if lang=="ar" else _welcome_embed(),view=CrystalWelcomeArabicView() if lang=="ar" else CrystalWelcomeView())
-    @discord.ui.button(label="العربية",style=discord.ButtonStyle.secondary,custom_id="crystal_sub_lang")
-    async def language(self,i,b):
-        _,_,lang=_parse_footer(i.message); new="ar" if lang=="en" else "en"; await self._render(i,0,new)
-
-
-def _tutorial_embed(page,lang):
-    data=(TUTORIAL_PAGES_AR if lang=="ar" else TUTORIAL_PAGES_EN)[max(0,min(page,3))]
-    e=discord.Embed(title=data[0],description=data[1],color=discord.Color.red()); e.set_footer(text=_nav_footer(max(0,min(page,3)),4,lang)); return e
-class CrystalTutorialView(BlacklistAwareView):
-    def __init__(self): super().__init__(timeout=None)
-    async def _render(self,i,delta=0,lang=None):
-        page,total,old=_parse_footer(i.message); lang=lang or old; page=max(0,min(3,page+delta)); await i.response.edit_message(embed=_tutorial_embed(page,lang),view=self)
-    @discord.ui.button(label="◀",style=discord.ButtonStyle.secondary,custom_id="crystal_tut_prev")
-    async def prev(self,i,b): await self._render(i,-1)
-    @discord.ui.button(label="▶",style=discord.ButtonStyle.secondary,custom_id="crystal_tut_next")
-    async def next(self,i,b): await self._render(i,1)
-    @discord.ui.button(label="Back",style=discord.ButtonStyle.secondary,custom_id="crystal_tut_back")
-    async def back(self,i,b):
-        _,_,lang=_parse_footer(i.message); await i.response.edit_message(embed=_welcome_embed_ar() if lang=="ar" else _welcome_embed(),view=CrystalWelcomeArabicView() if lang=="ar" else CrystalWelcomeView())
-    @discord.ui.button(label="العربية",style=discord.ButtonStyle.secondary,custom_id="crystal_tut_lang")
-    async def language(self,i,b):
-        _,_,lang=_parse_footer(i.message); await self._render(i,0,"ar" if lang=="en" else "en")
-
-
-def _command_embed(page,lang):
-    data=(COMMAND_PAGES_AR if lang=="ar" else COMMAND_PAGES_EN)[max(0,min(page,3))]
-    e=discord.Embed(title=f"Crystal Hub | {data[0]}",description="\n".join("• "+x for x in data[1]),color=discord.Color.red()); e.set_footer(text=_nav_footer(max(0,min(page,3)),4,lang)); return e
-class CrystalCommandsView(BlacklistAwareView):
-    def __init__(self): super().__init__(timeout=None)
-    async def _render(self,i,delta=0,lang=None):
-        page,total,old=_parse_footer(i.message); lang=lang or old; page=max(0,min(3,page+delta)); await i.response.edit_message(embed=_command_embed(page,lang),view=self)
-    @discord.ui.button(label="◀",style=discord.ButtonStyle.secondary,custom_id="crystal_cmd_prev")
-    async def prev(self,i,b): await self._render(i,-1)
-    @discord.ui.button(label="▶",style=discord.ButtonStyle.secondary,custom_id="crystal_cmd_next")
-    async def next(self,i,b): await self._render(i,1)
-    @discord.ui.button(label="Back",style=discord.ButtonStyle.secondary,custom_id="crystal_cmd_back")
-    async def back(self,i,b):
-        _,_,lang=_parse_footer(i.message); await i.response.edit_message(embed=_welcome_embed_ar() if lang=="ar" else _welcome_embed(),view=CrystalWelcomeArabicView() if lang=="ar" else CrystalWelcomeView())
-    @discord.ui.button(label="العربية",style=discord.ButtonStyle.secondary,custom_id="crystal_cmd_lang")
-    async def language(self,i,b):
-        _,_,lang=_parse_footer(i.message); await self._render(i,0,"ar" if lang=="en" else "en")
-
-async def _send_welcome_once(guild):
-    """Send one welcome message when Crystal Hub is added, in the first writable text channel."""
-    for channel in sorted(guild.text_channels, key=lambda c: (getattr(c, 'position', 0), c.id)):
-        try:
-            perms=channel.permissions_for(guild.me) if guild.me else None
-            if perms and (not perms.view_channel or not perms.send_messages): continue
-            await channel.send(embed=_welcome_embed(), view=CrystalWelcomeView())
-            print(f"Crystal welcome sent once in {guild.name} / #{channel.name}")
-            return True
-        except (discord.Forbidden, discord.HTTPException):
-            continue
-        except Exception as exc:
-            print(f"Crystal welcome failed in {guild.id}: {type(exc).__name__}")
-    return False
-
-@bot.tree.command(name="explain", description="Show the Crystal Hub command explanation")
-@app_commands.checks.has_permissions(administrator=True)
-async def explain_command(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=_command_embed(0,"en"), view=CrystalCommandsView(), ephemeral=False)
-
+        print(f"Crystal global slash sync failed: {type(exc).__name__}: {exc}")
+        return []
 
 @bot.event
 async def on_ready():
     print(f"Crystal Hub build: {BUILD_TAG}")
-    for ViewClass in (AdminGuideLanguageView, CrystalWelcomeView, CrystalWelcomeArabicView, CrystalSubscriptionView, CrystalTutorialView, CrystalCommandsView):
-        try:
-            key=f"_registered_{ViewClass.__name__}"
-            if not getattr(bot,key,False):
-                bot.add_view(ViewClass())
-                setattr(bot,key,True)
-        except Exception as exc:
-            print(f"Could not register persistent view {ViewClass.__name__}: {type(exc).__name__}: {exc}")
-    await _sync_crystal_commands_once()
+    if not getattr(bot, "_crystal_admin_view_registered", False):
+        bot.add_view(AdminGuideLanguageView())
+        bot._crystal_admin_view_registered = True
+    # Global-only registration prevents every slash command from appearing twice.
+    # Discord guild copies are intentionally NOT created.
+    await _sync_global_commands()
     print(f"Bot connected successfully as: {bot.user}")
     await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
     if not getattr(bot, "_crystal_dashboard_sync_started", False):
@@ -3082,12 +2831,8 @@ async def on_ready():
 
 @bot.event
 async def on_guild_join(guild):
-    # Global commands are synced once; no guild command copy is created.
-    try:
-        await bot.tree.sync()
-    except Exception as exc:
-        print(f"Global command sync after guild join failed: {type(exc).__name__}: {exc}")
-    await _send_welcome_once(guild)
+    # Commands are global; do not create guild-specific copies.
+    print(f"Crystal Hub joined guild {guild.id} ({guild.name}); global slash commands are used.")
 
 
 # 1. Generate key (/generate-key and /key)
@@ -3650,26 +3395,38 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
 
 
 # API account linking — connects a Dashboard API key to this Discord account.
-@bot.tree.command(name="api", description="Link or unlink a Crystal Hub Dashboard API account")
+@bot.tree.command(name="api", description="Link Discord to your Crystal Hub Dashboard API (or unlink + reset key)")
 @app_commands.describe(
-    acc="The Crystal Hub API key from your Dashboard",
-    unlink="Set true to unlink this API account and automatically reset the API key on the Dashboard",
+    acc="Your Crystal Hub API key from the Dashboard (e.g. CH-xxxxxxxx)",
+    unlink="Turn ON to unlink this Discord account and reset the API key on the Dashboard",
 )
 async def api_account_command(interaction: discord.Interaction, acc: str, unlink: bool = False):
+    """User-facing account link. Replaces the old / command."""
+    acc = str(acc or "").strip()
+    if not acc:
+        await interaction.response.send_message(
+            "❌ Provide your Dashboard API key.\n"
+            "Example: `/api` → `acc:` `CH-xxxxxxxx`\n"
+            "Unlink: same command with **unlink** turned on.",
+            ephemeral=True,
+        )
+        return
     try:
         if unlink:
             result = await asyncio.to_thread(_api_account_reset, acc, '', '', str(interaction.user.id))
             await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
             await interaction.response.send_message(
-                f"✅ API account unlinked. The old API key was removed and the Dashboard generated a new API key for **{result.get('name','script')}**.\n"
-                "Open the Dashboard to copy the new key.", ephemeral=True
+                f"✅ Unlinked. Old API key removed; Dashboard created a **new** API key for **{result.get('name', 'script')}**.\n"
+                "Open the Dashboard and copy the new key.",
+                ephemeral=True,
             )
             return
         script = await asyncio.to_thread(_api_account_link, acc, str(interaction.user.id), str(interaction.user))
         await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
         await interaction.response.send_message(
-            f"✅ API account linked to **{script.get('name','script')}**.\n"
-            "Dashboard and Discord are now connected for this API key.", ephemeral=True
+            f"✅ Linked to **{script.get('name', 'script')}**.\n"
+            "Discord is now synced with your Crystal Hub Dashboard (scripts, data, plan).",
+            ephemeral=True,
         )
     except PermissionError as exc:
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
@@ -3677,12 +3434,15 @@ async def api_account_command(interaction: discord.Interaction, acc: str, unlink
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
     except Exception as exc:
         print(f"API account command failed: {type(exc).__name__}: {exc}")
-        await interaction.response.send_message("❌ Could not update the API account. Check that the Dashboard API key is valid.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Could not update the API account. Check that the Dashboard API key is valid.",
+            ephemeral=True,
+        )
 
 
 # 7. إعداد البانل
-@bot.tree.command(name="hwid", description="Reset your Crystal Hub HWID binding")
-@app_commands.describe(script="Optional script to reset. Leave empty to reset all your linked script keys.")
+@bot.tree.command(name="hwid", description="Reset HWID binding so your key can lock to a new device")
+@app_commands.describe(script="Optional: one script only. Leave empty to reset HWID for all your keys.")
 @app_commands.autocomplete(script=script_autocomplete)
 async def hwid_command(interaction: discord.Interaction, script: Optional[str] = None):
     uid = str(interaction.user.id)
