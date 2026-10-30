@@ -25,7 +25,7 @@ from discord import app_commands
 from discord.http import Route
 from discord.ext import commands, tasks
 
-BUILD_TAG = "CrystalHub-2026-10-30-DURABLE-SUPABASE-SCRIPTS-V1"
+BUILD_TAG = "CrystalHub-2026-10-30-ACCOUNT-LOGIN-API-V2"
 
 # Render keeps only files under a mounted persistent disk. Set
 # CRYSTAL_HUB_DATA_DIR=/var/data on Render after attaching that disk.
@@ -773,14 +773,6 @@ def _account_api_create_account(guest_id: str, username: str, password: str, api
     rows = _supabase_rest('crystal_api_accounts', {}, 'POST', payload, 'resolution=merge-duplicates,return=representation')
     return _account_public(rows[0] if rows else payload)
 
-def _verify_guest_account_api(api_key: str, guest_id: str) -> bool:
-    key = str(api_key or '').strip()
-    gid = str(guest_id or '').strip()
-    if not key.startswith('CA-') or not gid:
-        return False
-    account = _api_account_get(key)
-    return bool(account and str(account.get('guest_id') or '') == gid and str(account.get('account_type') or 'account') == 'account')
-
 def _account_api_login(api_key: str) -> dict:
     key = str(api_key or '').strip()
     if not re.fullmatch(r'CA-[A-Za-z0-9_-]{12,100}', key):
@@ -825,56 +817,6 @@ def _account_api_get_by_discord(discord_user_id: str = ''):
         'discord_user_id': 'eq.' + urllib.parse.quote(did, safe=''), 'limit': '1'
     })
     return rows[0] if rows else None
-
-
-def _account_api_create_from_discord(discord_id: str, website_username: str) -> dict:
-    """Create/reuse a Dashboard Account API using a Discord identity (no email/password)."""
-    did = str(discord_id or '').strip()
-    uname = str(website_username or '').strip()
-    if not re.fullmatch(r'\d{17,20}', did):
-        raise ValueError('Discord ID must contain 17–20 digits.')
-    if not re.fullmatch(r'[A-Za-z0-9_]{3,24}', uname):
-        raise ValueError('Website username must be 3–24 letters, numbers, or underscores.')
-    if not bot.is_ready():
-        raise ValueError('The Discord bot is still starting. Try again in a moment.')
-    # Resolve the ID through Discord so the site cannot invent a Discord profile.
-    future = asyncio.run_coroutine_threadsafe(bot.fetch_user(int(did)), bot.loop)
-    discord_user = future.result(timeout=15)
-    discord_name = str(discord_user)[:100]
-    avatar_url = str(discord_user.display_avatar.url)[:2000]
-    existing_discord = _account_api_get_by_discord(did)
-    if existing_discord:
-        account = existing_discord
-        gid = str(account.get('guest_id') or '')
-        if not gid:
-            raise ValueError('This Discord account is linked to an older account without a Guest ID. Contact the site administrator.')
-        # Do not silently replace an existing account's website username.
-        if str(account.get('username') or '').lower() != uname.lower():
-            raise ValueError('This Discord ID already has an account. Sign in with its existing Account API key.')
-        patch = {'discord_username': discord_name, 'avatar_url': avatar_url, 'updated_at': _iso_now()}
-        _supabase_rest('crystal_api_accounts', {'id':'eq.'+str(account.get('id'))}, 'PATCH', patch, 'return=minimal')
-        return _account_public({**account, **patch})
-    # Check username uniqueness before creating a new identity.
-    taken = _supabase_rest('crystal_api_accounts', {
-        'select':'id', 'account_type':'eq.account',
-        'username':'ilike.' + urllib.parse.quote(uname, safe=''), 'limit':'1'
-    })
-    if taken:
-        raise ValueError('That website username is already in use.')
-    guest_id = secrets.token_hex(20)
-    account = _account_api_get_or_create('', guest_id, did, discord_name)
-    patch = {'username': uname, 'avatar_url': avatar_url, 'discord_user_id': did,
-             'discord_username': discord_name, 'updated_at': _iso_now()}
-    account_id = account.get('id')
-    if account_id:
-        rows = _supabase_rest('crystal_api_accounts', {'id':'eq.'+str(account_id)}, 'PATCH', patch, 'return=representation')
-        if rows:
-            account = rows[0]
-        else:
-            account = {**account, **patch}
-    else:
-        account = {**account, **patch}
-    return _account_public(account)
 
 
 def _account_api_get_or_create(user_id: str = '', guest_id: str = '', discord_user_id: str = '', discord_username: str = ''):
@@ -1410,19 +1352,95 @@ def _load_script_from_api_url(api_url: str) -> dict:
         "admin_role_id": data.get("admin_role_id"),
     }
 
+def _crystal_account_public(row: dict) -> dict:
+    """Safe account payload for the separate Crystal login site."""
+    return {
+        # Keep camelCase for the login portal and snake_case for the Dashboard API.
+        "guestId": str(row.get("guest_id") or ""),
+        "guest_id": str(row.get("guest_id") or ""),
+        "discordId": str(row.get("discord_user_id") or ""),
+        "discord_user_id": str(row.get("discord_user_id") or ""),
+        "discordUsername": str(row.get("discord_username") or ""),
+        "discord_username": str(row.get("discord_username") or ""),
+        "username": str(row.get("website_username") or ""),
+        "website_username": str(row.get("website_username") or ""),
+        "avatarUrl": str(row.get("avatar_url") or ""),
+        "avatar_url": str(row.get("avatar_url") or ""),
+        "apiKey": str(row.get("api_key") or ""),
+        "api_key": str(row.get("api_key") or ""),
+        "plan": str(row.get("plan") or "Free"),
+        "planExpiresAt": row.get("plan_expires_at"),
+        "plan_expires_at": row.get("plan_expires_at"),
+        "createdAt": row.get("created_at"),
+        "created_at": row.get("created_at"),
+    }
+
+
+def _crystal_account_by_key(api_key: str):
+    key = str(api_key or "").strip()
+    if not re.fullmatch(r"CA-[A-Za-z0-9_-]{24,100}", key):
+        return None
+    rows = _supabase_rest("crystal_accounts", {
+        "select": "*", "api_key": "eq." + urllib.parse.quote(key, safe=""), "limit": "1"
+    })
+    return rows[0] if rows else None
+
+
+def _crystal_account_create(discord_user, website_username: str) -> dict:
+    did = str(getattr(discord_user, "id", "") or "").strip()
+    uname = str(website_username or "").strip()
+    if not did.isdigit() or not (17 <= len(did) <= 20):
+        raise ValueError("Discord ID is invalid.")
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,24}", uname):
+        raise ValueError("Website username must be 3-24 characters (letters, numbers, underscore).")
+    existing = _supabase_rest("crystal_accounts", {
+        "select": "*", "discord_user_id": "eq." + did, "limit": "1"
+    })
+    # A Discord identity can own only one site account. Do not silently replace its API key.
+    if existing:
+        row = existing[0]
+        if str(row.get("website_username") or "").lower() != uname.lower():
+            taken = _supabase_rest("crystal_accounts", {
+                "select": "guest_id", "website_username": "eq." + urllib.parse.quote(uname, safe=""), "limit": "1"
+            })
+            if taken and str(taken[0].get("guest_id")) != str(row.get("guest_id")):
+                raise ValueError("That website username is already taken.")
+            _supabase_rest("crystal_accounts", {"guest_id": "eq." + urllib.parse.quote(str(row.get("guest_id")), safe="")}, "PATCH", {
+                "website_username": uname
+            }, "return=minimal")
+            row["website_username"] = uname
+        return row
+    taken = _supabase_rest("crystal_accounts", {
+        "select": "guest_id", "website_username": "eq." + urllib.parse.quote(uname, safe=""), "limit": "1"
+    })
+    if taken:
+        raise ValueError("That website username is already taken.")
+    avatar = ""
+    try:
+        avatar = str(discord_user.display_avatar.url)
+    except Exception:
+        pass
+    guest_id = secrets.token_urlsafe(24)
+    api_key = "CA-" + secrets.token_urlsafe(36).replace("-", "").replace("_", "")[:48]
+    row = {
+        "guest_id": guest_id,
+        "discord_user_id": did,
+        "discord_username": str(discord_user)[:100],
+        "website_username": uname,
+        "avatar_url": avatar[:2000],
+        "api_key": api_key,
+        "plan": "Free",
+    }
+    created = _supabase_rest("crystal_accounts", {}, "POST", row, "return=representation")
+    return created[0] if created else row
+
+
 class DynamicScriptHandler(BaseHTTPRequestHandler):
     def _send_text(self, status, body):
         payload = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
-        origin = str(self.headers.get("Origin", ""))
-        allowed_origins = {
-            "https://crystal-login.pages.dev",
-            "https://crystal-dashboard.pages.dev",
-            os.getenv("SITE_ORIGIN", "").strip(),
-        }
-        allowed_origins.discard("")
-        self.send_header("Access-Control-Allow-Origin", origin if origin in allowed_origins else (os.getenv("SITE_ORIGIN", "").strip() or "https://crystal-login.pages.dev"))
+        self.send_header("Access-Control-Allow-Origin", os.getenv("SITE_ORIGIN", "*"))
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Crystal-Account, X-Access-Token")
@@ -1557,8 +1575,6 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         guest_id = str((query.get("guestId") or [""])[0]).strip()[:128]
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", guest_id):
             self._send_text(400, json.dumps({"error": "invalid guest id"})); return
-        if not _verify_guest_account_api(self.headers.get("X-Crystal-Account", ""), guest_id):
-            self._send_text(401, json.dumps({"error": "Valid Account API required."})); return
         try:
             rows = _supabase_rest("crystal_guest_subscriptions", {
                 "select": "plan,expires_at,created_at,updated_at",
@@ -1766,8 +1782,6 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 self._send_text(400, json.dumps({"error": "guestId, name and api_key are required"})); return
             if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", guest_id):
                 self._send_text(400, json.dumps({"error": "invalid guest id"})); return
-            if not _verify_guest_account_api(self.headers.get("X-Crystal-Account", ""), guest_id):
-                self._send_text(401, json.dumps({"error": "Valid Account API required."})); return
             # Guest keys are generated by the dashboard, but the server is the source of truth.
             row = {
                 "guest_id": guest_id, "user_id": None,
@@ -1810,8 +1824,6 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         guest_id = str((query.get("guestId") or [""])[0]).strip()[:128]
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", guest_id):
             self._send_text(400, json.dumps({"error": "invalid guest id"})); return
-        if not _verify_guest_account_api(self.headers.get("X-Crystal-Account", ""), guest_id):
-            self._send_text(401, json.dumps({"error": "Valid Account API required."})); return
         try:
             rows = _supabase_rest("crystal_scripts", {
                 "select": "*", "guest_id": "eq." + urllib.parse.quote(guest_id, safe=""),
@@ -1847,12 +1859,26 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             if length<=0 or length>600000:
                 self._send_text(400,json.dumps({'error':'Invalid request.'})); return
             body=json.loads(self.rfile.read(length).decode('utf-8'))
-            if body.get('discordId') or body.get('discord_id'):
-                account = _account_api_create_from_discord(str(body.get('discordId') or body.get('discord_id') or ''), str(body.get('username','')))
+            if not isinstance(body, dict):
+                raise ValueError('Invalid request.')
+            # New login site: Discord ID first, website username second; no email/password.
+            if body.get('discordId') is not None:
+                did = str(body.get('discordId', '')).strip()
+                if not re.fullmatch(r'[0-9]{17,20}', did):
+                    raise ValueError('Enter a valid Discord ID.')
+                if not bot.is_ready():
+                    self._send_text(503, json.dumps({'error':'Discord bot is not ready. Try again shortly.'})); return
+                future = asyncio.run_coroutine_threadsafe(bot.fetch_user(int(did)), bot.loop)
+                try:
+                    discord_user = future.result(timeout=12)
+                except Exception:
+                    raise ValueError('Could not find that Discord account. Check the Discord ID.')
+                account = _crystal_account_create(discord_user, str(body.get('username', '')))
+                self._send_text(200, json.dumps({'ok':True,'account':_crystal_account_public(account)},ensure_ascii=False))
             else:
-                # Backward compatibility for existing clients; old accounts remain usable.
+                # Backward compatibility for the older Guest/password signup page.
                 account=_account_api_create_account(str(body.get('guestId','')), str(body.get('username','')), str(body.get('password','')), str(body.get('apiKey','')), str(body.get('avatarUrl','')))
-            self._send_text(200,json.dumps({'ok':True,'account':account},ensure_ascii=False))
+                self._send_text(200,json.dumps({'ok':True,'account':account},ensure_ascii=False))
         except ValueError as exc:
             self._send_text(400,json.dumps({'error':str(exc)}))
         except Exception as exc:
@@ -1865,8 +1891,14 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             if length<=0 or length>32768:
                 self._send_text(400,json.dumps({'error':'Invalid request.'})); return
             body=json.loads(self.rfile.read(length).decode('utf-8'))
-            account=_account_api_login(str(body.get('apiKey','')))
-            self._send_text(200,json.dumps({'ok':True,'account':account},ensure_ascii=False))
+            api_key = str(body.get('apiKey','')).strip()
+            account = _crystal_account_by_key(api_key)
+            if account:
+                self._send_text(200,json.dumps({'ok':True,'account':_crystal_account_public(account)},ensure_ascii=False))
+            else:
+                # Keep old Account API keys working for existing dashboard users.
+                account=_account_api_login(api_key)
+                self._send_text(200,json.dumps({'ok':True,'account':account},ensure_ascii=False))
         except ValueError as exc:
             self._send_text(401,json.dumps({'error':str(exc)}))
         except Exception as exc:
@@ -2180,6 +2212,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", os.getenv("SITE_ORIGIN", "*"))
+            self.send_header("Vary", "Origin")
             payload = json.dumps(_script_record_payload(script_name, scripts_data[script_name]), ensure_ascii=False).encode("utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -3935,21 +3968,32 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
 )
 async def api_account_command(interaction: discord.Interaction, acc: Optional[str] = None, unlink: bool = False):
     acc = str(acc or '').strip()
-    if not acc and not unlink:
+    if not acc:
         try:
-            own = await asyncio.to_thread(_account_api_get_by_discord, str(interaction.user.id))
-            if not own:
+            rows = await asyncio.to_thread(_supabase_rest, 'crystal_accounts', {
+                'select': 'api_key,website_username,discord_user_id',
+                'discord_user_id': 'eq.' + str(interaction.user.id), 'limit': '1'
+            })
+            if rows:
                 await interaction.response.send_message(
-                    "❌ No Dashboard Account API is linked to this Discord ID yet. Create your account at https://crystal-login.pages.dev/ first.", ephemeral=True)
+                    "🔑 **Your Crystal Hub Account API**\n"
+                    f"Username: `{rows[0].get('website_username', 'Unknown')}`\n"
+                    f"Account API: `{rows[0].get('api_key', '')}`\n"
+                    "Keep this key private. It is different from Script API keys (`CH-...`).",
+                    ephemeral=True)
+                return
+            legacy = await asyncio.to_thread(_account_api_get_by_discord, str(interaction.user.id))
+            if legacy and legacy.get('api_key'):
+                await interaction.response.send_message(
+                    f"🔑 **Your Account API:** `{legacy['api_key']}`\nKeep this key private.", ephemeral=True)
                 return
             await interaction.response.send_message(
-                "🔑 **Your Crystal Hub Account API**\n"
-                f"`{own.get('api_key', '')}`\n"
-                "Keep this key private. It is different from each Script API key (`CH-...`).", ephemeral=True)
+                "❌ No Crystal Hub website account is linked to this Discord ID yet. Create one on the login page using your Discord ID, then run `/api` again.",
+                ephemeral=True)
             return
         except Exception as exc:
             print(f'/api account lookup error: {type(exc).__name__}: {exc}')
-            await interaction.response.send_message('❌ Could not retrieve your Account API.', ephemeral=True)
+            await interaction.response.send_message('❌ Could not load your Account API. Check the Supabase connection.', ephemeral=True)
             return
     try:
         if not acc.startswith('CA-'):
