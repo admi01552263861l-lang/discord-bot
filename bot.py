@@ -87,10 +87,16 @@ def _global_admin_status(interaction):
         return True, ""
     if not interaction.guild:
         return False, "This command can only be used inside a server."
-    if not _global_admin_role_id(interaction.guild.id):
-        return False, "❌ Set the server-wide admin role first with `/admin-role`."
+    # Either the configured global Admin role OR Discord Administrator permission.
+    try:
+        if bool(interaction.user.guild_permissions.administrator):
+            return True, ""
+    except AttributeError:
+        pass
     if _has_global_admin_access(interaction):
         return True, ""
+    if not _global_admin_role_id(interaction.guild.id):
+        return False, "❌ Set the server-wide admin role first with `/admin-role`, or use Discord Administrator permission."
     return False, "❌ You need the configured admin role or Discord Administrator permission."
 
 # Discord admin redeem access
@@ -700,6 +706,94 @@ def _load_script_from_supabase_api_key(api_key: str) -> dict:
             "source_name": row.get("source_name"), "source_path": row.get("source_path")}
 
 
+def _account_password_hash(password: str) -> str:
+    password = str(password or '')
+    if len(password) < 6 or len(password) > 256:
+        raise ValueError('Password must be between 6 and 256 characters.')
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 210000)
+    return 'pbkdf2_sha256$210000$' + salt.hex() + '$' + digest.hex()
+
+def _account_password_verify(password: str, stored: str) -> bool:
+    try:
+        algo, rounds, salt_hex, digest_hex = str(stored or '').split('$', 3)
+        if algo != 'pbkdf2_sha256':
+            return False
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.pbkdf2_hmac('sha256', str(password or '').encode('utf-8'), bytes.fromhex(salt_hex), int(rounds))
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+def _account_public(account: dict) -> dict:
+    if not isinstance(account, dict):
+        return {}
+    return {k: account.get(k) for k in ('id','account_type','api_key','guest_id','username','avatar_url','discord_user_id','discord_username') if k in account}
+
+def _account_api_create_account(guest_id: str, username: str, password: str, api_key: str = '', avatar_url: str = '') -> dict:
+    gid = str(guest_id or '').strip()[:128]
+    uname = str(username or '').strip()[:32]
+    if not re.fullmatch(r'[A-Za-z0-9_-]{16,128}', gid):
+        raise ValueError('Invalid Guest ID.')
+    if not re.fullmatch(r'[A-Za-z0-9_ .-]{3,32}', uname):
+        raise ValueError('Username must be 3-32 characters and use letters, numbers, spaces, _, -, or .')
+    if len(password or '') < 6:
+        raise ValueError('Password must be at least 6 characters.')
+    # Reuse an existing Account API for this guest when one exists. This preserves scripts and old API links.
+    existing = _account_api_get_by_owner('', gid)
+    key = str(api_key or '').strip()
+    if key and not re.fullmatch(r'CA-[A-Za-z0-9_-]{12,100}', key):
+        raise ValueError('Account API must start with CA-.')
+    if existing:
+        if key and key != str(existing.get('api_key') or ''):
+            raise ValueError('This Guest account already has a different Account API key.')
+        key = str(existing.get('api_key') or '')
+        patch = {
+            'username': uname,
+            'password_hash': _account_password_hash(password),
+            'avatar_url': str(avatar_url or '')[:500000],
+            'updated_at': _iso_now(),
+        }
+        rows = _supabase_rest('crystal_api_accounts', {'id':'eq.'+str(existing.get('id'))}, 'PATCH', patch, 'return=representation')
+        return _account_public({**existing, **patch})
+    # Username is unique for named accounts.
+    taken = _supabase_rest('crystal_api_accounts', {'select':'id,guest_id','account_type':'eq.account','username':'eq.'+urllib.parse.quote(uname, safe=''),'limit':'1'})
+    if taken:
+        raise ValueError('That username is already in use.')
+    if not key:
+        key = _account_api_generate()
+    while _supabase_rest('crystal_api_accounts', {'select':'id','api_key':'eq.'+urllib.parse.quote(key,safe=''),'limit':'1'}):
+        key = _account_api_generate()
+    now = _iso_now()
+    payload = {
+        'account_type':'account','api_key':key,'guest_id':gid,'username':uname,
+        'password_hash':_account_password_hash(password),'avatar_url':str(avatar_url or '')[:500000],
+        'linked_at':now,'updated_at':now
+    }
+    rows = _supabase_rest('crystal_api_accounts', {}, 'POST', payload, 'resolution=merge-duplicates,return=representation')
+    return _account_public(rows[0] if rows else payload)
+
+def _verify_guest_account_api(api_key: str, guest_id: str) -> bool:
+    key = str(api_key or '').strip()
+    gid = str(guest_id or '').strip()
+    if not key.startswith('CA-') or not gid:
+        return False
+    account = _api_account_get(key)
+    return bool(account and str(account.get('guest_id') or '') == gid and str(account.get('account_type') or 'account') == 'account')
+
+def _account_api_login(api_key: str) -> dict:
+    key = str(api_key or '').strip()
+    if not re.fullmatch(r'CA-[A-Za-z0-9_-]{12,100}', key):
+        raise ValueError('Invalid Account API. It must start with CA-.')
+    account = _api_account_get(key)
+    if not account:
+        raise ValueError('Account API key not found.')
+    if str(account.get('account_type') or 'account') != 'account':
+        raise ValueError('This is not an Account API key.')
+    if not account.get('guest_id'):
+        raise ValueError('This Account API is not attached to a Dashboard account yet.')
+    return _account_public(account)
+
 def _account_api_generate():
     return 'CA-' + secrets.token_urlsafe(36).replace('-', '').replace('_', '')[:48]
 
@@ -720,6 +814,67 @@ def _account_api_get_by_owner(user_id: str = '', guest_id: str = ''):
     else:
         return None
     return rows[0] if rows else None
+
+
+def _account_api_get_by_discord(discord_user_id: str = ''):
+    did = str(discord_user_id or '').strip()
+    if not did:
+        return None
+    rows = _supabase_rest('crystal_api_accounts', {
+        'select': '*', 'account_type': 'eq.account',
+        'discord_user_id': 'eq.' + urllib.parse.quote(did, safe=''), 'limit': '1'
+    })
+    return rows[0] if rows else None
+
+
+def _account_api_create_from_discord(discord_id: str, website_username: str) -> dict:
+    """Create/reuse a Dashboard Account API using a Discord identity (no email/password)."""
+    did = str(discord_id or '').strip()
+    uname = str(website_username or '').strip()
+    if not re.fullmatch(r'\d{17,20}', did):
+        raise ValueError('Discord ID must contain 17–20 digits.')
+    if not re.fullmatch(r'[A-Za-z0-9_]{3,24}', uname):
+        raise ValueError('Website username must be 3–24 letters, numbers, or underscores.')
+    if not bot.is_ready():
+        raise ValueError('The Discord bot is still starting. Try again in a moment.')
+    # Resolve the ID through Discord so the site cannot invent a Discord profile.
+    future = asyncio.run_coroutine_threadsafe(bot.fetch_user(int(did)), bot.loop)
+    discord_user = future.result(timeout=15)
+    discord_name = str(discord_user)[:100]
+    avatar_url = str(discord_user.display_avatar.url)[:2000]
+    existing_discord = _account_api_get_by_discord(did)
+    if existing_discord:
+        account = existing_discord
+        gid = str(account.get('guest_id') or '')
+        if not gid:
+            raise ValueError('This Discord account is linked to an older account without a Guest ID. Contact the site administrator.')
+        # Do not silently replace an existing account's website username.
+        if str(account.get('username') or '').lower() != uname.lower():
+            raise ValueError('This Discord ID already has an account. Sign in with its existing Account API key.')
+        patch = {'discord_username': discord_name, 'avatar_url': avatar_url, 'updated_at': _iso_now()}
+        _supabase_rest('crystal_api_accounts', {'id':'eq.'+str(account.get('id'))}, 'PATCH', patch, 'return=minimal')
+        return _account_public({**account, **patch})
+    # Check username uniqueness before creating a new identity.
+    taken = _supabase_rest('crystal_api_accounts', {
+        'select':'id', 'account_type':'eq.account',
+        'username':'ilike.' + urllib.parse.quote(uname, safe=''), 'limit':'1'
+    })
+    if taken:
+        raise ValueError('That website username is already in use.')
+    guest_id = secrets.token_hex(20)
+    account = _account_api_get_or_create('', guest_id, did, discord_name)
+    patch = {'username': uname, 'avatar_url': avatar_url, 'discord_user_id': did,
+             'discord_username': discord_name, 'updated_at': _iso_now()}
+    account_id = account.get('id')
+    if account_id:
+        rows = _supabase_rest('crystal_api_accounts', {'id':'eq.'+str(account_id)}, 'PATCH', patch, 'return=representation')
+        if rows:
+            account = rows[0]
+        else:
+            account = {**account, **patch}
+    else:
+        account = {**account, **patch}
+    return _account_public(account)
 
 
 def _account_api_get_or_create(user_id: str = '', guest_id: str = '', discord_user_id: str = '', discord_username: str = ''):
@@ -1260,9 +1415,17 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         payload = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", os.getenv("SITE_ORIGIN", "*"))
+        origin = str(self.headers.get("Origin", ""))
+        allowed_origins = {
+            "https://crystal-login.pages.dev",
+            "https://crystal-dashboard.pages.dev",
+            os.getenv("SITE_ORIGIN", "").strip(),
+        }
+        allowed_origins.discard("")
+        self.send_header("Access-Control-Allow-Origin", origin if origin in allowed_origins else (os.getenv("SITE_ORIGIN", "").strip() or "https://crystal-login.pages.dev"))
+        self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Crystal-Account, X-Access-Token")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -1394,6 +1557,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         guest_id = str((query.get("guestId") or [""])[0]).strip()[:128]
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", guest_id):
             self._send_text(400, json.dumps({"error": "invalid guest id"})); return
+        if not _verify_guest_account_api(self.headers.get("X-Crystal-Account", ""), guest_id):
+            self._send_text(401, json.dumps({"error": "Valid Account API required."})); return
         try:
             rows = _supabase_rest("crystal_guest_subscriptions", {
                 "select": "plan,expires_at,created_at,updated_at",
@@ -1601,6 +1766,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 self._send_text(400, json.dumps({"error": "guestId, name and api_key are required"})); return
             if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", guest_id):
                 self._send_text(400, json.dumps({"error": "invalid guest id"})); return
+            if not _verify_guest_account_api(self.headers.get("X-Crystal-Account", ""), guest_id):
+                self._send_text(401, json.dumps({"error": "Valid Account API required."})); return
             # Guest keys are generated by the dashboard, but the server is the source of truth.
             row = {
                 "guest_id": guest_id, "user_id": None,
@@ -1643,6 +1810,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         guest_id = str((query.get("guestId") or [""])[0]).strip()[:128]
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", guest_id):
             self._send_text(400, json.dumps({"error": "invalid guest id"})); return
+        if not _verify_guest_account_api(self.headers.get("X-Crystal-Account", ""), guest_id):
+            self._send_text(401, json.dumps({"error": "Valid Account API required."})); return
         try:
             rows = _supabase_rest("crystal_scripts", {
                 "select": "*", "guest_id": "eq." + urllib.parse.quote(guest_id, safe=""),
@@ -1672,6 +1841,38 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             print(f"Guest script delete failed: {type(exc).__name__}: {exc}")
             self._send_text(500, json.dumps({"error": "Could not delete Guest script."}))
 
+    def _account_create_http(self):
+        try:
+            length=int(self.headers.get('Content-Length','0'))
+            if length<=0 or length>600000:
+                self._send_text(400,json.dumps({'error':'Invalid request.'})); return
+            body=json.loads(self.rfile.read(length).decode('utf-8'))
+            if body.get('discordId') or body.get('discord_id'):
+                account = _account_api_create_from_discord(str(body.get('discordId') or body.get('discord_id') or ''), str(body.get('username','')))
+            else:
+                # Backward compatibility for existing clients; old accounts remain usable.
+                account=_account_api_create_account(str(body.get('guestId','')), str(body.get('username','')), str(body.get('password','')), str(body.get('apiKey','')), str(body.get('avatarUrl','')))
+            self._send_text(200,json.dumps({'ok':True,'account':account},ensure_ascii=False))
+        except ValueError as exc:
+            self._send_text(400,json.dumps({'error':str(exc)}))
+        except Exception as exc:
+            print(f'Account create failed: {type(exc).__name__}: {exc}')
+            self._send_text(500,json.dumps({'error':'Could not create account.'}))
+
+    def _account_login_http(self):
+        try:
+            length=int(self.headers.get('Content-Length','0'))
+            if length<=0 or length>32768:
+                self._send_text(400,json.dumps({'error':'Invalid request.'})); return
+            body=json.loads(self.rfile.read(length).decode('utf-8'))
+            account=_account_api_login(str(body.get('apiKey','')))
+            self._send_text(200,json.dumps({'ok':True,'account':account},ensure_ascii=False))
+        except ValueError as exc:
+            self._send_text(401,json.dumps({'error':str(exc)}))
+        except Exception as exc:
+            print(f'Account login failed: {type(exc).__name__}: {exc}')
+            self._send_text(500,json.dumps({'error':'Could not login with Account API.'}))
+
     def _account_api_http(self):
         try:
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -1681,7 +1882,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             if not user and not guest_id:
                 self._send_text(401, json.dumps({'error':'Login or Guest account required.'})); return
             account = _account_api_get_or_create(str(user['id']) if user else '', guest_id)
-            self._send_text(200, json.dumps({'ok':True,'account':account}, ensure_ascii=False))
+            self._send_text(200, json.dumps({'ok':True,'account':_account_public(account)}, ensure_ascii=False))
         except Exception as exc:
             print(f'Account API get failed: {type(exc).__name__}: {exc}')
             self._send_text(500, json.dumps({'error':'Could not load Account API.'}))
@@ -1703,51 +1904,50 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
 
     def _api_account_status(self):
         try:
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            api_key = str((query.get('apiKey') or [''])[0]).strip()
-            token = str((query.get('accessToken') or [''])[0]).strip() or str(self.headers.get('X-Access-Token','')).strip()
-            guest_id = str((query.get('guestId') or [''])[0]).strip()[:128]
-            user = _verify_supabase_access_token(token) if token else None
-            rows = _supabase_rest('crystal_scripts', {
-                'select': 'id,name,api_key,user_id,guest_id,discord_user_id,discord_username',
-                'api_key': 'eq.' + urllib.parse.quote(api_key, safe=''), 'limit': '1'
-            })
-            if not rows:
-                self._send_text(404, json.dumps({'error':'API key not found.'})); return
-            row = rows[0]
-            if user and str(row.get('user_id') or '') != str(user['id']):
-                self._send_text(403, json.dumps({'error':'This API key does not belong to your account.'})); return
-            if not user and guest_id and str(row.get('guest_id') or '') != guest_id:
-                self._send_text(403, json.dumps({'error':'This API key does not belong to this Guest account.'})); return
-            if not user and not guest_id:
-                self._send_text(401, json.dumps({'error':'Login or Guest account required.'})); return
-            account = _api_account_get(api_key)
-            self._send_text(200, json.dumps({'ok':True,'script':row,'account':account}, ensure_ascii=False));
+            query=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            api_key=str((query.get('apiKey') or [''])[0]).strip()
+            if not api_key.startswith('CA-'):
+                self._send_text(400,json.dumps({'error':'This endpoint requires an Account API key starting with CA-.'})); return
+            account=_api_account_get(api_key)
+            if not account:
+                self._send_text(404,json.dumps({'error':'Account API key not found.'})); return
+            self._send_text(200,json.dumps({'ok':True,'account':_account_public(account)},ensure_ascii=False))
         except Exception as exc:
             print(f'API account status failed: {type(exc).__name__}: {exc}')
-            self._send_text(500, json.dumps({'error':'Could not load API account status.'}))
+            self._send_text(500,json.dumps({'error':'Could not load Account API status.'}))
 
     def _api_account_reset_http(self):
         try:
-            length = int(self.headers.get('Content-Length','0'))
-            if length <= 0 or length > 32768:
-                self._send_text(400, json.dumps({'error':'invalid request'})); return
-            body = json.loads(self.rfile.read(length).decode('utf-8'))
-            api_key = str(body.get('apiKey','')).strip()
-            token = str(body.get('accessToken','')).strip()
-            guest_id = str(body.get('guestId','')).strip()[:128]
-            user = _verify_supabase_access_token(token) if token else None
-            if not user and not guest_id:
-                self._send_text(401, json.dumps({'error':'Login or Guest account required.'})); return
-            result = _api_account_reset(api_key, str(user['id']) if user else '', guest_id)
-            self._send_text(200, json.dumps({'ok':True,'script':result}, ensure_ascii=False))
+            length=int(self.headers.get('Content-Length','0'))
+            if length<=0 or length>32768:
+                self._send_text(400,json.dumps({'error':'Invalid request.'})); return
+            body=json.loads(self.rfile.read(length).decode('utf-8'))
+            api_key=str(body.get('apiKey','')).strip()
+            guest_id=str(body.get('guestId','')).strip()[:128]
+            account=_api_account_get(api_key)
+            if not account:
+                self._send_text(404,json.dumps({'error':'Account API key not found.'})); return
+            if guest_id and str(account.get('guest_id') or '')!=guest_id:
+                self._send_text(403,json.dumps({'error':'This Account API does not belong to this account.'})); return
+            old_key=api_key
+            new_key=_account_api_generate()
+            while _supabase_rest('crystal_api_accounts', {'select':'id','api_key':'eq.'+urllib.parse.quote(new_key,safe=''),'limit':'1'}):
+                new_key=_account_api_generate()
+            patch={'api_key':new_key,'discord_user_id':None,'discord_username':None,'linked_at':_iso_now(),'updated_at':_iso_now()}
+            rows=_supabase_rest('crystal_api_accounts', {'id':'eq.'+str(account.get('id'))}, 'PATCH', patch, 'return=representation')
+            result=_account_public({**account,**patch})
+            try:
+                _supabase_rest('crystal_discord_users', {'api_key':'eq.'+urllib.parse.quote(old_key,safe='')}, 'DELETE', None, 'return=minimal')
+            except Exception:
+                pass
+            self._send_text(200,json.dumps({'ok':True,'account':result},ensure_ascii=False))
         except PermissionError as exc:
-            self._send_text(403, json.dumps({'error':str(exc)}));
+            self._send_text(403,json.dumps({'error':str(exc)}))
         except ValueError as exc:
-            self._send_text(404, json.dumps({'error':str(exc)}));
+            self._send_text(404,json.dumps({'error':str(exc)}))
         except Exception as exc:
             print(f'API account reset failed: {type(exc).__name__}: {exc}')
-            self._send_text(500, json.dumps({'error':'Could not reset the API key.'}))
+            self._send_text(500,json.dumps({'error':'Could not reset Account API.'}))
 
     def _admin_script_action(self):
         """Admin dashboard bridge: apply script changes to the same Supabase rows used by Discord."""
@@ -1816,6 +2016,12 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed_path = urllib.parse.urlparse(self.path)
+        if parsed_path.path == "/api/account-create":
+            self._account_create_http()
+            return
+        if parsed_path.path == "/api/account-login":
+            self._account_login_http()
+            return
         if parsed_path.path == '/api/account-api-reset':
             self._account_api_reset_http()
             return
@@ -1913,8 +2119,16 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 pass
 
         if parsed_path.path == "/script-source":
-            # Deliver source only after key and saved device binding pass.
+            # A generated key is single-use: after the first successful script-source
+            # request it is consumed and cannot be used by another user/device.
             meta = (s_info.get("key_meta") or {}).get(user_key, {})
+            if user_key.strip().lower() != "trail" and not meta.get("consumed"):
+                meta["consumed"] = True
+                meta["consumed_at"] = _iso_now()
+                meta["consumed_hwid"] = str(reported_hwid)[:256]
+                meta["consumed_device"] = reported_device
+                s_info.setdefault("key_meta", {})[user_key] = meta
+                save_data()
             _send_script_webhook(s_info, "Key Used", username="", discord_user_id=str(meta.get("discord_user_id") or ""), key=user_key, device=reported_device, country=reported_country, duration=format_remaining(meta.get("expires_at")))
             _persist_script_row(s_info.get("supabase_row_id"), {"key_meta": s_info.get("key_meta", {}), "updated_at": _iso_now()})
             self._send_text(200, s_info.get("source_code", "-- No source code loaded"))
@@ -2400,6 +2614,8 @@ def key_is_usable(s_info: dict, key: str) -> tuple:
     meta = (s_info.get("key_meta") or {}).get(key, {})
     if meta.get("disabled"):
         return False, "This key has been disabled."
+    if meta.get("consumed"):
+        return False, "This key has already been used by another user."
     if key not in s_info.get("valid_keys", set()) and key not in set((s_info.get("user_keys") or {}).values()) and key not in (s_info.get("key_meta") or {}):
         return False, "Key is not valid for this script."
     if (meta.get("mode") or "PERM").upper() == "TIME" and is_expired(meta.get("expires_at")):
@@ -2563,7 +2779,7 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
     # / has been permanently removed — use /api to link Dashboard account.
     command_name = getattr(getattr(interaction, "command", None), "name", "")
     management_commands = {
-        "generate-key", "key", "whitelist", "see-keys", "delete-key",
+        "generate-key", "whitelist", "see-keys", "delete-key",
         "unwhitelist", "trail", "delete-script",
         "set-buyer-role", "update-script", "reset-hwid-cooldown",
         "ai-bot",
@@ -2571,6 +2787,17 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
     }
     if command_name in management_commands:
         is_admin_tier = _discord_plan(interaction.user.id) == "Admin"
+        # /generate-key is intentionally available on every plan, but still requires
+        # the configured Admin role or Discord Administrator permission.
+        if command_name == "generate-key":
+            allowed, message = _global_admin_status(interaction)
+            if not allowed:
+                try:
+                    await interaction.response.send_message(message or "❌ Admin role or Administrator permission required.", ephemeral=True)
+                except discord.HTTPException:
+                    pass
+                return False
+            return True
         if not (is_bot_owner(interaction.user.id) or is_admin_tier or str(interaction.user.id) in admin_redeemed_users):
             message = "❌ This command requires internal bot authorization."
             try:
@@ -3152,6 +3379,7 @@ async def on_ready():
     print(f"Crystal Hub build: {BUILD_TAG}")
     if not getattr(bot, "_crystal_admin_view_registered", False):
         bot.add_view(AdminGuideLanguageView())
+        bot.add_view(ExplainHomeView("en"))
         bot._crystal_admin_view_registered = True
     # Global-only registration prevents every slash command from appearing twice.
     # Discord guild copies are intentionally NOT created.
@@ -3187,8 +3415,11 @@ async def generate_key_command(
     duration_type: app_commands.Choice[str] = None,
     duration: str = None,
 ):
-    if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to generate keys.", ephemeral=True)
+    # /generate-key is available to Free/Premium/Ultra users too, but only
+    # when the user has the configured Admin role or Discord Administrator permission.
+    role_ok = has_admin_editor_role(interaction) or is_guild_administrator(interaction) or _has_global_admin_access(interaction)
+    if not (is_bot_owner(interaction.user.id) or role_ok):
+        await interaction.response.send_message("❌ You need the configured Admin role or Discord Administrator permission to generate keys.", ephemeral=True)
         return
     if script not in scripts_data:
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
@@ -3199,56 +3430,10 @@ async def generate_key_command(
     except ValueError as exc:
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
         return
-    quota_ok, quota_error = _quota_check(interaction.user.id, "keys")
-    if not quota_ok:
-        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
-        return
     new_key = generate_random_key()
     register_key(scripts_data[script], new_key, mode, expires_at, created_by=interaction.user.id)
     save_data()
     _sync_script_to_supabase(script, scripts_data[script], str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
-    _quota_increment(interaction.user.id, "keys")
-    when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
-    await interaction.response.send_message(
-        f"🔑 **New Key Generated for `{script}`** ({mode} — {when}):\n```text\n{new_key}\n```\n\n{_quota_status(interaction.user.id)}",
-        ephemeral=True
-    )
-
-
-@bot.tree.command(name="key", description="Generate a script key (PERM or TIME)")
-@app_commands.describe(script="Target script", duration_type="PERM = permanent, TIME = timed", duration="Required for TIME (e.g. 1m, 30m, 1h, 1d)")
-@app_commands.autocomplete(script=script_autocomplete)
-@app_commands.choices(duration_type=[
-    app_commands.Choice(name="PERM (permanent)", value="PERM"),
-    app_commands.Choice(name="TIME (timed)", value="TIME"),
-])
-async def key_command(
-    interaction: discord.Interaction,
-    script: str,
-    duration_type: app_commands.Choice[str],
-    duration: str = None,
-):
-    if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to generate keys.", ephemeral=True)
-        return
-    if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
-        return
-    mode = duration_type.value.upper()
-    try:
-        mode, expires_at = resolve_expires(mode, duration)
-    except ValueError as exc:
-        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
-        return
-    quota_ok, quota_error = _quota_check(interaction.user.id, "keys")
-    if not quota_ok:
-        await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
-        return
-    new_key = generate_random_key()
-    register_key(scripts_data[script], new_key, mode, expires_at, created_by=interaction.user.id)
-    save_data()
-    _sync_script_to_supabase(script, scripts_data[script], str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
-    _quota_increment(interaction.user.id, "keys")
     when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
     await interaction.response.send_message(
         f"🔑 **New Key Generated for `{script}`** ({mode} — {when}):\n```text\n{new_key}\n```\n\n{_quota_status(interaction.user.id)}",
@@ -3743,57 +3928,58 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
 
 
 # API account linking — connects a Dashboard API key to this Discord account.
-@bot.tree.command(name="api", description="Link Discord to your Crystal Hub Dashboard API (or unlink + reset key)")
+@bot.tree.command(name="api", description="Link your Discord account to your Crystal Hub Account API")
 @app_commands.describe(
-    acc="Your Crystal Hub API key from the Dashboard (e.g. CH-xxxxxxxx)",
-    unlink="Turn ON to unlink this Discord account and reset the API key on the Dashboard",
+    acc="Your standalone Crystal Hub Account API key from Dashboard Settings (CA-...)",
+    unlink="Unlink this Discord account from the Account API"
 )
-async def api_account_command(interaction: discord.Interaction, acc: str, unlink: bool = False):
-    """User-facing account link. Replaces the old / command."""
-    acc = str(acc or "").strip()
-    if not acc:
-        await interaction.response.send_message(
-            "❌ Provide your Dashboard API key.\n"
-            "Example: `/api` → `acc:` `CH-xxxxxxxx`\n"
-            "Unlink: same command with **unlink** turned on.",
-            ephemeral=True,
-        )
-        return
-    try:
-        if unlink:
-            acct = await asyncio.to_thread(_account_api_get_by_owner, '', str(interaction.user.id))
-            if acct and str(acct.get('api_key') or '') == acc:
-                await asyncio.to_thread(_supabase_rest, 'crystal_api_accounts', {'id':'eq.'+str(acct.get('id'))}, 'PATCH', {'discord_user_id':None,'discord_username':None,'updated_at':_iso_now()}, 'return=minimal')
-                await interaction.response.send_message('✅ Account API unlinked. Your Dashboard scripts were not changed.', ephemeral=True)
+async def api_account_command(interaction: discord.Interaction, acc: Optional[str] = None, unlink: bool = False):
+    acc = str(acc or '').strip()
+    if not acc and not unlink:
+        try:
+            own = await asyncio.to_thread(_account_api_get_by_discord, str(interaction.user.id))
+            if not own:
+                await interaction.response.send_message(
+                    "❌ No Dashboard Account API is linked to this Discord ID yet. Create your account at https://crystal-login.pages.dev/ first.", ephemeral=True)
                 return
-            result = await asyncio.to_thread(_api_account_reset, acc, '', '', str(interaction.user.id))
-            await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
             await interaction.response.send_message(
-                f"✅ Unlinked. Old API key removed; Dashboard created a **new** API key for **{result.get('name', 'script')}**.\n"
-                "Open the Dashboard and copy the new key.",
-                ephemeral=True,
-            )
+                "🔑 **Your Crystal Hub Account API**\n"
+                f"`{own.get('api_key', '')}`\n"
+                "Keep this key private. It is different from each Script API key (`CH-...`).", ephemeral=True)
+            return
+        except Exception as exc:
+            print(f'/api account lookup error: {type(exc).__name__}: {exc}')
+            await interaction.response.send_message('❌ Could not retrieve your Account API.', ephemeral=True)
+            return
+    try:
+        if not acc.startswith('CA-'):
+            await interaction.response.send_message(
+                "❌ That is a **Script API key**. `/api` needs the standalone **Account API key** from Dashboard → Settings → Account API.\n"
+                "The Account API key starts with `CA-`.", ephemeral=True)
+            return
+        if unlink:
+            acct = await asyncio.to_thread(_account_api_get_by_discord, str(interaction.user.id))
+            if not acct or str(acct.get('api_key') or '') != acc:
+                await interaction.response.send_message('❌ This Account API key is not linked to your Discord account.', ephemeral=True)
+                return
+            await asyncio.to_thread(_supabase_rest, 'crystal_api_accounts', {'id':'eq.'+str(acct.get('id'))}, 'PATCH', {
+                'discord_user_id':None, 'discord_username':None, 'updated_at':_iso_now()
+            }, 'return=minimal')
+            await interaction.response.send_message('✅ Account API unlinked. Your scripts and Script API keys were not changed.', ephemeral=True)
             return
         account = await asyncio.to_thread(_account_api_link, acc, str(interaction.user.id), str(interaction.user))
         await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
         await interaction.response.send_message(
-            '✅ Account API linked successfully. Your Discord account is now connected to your Dashboard scripts and plan.\n'
-            'Your Script API keys were not changed.',
-            ephemeral=True,
-        )
-    except PermissionError as exc:
-        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            "✅ **Account API linked.**\n"
+            "Your Discord account is now connected to the Dashboard account.\n"
+            f"Account API: `{account.get('api_key', acc)}`\n"
+            "Your individual Script API keys (`CH-...`) remain separate.", ephemeral=True)
     except ValueError as exc:
-        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        await interaction.response.send_message(f'❌ {exc}', ephemeral=True)
     except Exception as exc:
-        print(f"API account command failed: {type(exc).__name__}: {exc}")
-        await interaction.response.send_message(
-            "❌ Could not update the API account. Check that the Dashboard API key is valid.",
-            ephemeral=True,
-        )
+        print(f'/api account link error: {type(exc).__name__}: {exc}')
+        await interaction.response.send_message('❌ Could not link the Account API. Check that the key came from Dashboard → Settings.', ephemeral=True)
 
-
-# 7. إعداد البانل
 @bot.tree.command(name="hwid", description="Reset HWID binding so your key can lock to a new device")
 @app_commands.describe(script="Optional: one script only. Leave empty to reset HWID for all your keys.")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -5143,6 +5329,218 @@ async def ai_bot_command_error(interaction: discord.Interaction, error):
             await interaction.response.send_message(
                 "Could not change AI chat settings. Check the bot logs.", ephemeral=True
             )
+
+
+
+# /explain tutorial videos (same three videos used by the Dashboard tutorial)
+EXPLAIN_VIDEO_FILES = {
+    "website": "videos/create-script-in-website.mp4",
+    "commands": "videos/how-to-create-script-by-commands.mp4",
+    "key": "videos/how-to-create-key-or-whitelist.mp4",
+}
+
+
+def _explain_video_path(key: str):
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, EXPLAIN_VIDEO_FILES[key])
+
+
+class ExplainVideosView(BlacklistAwareView):
+    """Three tutorial videos matching the Dashboard Tutorial videos."""
+    def __init__(self, language="en"):
+        super().__init__(timeout=900)
+        self.language = language
+        self.website_btn.label = "إنشاء سكربت من الموقع" if language == "ar" else "Create script in website"
+        self.commands_btn.label = "إنشاء سكربت بالأوامر" if language == "ar" else "How to create script by commands"
+        self.key_btn.label = "إنشاء Key أو Whitelist" if language == "ar" else "How to create key or whitelist"
+        self.back_btn.label = "رجوع" if language == "ar" else "Back"
+        self.language_btn.label = "English" if language == "ar" else "العربية"
+
+    async def _send_video(self, interaction, key: str):
+        path = _explain_video_path(key)
+        if not os.path.isfile(path):
+            msg = "الفيديو غير موجود في ملفات البوت." if self.language == "ar" else "This tutorial video is missing from the bot files."
+            await interaction.response.send_message(msg, ephemeral=True)
+            return
+        labels = {
+            "website": ("إنشاء سكربت من الموقع" if self.language == "ar" else "Create script in website"),
+            "commands": ("إنشاء سكربت بالأوامر" if self.language == "ar" else "How to create script by commands"),
+            "key": ("إنشاء Key أو Whitelist" if self.language == "ar" else "How to create key or whitelist"),
+        }
+        await interaction.response.send_message(
+            content=f"🎥 **{labels[key]}**",
+            file=discord.File(path, filename=os.path.basename(path)),
+            ephemeral=False,
+        )
+
+    @discord.ui.button(label="Create script in website", style=discord.ButtonStyle.primary, custom_id="crystal_explain_video_website")
+    async def website_btn(self, interaction, button):
+        await self._send_video(interaction, "website")
+
+    @discord.ui.button(label="How to create script by commands", style=discord.ButtonStyle.primary, custom_id="crystal_explain_video_commands")
+    async def commands_btn(self, interaction, button):
+        await self._send_video(interaction, "commands")
+
+    @discord.ui.button(label="How to create key or whitelist", style=discord.ButtonStyle.primary, custom_id="crystal_explain_video_key")
+    async def key_btn(self, interaction, button):
+        await self._send_video(interaction, "key")
+
+    @discord.ui.button(label="Back", emoji="◀", style=discord.ButtonStyle.secondary, custom_id="crystal_explain_video_back")
+    async def back_btn(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=build_explain_home_embed(self.language),
+            view=ExplainHomeView(self.language),
+        )
+
+    @discord.ui.button(label="العربية", emoji="🌐", style=discord.ButtonStyle.secondary, custom_id="crystal_explain_video_language")
+    async def language_btn(self, interaction, button):
+        self.language = "ar" if self.language == "en" else "en"
+        await interaction.response.edit_message(
+            embed=build_explain_videos_embed(self.language),
+            view=ExplainVideosView(self.language),
+        )
+
+class ExplainHomeView(BlacklistAwareView):
+    """Public bilingual /explain menu. Every screen includes its own language toggle."""
+    def __init__(self, language="en"):
+        super().__init__(timeout=900)
+        self.language = language
+        if language == "ar":
+            self.script_btn.label = "شرح السكربت"
+            self.website_btn.label = "شرح الموقع"
+            self.bot_btn.label = "شرح البوت"
+            self.commands_btn.label = "الأوامر"
+            self.videos_btn.label = "الفيديوهات"
+            self.language_btn.label = "English"
+        else:
+            self.script_btn.label = "Script Tutorial"
+            self.website_btn.label = "Website Tutorial"
+            self.bot_btn.label = "Bot Tutorial"
+            self.commands_btn.label = "Commands"
+            self.videos_btn.label = "Videos"
+            self.language_btn.label = "العربية"
+
+    async def _open(self, interaction: discord.Interaction, topic: str):
+        await interaction.response.edit_message(
+            embed=build_explain_embed(topic, self.language),
+            view=ExplainPageView(topic, self.language),
+        )
+
+    @discord.ui.button(label="Script Tutorial", style=discord.ButtonStyle.primary, custom_id="crystal_explain_script")
+    async def script_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open(interaction, "script")
+
+    @discord.ui.button(label="Website Tutorial", style=discord.ButtonStyle.primary, custom_id="crystal_explain_website")
+    async def website_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open(interaction, "website")
+
+    @discord.ui.button(label="Bot Tutorial", style=discord.ButtonStyle.primary, custom_id="crystal_explain_bot")
+    async def bot_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open(interaction, "bot")
+
+    @discord.ui.button(label="Commands", style=discord.ButtonStyle.secondary, custom_id="crystal_explain_commands")
+    async def commands_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open(interaction, "commands")
+
+    @discord.ui.button(label="Videos", style=discord.ButtonStyle.success, custom_id="crystal_explain_videos")
+    async def videos_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=build_explain_videos_embed(self.language),
+            view=ExplainVideosView(self.language),
+        )
+
+    @discord.ui.button(label="العربية", emoji="🌐", style=discord.ButtonStyle.secondary, custom_id="crystal_explain_home_language")
+    async def language_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.language = "ar" if self.language == "en" else "en"
+        await interaction.response.edit_message(
+            embed=build_explain_home_embed(self.language),
+            view=ExplainHomeView(self.language),
+        )
+
+
+class ExplainPageView(BlacklistAwareView):
+    """A bilingual explanation page with Back + language toggle."""
+    def __init__(self, topic: str, language="en"):
+        super().__init__(timeout=900)
+        self.topic = topic
+        self.language = language
+        self.language_btn.label = "English" if language == "ar" else "العربية"
+
+    @discord.ui.button(label="Back", emoji="◀", style=discord.ButtonStyle.secondary, custom_id="crystal_explain_back")
+    async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=build_explain_home_embed(self.language),
+            view=ExplainHomeView(self.language),
+        )
+
+    @discord.ui.button(label="العربية", emoji="🌐", style=discord.ButtonStyle.secondary, custom_id="crystal_explain_page_language")
+    async def language_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.language = "ar" if self.language == "en" else "en"
+        await interaction.response.edit_message(
+            embed=build_explain_embed(self.topic, self.language),
+            view=ExplainPageView(self.topic, self.language),
+        )
+
+
+def build_explain_home_embed(language="en"):
+    if language == "ar":
+        return discord.Embed(
+            title="Crystal Hub | الشرح",
+            description="اختر القسم الذي تريد شرحه من الأزرار بالأسفل. يمكنك تبديل اللغة من زر 🌐.",
+            color=discord.Color.red(),
+        )
+    return discord.Embed(
+        title="Crystal Hub | Explanation",
+        description="Choose what you want to learn from the buttons below. You can switch the language with 🌐.",
+        color=discord.Color.red(),
+    )
+
+
+def build_explain_videos_embed(language="en"):
+    if language == "ar":
+        return discord.Embed(
+            title="Crystal Hub | فيديوهات الشرح",
+            description="اختر الفيديو الذي تريد مشاهدته. هذه نفس فيديوهات Tutorial الموجودة في الموقع.",
+            color=discord.Color.red(),
+        )
+    return discord.Embed(
+        title="Crystal Hub | Tutorial Videos",
+        description="Choose a video to watch. These are the same three videos used by the Dashboard Tutorial.",
+        color=discord.Color.red(),
+    )
+
+
+def build_explain_embed(topic: str, language="en"):
+    pages = {
+        "script": {
+            "en": ("Script Tutorial", "Create a script, give it a name, add your Lua source, then save it. After creation you can manage its access, file/source settings, keys and loader from the script workspace."),
+            "ar": ("شرح السكربت", "أنشئ السكربت، اختر اسمه، أضف سورس Lua ثم احفظه. بعد الإنشاء تقدر تدير الوصول والملف أو السورس والمفاتيح ورابط التحميل من مساحة السكربت."),
+        },
+        "website": {
+            "en": ("Website Tutorial", "Open the Dashboard, create or log in to your Account API, then use Scripts → Create Script. Your scripts and account data are saved to the connected backend."),
+            "ar": ("شرح الموقع", "افتح الداشبورد، أنشئ أو سجّل دخولك باستخدام Account API، ثم ادخل Scripts → Create Script. يتم حفظ السكربتات وبيانات الحساب في النظام المرتبط."),
+        },
+        "bot": {
+            "en": ("Bot Tutorial", "Invite Crystal Hub to your server, use the command menus to create and manage scripts, and use /api to link your Discord account to your Dashboard Account API."),
+            "ar": ("شرح البوت", "أضف Crystal Hub إلى سيرفرك، واستخدم قوائم الأوامر لإنشاء وإدارة السكربتات، واستخدم /api لربط ديسكورد بحساب Account API في الداشبورد."),
+        },
+        "commands": {
+            "en": ("Commands", "Main commands include /create-script, /generate-key, /hwid, /api, /trial, /source-setup, /panel-setup, /update-script, /delete-script and /avatar. Use the command's Discord help/options for its exact arguments."),
+            "ar": ("الأوامر", "من أهم الأوامر: /create-script و /generate-key و /hwid و /api و /trial و /source-setup و /panel-setup و /update-script و /delete-script و /avatar. استخدم خيارات الأمر في ديسكورد لمعرفة البيانات المطلوبة."),
+        },
+    }
+    title, description = pages.get(topic, pages["commands"])[language]
+    return discord.Embed(title=f"Crystal Hub | {title}", description=description, color=discord.Color.red())
+
+
+@bot.tree.command(name="explain", description="Open the Crystal Hub explanation and tutorial menu")
+async def explain_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=build_explain_home_embed("en"),
+        view=ExplainHomeView("en"),
+        ephemeral=False,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 class AdminGuideLanguageView(BlacklistAwareView):
