@@ -1882,8 +1882,10 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_text(400,json.dumps({'error':str(exc)}))
         except Exception as exc:
-            print(f'Account create failed: {type(exc).__name__}: {exc}')
-            self._send_text(500,json.dumps({'error':'Could not create account.'}))
+            detail = str(exc).strip() or type(exc).__name__
+            print(f'Account create failed: {type(exc).__name__}: {detail}')
+            safe_detail = re.sub(r'(SUPA_PRIVATE|SUPABASE_SERVICE_ROLE_KEY|Authorization)\s*[:=]\s*[^\s,;]+', '[hidden]', detail, flags=re.I)
+            self._send_text(500,json.dumps({'error':'Could not create account.','detail':safe_detail[:500]},ensure_ascii=False))
 
     def _account_login_http(self):
         try:
@@ -3410,10 +3412,7 @@ async def _sync_global_commands():
 @bot.event
 async def on_ready():
     print(f"Crystal Hub build: {BUILD_TAG}")
-    if not getattr(bot, "_crystal_admin_view_registered", False):
-        bot.add_view(AdminGuideLanguageView())
-        bot.add_view(ExplainHomeView("en"))
-        bot._crystal_admin_view_registered = True
+    # These timed views are created when opened; they are not persistent views.
     # Global-only registration prevents every slash command from appearing twice.
     # Discord guild copies are intentionally NOT created.
     await _sync_global_commands()
