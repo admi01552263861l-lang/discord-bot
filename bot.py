@@ -172,6 +172,10 @@ def load_data():
                     s_info.setdefault("settings", {})
                     s_info.setdefault("source_name", None)
                     s_info.setdefault("source_path", None)
+                    s_info.setdefault("guild_id", None)
+                    s_info.setdefault("discord_user_id", None)
+                    s_info.setdefault("discord_username", None)
+                    s_info.setdefault("guest_id", None)
                     # Normalize access maps
                     if not isinstance(s_info.get("key_meta"), dict):
                         s_info["key_meta"] = {}
@@ -227,6 +231,10 @@ def save_data():
                 "settings": s_info.get("settings", {}) if isinstance(s_info.get("settings", {}), dict) else {},
                 "source_name": s_info.get("source_name"),
                 "source_path": s_info.get("source_path"),
+                "guild_id": str(s_info.get("guild_id") or "") or None,
+                "discord_user_id": str(s_info.get("discord_user_id") or "") or None,
+                "discord_username": str(s_info.get("discord_username") or "") or None,
+                "guest_id": str(s_info.get("guest_id") or "") or None,
             }
         
         payload = {
@@ -1057,8 +1065,18 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
     bindings survive Render redeploys and bot updates.
     """
     try:
-        discord_user_id = str(discord_user_id or info.get("created_by") or "").strip()
-        discord_username = str(discord_username or "")[:100]
+        script_name = str(script_name or info.get("name") or info.get("script_name") or "").strip()
+        if not script_name:
+            raise ValueError("Script name is missing; refusing to write an unnamed row to Supabase.")
+        info["name"] = script_name
+        discord_user_id = str(discord_user_id or info.get("discord_user_id") or info.get("created_by") or "").strip()
+        discord_username = str(discord_username or info.get("discord_username") or "")[:100]
+        if discord_user_id:
+            info["discord_user_id"] = discord_user_id
+        if discord_username:
+            info["discord_username"] = discord_username
+        if guild_id:
+            info["guild_id"] = str(guild_id)
         user_id = info.get("supabase_user_id") or None
         if not user_id and discord_user_id:
             try:
@@ -1087,6 +1105,7 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
             "buyer_role_id": info.get("buyer_role_id"),
             "admin_role_id": info.get("admin_role_id"),
             "created_by": str(info.get("created_by") or discord_user_id),
+        "name": script_name,
             "panel_created_by": info.get("panel_created_by"),
             "panel_guild_id": info.get("panel_guild_id"),
             "panel_channel_id": info.get("panel_channel_id"),
@@ -1112,6 +1131,7 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
         }
         row = {
             "user_id": str(user_id) if user_id else None,
+            "guest_id": str(info.get("guest_id") or "") or None,
             "name": script_name,
             "api_key": info.get("api_key", ""),
             "script": info.get("source_code", ""),
@@ -1226,6 +1246,7 @@ def _sync_dashboard_scripts_from_supabase():
                 "whitelisted_users": whitelisted,
                 "user_keys": user_keys,
                 "created_by": owner,
+                "name": name,
                 "panel_created_by": bot_data.get("panel_created_by"),
                 "panel_guild_id": bot_data.get("panel_guild_id"),
                 "panel_channel_id": bot_data.get("panel_channel_id"),
@@ -1354,25 +1375,26 @@ def _load_script_from_api_url(api_url: str) -> dict:
 
 def _crystal_account_public(row: dict) -> dict:
     """Safe account payload for the separate Crystal login site."""
+    # Return both camelCase (login portal) and snake_case (dashboard) fields.
+    guest_id = str(row.get("guest_id") or "")
+    discord_id = str(row.get("discord_user_id") or "")
+    discord_username = str(row.get("discord_username") or "")
+    username = str(row.get("website_username") or "")
+    avatar_url = str(row.get("avatar_url") or "")
+    api_key = str(row.get("api_key") or "")
+    plan = str(row.get("plan") or "Free")
+    expires = row.get("plan_expires_at")
+    created = row.get("created_at")
     return {
-        # Keep camelCase for the login portal and snake_case for the Dashboard API.
-        "guestId": str(row.get("guest_id") or ""),
-        "guest_id": str(row.get("guest_id") or ""),
-        "discordId": str(row.get("discord_user_id") or ""),
-        "discord_user_id": str(row.get("discord_user_id") or ""),
-        "discordUsername": str(row.get("discord_username") or ""),
-        "discord_username": str(row.get("discord_username") or ""),
-        "username": str(row.get("website_username") or ""),
-        "website_username": str(row.get("website_username") or ""),
-        "avatarUrl": str(row.get("avatar_url") or ""),
-        "avatar_url": str(row.get("avatar_url") or ""),
-        "apiKey": str(row.get("api_key") or ""),
-        "api_key": str(row.get("api_key") or ""),
-        "plan": str(row.get("plan") or "Free"),
-        "planExpiresAt": row.get("plan_expires_at"),
-        "plan_expires_at": row.get("plan_expires_at"),
-        "createdAt": row.get("created_at"),
-        "created_at": row.get("created_at"),
+        "guestId": guest_id, "guest_id": guest_id,
+        "discordId": discord_id, "discord_user_id": discord_id,
+        "discordUsername": discord_username, "discord_username": discord_username,
+        "username": username, "website_username": username,
+        "avatarUrl": avatar_url, "avatar_url": avatar_url,
+        "apiKey": api_key, "api_key": api_key,
+        "plan": plan,
+        "planExpiresAt": expires, "plan_expires_at": expires,
+        "createdAt": created, "created_at": created,
     }
 
 
@@ -1739,6 +1761,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 "ultra_safe": bool(data.get("ultra_safe", False)),
                 "discord_user_id": str(data.get("discord_user_id") or "")[:100] or None,
                 "discord_username": str(data.get("discord_username") or "")[:100] or None,
+                "guild_id": str(data.get("guild_id") or "")[:32] or None,
+                "guest_id": str(data.get("guest_id") or "")[:128] or None,
                 "loader_code": str(data.get("loader_code") or "")[:300] or None,
                 "access_mode": "paid" if str(data.get("access_mode", "free")).lower()=="paid" else "free",
                 "disabled": bool(data.get("disabled", False)),
@@ -1792,6 +1816,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 "obfuscator": bool(data.get("obfuscator", False)),
                 "ultra_safe": bool(data.get("ultra_safe", False)),
                 "discord_user_id": None, "discord_username": None,
+                "guild_id": str(data.get("guild_id") or "")[:32] or None,
                 "loader_code": str(data.get("loader_code") or "")[:300] or None,
                 "access_mode": "paid" if str(data.get("access_mode", "free")).lower() == "paid" else "free",
                 "disabled": bool(data.get("disabled", False)),
@@ -1882,10 +1907,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_text(400,json.dumps({'error':str(exc)}))
         except Exception as exc:
-            detail = str(exc).strip() or type(exc).__name__
-            print(f'Account create failed: {type(exc).__name__}: {detail}')
-            safe_detail = re.sub(r'(SUPA_PRIVATE|SUPABASE_SERVICE_ROLE_KEY|Authorization)\s*[:=]\s*[^\s,;]+', '[hidden]', detail, flags=re.I)
-            self._send_text(500,json.dumps({'error':'Could not create account.','detail':safe_detail[:500]},ensure_ascii=False))
+            print(f'Account create failed: {type(exc).__name__}: {exc}')
+            self._send_text(500,json.dumps({'error':'Could not create account.'}))
 
     def _account_login_http(self):
         try:
@@ -2734,7 +2757,12 @@ async def script_autocomplete(
     current: str
 ) -> list[app_commands.Choice[str]]:
     choices = []
-    for script_name in scripts_data.keys():
+    active_guild = str(interaction.guild_id or "")
+    for script_name, script_info in scripts_data.items():
+        # A script is visible only inside the Discord server it is bound to.
+        bound_guild = str((script_info or {}).get("guild_id") or "")
+        if not active_guild or not bound_guild or bound_guild != active_guild:
+            continue
         if current.lower() in script_name.lower():
             choices.append(app_commands.Choice(name=script_name, value=script_name))
     return choices[:25]
@@ -2808,6 +2836,34 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
         except discord.HTTPException:
             pass
         return False
+
+    # Enforce per-server script isolation for all slash commands with a script option.
+    # Legacy rows without guild_id are intentionally unavailable until explicitly linked.
+    if interaction.guild_id:
+        def _walk_options(items):
+            for item in items or []:
+                if isinstance(item, dict):
+                    yield item
+                    yield from _walk_options(item.get("options", []))
+        try:
+            raw_options = (interaction.data or {}).get("options", [])
+            for option in _walk_options(raw_options):
+                if str(option.get("name", "")).lower() in ("script", "script_name"):
+                    selected = str(option.get("value", ""))
+                    if selected and selected in scripts_data:
+                        bound = str((scripts_data.get(selected) or {}).get("guild_id") or "")
+                        if bound != str(interaction.guild_id):
+                            msg = "❌ This script is not linked to this server. Each Discord server can use only its own scripts."
+                            try:
+                                if interaction.response.is_done():
+                                    await interaction.followup.send(msg, ephemeral=True)
+                                else:
+                                    await interaction.response.send_message(msg, ephemeral=True)
+                            except discord.HTTPException:
+                                pass
+                            return False
+        except Exception as _scope_exc:
+            print(f"Crystal guild script guard warning: {type(_scope_exc).__name__}: {_scope_exc}")
 
     # Gate bot-management slash commands with the server-wide role. Keep user-facing
     # commands (/api, /hwid, /redeem) available to everyone; quota checks remain in place.
@@ -3395,6 +3451,8 @@ async def _crystal_dashboard_sync_loop():
             imported_count = await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
             pushed_count = await asyncio.to_thread(_push_all_local_scripts_to_supabase)
             print(f"Crystal durable sync: restored {imported_count}, persisted {pushed_count} script(s).")
+            if scripts_data and pushed_count == 0:
+                print("WARNING: no local scripts were confirmed saved to Supabase. Check SUPA_PRIVATE and crystal_scripts columns/permissions.")
         except Exception as exc:
             print(f"Crystal durable sync failed: {type(exc).__name__}: {exc}")
 
@@ -3412,7 +3470,8 @@ async def _sync_global_commands():
 @bot.event
 async def on_ready():
     print(f"Crystal Hub build: {BUILD_TAG}")
-    # These timed views are created when opened; they are not persistent views.
+    # Do not register these finite-timeout views with bot.add_view().
+    # They are attached directly when their messages are sent.
     # Global-only registration prevents every slash command from appearing twice.
     # Discord guild copies are intentionally NOT created.
     await _sync_global_commands()
@@ -3664,6 +3723,7 @@ async def create_script_command(
         "whitelisted_users": set(),
         "user_keys": {},
         "created_by": str(interaction.user.id),
+        "guild_id": str(interaction.guild.id) if interaction.guild else None,
         "api_key": api_key,
         "supabase_user_id": (imported or {}).get("_supabase_user_id"),
         "supabase_row_id": (imported or {}).get("_supabase_row_id"),
@@ -5375,24 +5435,21 @@ async def ai_bot_command_error(interaction: discord.Interaction, error):
 
 
 
-# /explain tutorial videos
-# No MP4 files are bundled with the bot. Each value can be a Discord MESSAGE URL
-# containing the tutorial video. Set these in Render Environment Variables.
-# The singular CRYSTAL_EXPLAIN_VIDEO_KEY is also accepted for the key/whitelist video.
-EXPLAIN_VIDEO_ENV = {
-    "website": "CRYSTAL_EXPLAIN_VIDEO_WEBSITE",
-    "commands": "CRYSTAL_EXPLAIN_VIDEO_COMMANDS",
-    "key": "CRYSTAL_EXPLAIN_VIDEO_KEY",
+# /explain tutorial videos (same three videos used by the Dashboard tutorial)
+EXPLAIN_VIDEO_FILES = {
+    "website": "videos/create-script-in-website.mp4",
+    "commands": "videos/how-to-create-script-by-commands.mp4",
+    "key": "videos/how-to-create-key-or-whitelist.mp4",
 }
 
 
-def _explain_video_url(key: str) -> str:
-    value = os.getenv(EXPLAIN_VIDEO_ENV.get(key, ""), "").strip()
-    return value
+def _explain_video_path(key: str):
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, EXPLAIN_VIDEO_FILES[key])
 
 
 class ExplainVideosView(BlacklistAwareView):
-    """Tutorial video links. Videos live in Discord; the bot does not need MP4 files."""
+    """Three tutorial videos matching the Dashboard Tutorial videos."""
     def __init__(self, language="en"):
         super().__init__(timeout=900)
         self.language = language
@@ -5403,27 +5460,20 @@ class ExplainVideosView(BlacklistAwareView):
         self.language_btn.label = "English" if language == "ar" else "العربية"
 
     async def _send_video(self, interaction, key: str):
-        url = _explain_video_url(key)
-        label = {
-            "website": "إنشاء سكربت من الموقع" if self.language == "ar" else "Create script in website",
-            "commands": "إنشاء سكربت بالأوامر" if self.language == "ar" else "How to create script by commands",
-            "key": "إنشاء Key أو Whitelist" if self.language == "ar" else "How to create key or whitelist",
-        }[key]
-        if not url:
-            env_name = EXPLAIN_VIDEO_ENV[key]
-            msg = (
-                f"مصدر هذا الفيديو غير مضبوط في Render. ضع رابط رسالة Discord للفيديو في `{env_name}`."
-                if self.language == "ar" else
-                f"This video source is not configured in Render. Put the Discord message URL for the video in `{env_name}`."
-            )
+        path = _explain_video_path(key)
+        if not os.path.isfile(path):
+            msg = "الفيديو غير موجود في ملفات البوت." if self.language == "ar" else "This tutorial video is missing from the bot files."
             await interaction.response.send_message(msg, ephemeral=True)
             return
-        # Discord message URLs are intentionally forwarded as links. The source video
-        # stays in Discord and the bot does not upload or bundle the file.
+        labels = {
+            "website": ("إنشاء سكربت من الموقع" if self.language == "ar" else "Create script in website"),
+            "commands": ("إنشاء سكربت بالأوامر" if self.language == "ar" else "How to create script by commands"),
+            "key": ("إنشاء Key أو Whitelist" if self.language == "ar" else "How to create key or whitelist"),
+        }
         await interaction.response.send_message(
-            content=(f"🎥 **{label}**\n{url}"),
+            content=f"🎥 **{labels[key]}**",
+            file=discord.File(path, filename=os.path.basename(path)),
             ephemeral=False,
-            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     @discord.ui.button(label="Create script in website", style=discord.ButtonStyle.primary, custom_id="crystal_explain_video_website")
@@ -5476,7 +5526,7 @@ class ExplainHomeView(BlacklistAwareView):
     async def _open(self, interaction: discord.Interaction, topic: str):
         await interaction.response.edit_message(
             embed=build_explain_embed(topic, self.language),
-            view=ExplainPageView(topic, self.language, 0),
+            view=ExplainPageView(topic, self.language),
         )
 
     @discord.ui.button(label="Script Tutorial", style=discord.ButtonStyle.primary, custom_id="crystal_explain_script")
@@ -5511,118 +5561,13 @@ class ExplainHomeView(BlacklistAwareView):
         )
 
 
-EXPLAIN_COMMAND_PAGES = [
-    {
-        "name": "/create-script",
-        "en": ("Create Script", "Use `/create-script` to register a new script in Crystal Hub. Choose the script name and configure its buyer/admin roles when requested. Free users can create scripts without redeeming a plan. After creation, the script is saved so you can manage its source, access, keys, HWID and loader."),
-        "ar": ("إنشاء سكربت", "استخدم `/create-script` لإضافة سكربت جديد في Crystal Hub. اختر اسم السكربت واضبط رتبة المشتري ورتبة الإدارة إذا طلبها الأمر. مستخدم Free يقدر ينشئ سكربت بدون Redeem. بعد الإنشاء يتم حفظ السكربت وتقدر تدير السورس والصلاحيات والمفاتيح والـHWID ورابط التحميل."),
-    },
-    {
-        "name": "/generate-key",
-        "en": ("Generate Key", "Use `/generate-key` to create an access key for a selected script. Select the script, then choose `PERM` for permanent access or `TIME` for a timed key such as `1m`, `1h` or `1d`. The generated key is stored with the script and can be used for the script authorization system."),
-        "ar": ("إنشاء Key", "استخدم `/generate-key` لإنشاء مفتاح وصول للسكربت الذي تختاره. اختر السكربت ثم اختر `PERM` للوصول الدائم أو `TIME` لمدة محددة مثل `1m` أو `1h` أو `1d`. يتم حفظ الـKey مع السكربت ويستخدمه نظام التحقق من الوصول."),
-    },
-    {
-        "name": "/whitelist",
-        "en": ("Whitelist", "Use `/whitelist` to give a Discord member access to a selected script. Choose the member, script and access duration. The bot creates the user's access key and attempts to send it to them by DM. You can use permanent or timed access."),
-        "ar": ("Whitelist", "استخدم `/whitelist` لإعطاء عضو في ديسكورد صلاحية الوصول إلى سكربت محدد. اختر العضو والسكربت ومدة الوصول. البوت ينشئ مفتاح الوصول للمستخدم ويحاول إرساله له في الخاص. تقدر تستخدم وصول دائم أو مؤقت."),
-    },
-    {
-        "name": "/trail",
-        "en": ("Trail", "Use `/trail` to turn the free Trail access for a script ON or OFF. When enabling Trail, choose permanent access or a timed duration. This controls whether users can receive the configured free trial access for that script."),
-        "ar": ("Trail", "استخدم `/trail` لتشغيل أو إيقاف وصول Trail المجاني للسكربت. عند تشغيله اختر وصول دائم أو مدة مؤقتة. هذا يتحكم في إمكانية إعطاء المستخدمين وصول التجربة المجانية المحدد للسكربت."),
-    },
-    {
-        "name": "/source-setup",
-        "en": ("Source Setup", "Use `/source-setup` to upload or update a script source. Choose the target script, upload the source file, then choose whether the source should be obfuscated. Crystal Hub prepares the selected source and saves the result for the script loader."),
-        "ar": ("إعداد السورس", "استخدم `/source-setup` لرفع أو تحديث سورس السكربت. اختر السكربت وارفع ملف السورس ثم اختر هل تريد تشفيره أم لا. Crystal Hub يجهز السورس المحدد ويحفظ النتيجة لاستخدامها مع Loader السكربت."),
-    },
-    {
-        "name": "/panel-setup",
-        "en": ("Panel Setup", "Use `/panel-setup` to create the script management panel in your server. Configure the panel information and channel when needed. If you do not specify a channel, Crystal Hub keeps the setup to one panel instead of creating duplicate panels."),
-        "ar": ("إعداد البانل", "استخدم `/panel-setup` لإنشاء بانل إدارة السكربتات في السيرفر. اضبط معلومات البانل والقناة عند الحاجة. إذا لم تحدد قناة، Crystal Hub يحافظ على بانل واحد بدل إنشاء بانلات مكررة."),
-    },
-    {
-        "name": "/hwid",
-        "en": ("Reset HWID", "Use `/hwid` when a user's key is already bound to a device and needs to be moved to another device. The HWID binding is reset according to the command options, allowing the key to authorize again on the new device."),
-        "ar": ("Reset HWID", "استخدم `/hwid` عندما يكون الـKey مربوطًا بجهاز وتحتاج تنقله لجهاز آخر. يتم إعادة ضبط ربط HWID حسب خيارات الأمر، وبعدها يقدر الـKey يتعرف على الجهاز الجديد."),
-    },
-    {
-        "name": "/api",
-        "en": ("Account API", "Use `/api` to connect your Discord identity with your Crystal Hub website account. The website account uses an Account API key beginning with `CA-`. The key can be used to sign in to the Dashboard and keep the Discord and website account connected."),
-        "ar": ("Account API", "استخدم `/api` لربط هويتك في ديسكورد بحساب Crystal Hub في الموقع. مفتاح حساب الموقع يبدأ بـ `CA-`. يستخدم المفتاح لتسجيل الدخول للـDashboard والحفاظ على ربط حساب ديسكورد بحساب الموقع."),
-    },
-    {
-        "name": "/update-script",
-        "en": ("Update Script", "Use `/update-script` to announce a new script version. Select the script, enter the new version number such as `1.0.1`, then write the update details. Crystal Hub sends the update announcement to the server."),
-        "ar": ("تحديث السكربت", "استخدم `/update-script` للإعلان عن إصدار جديد للسكربت. اختر السكربت، اكتب رقم الإصدار الجديد مثل `1.0.1` ثم اكتب تفاصيل التحديث. Crystal Hub يرسل إعلان التحديث في السيرفر."),
-    },
-    {
-        "name": "/delete-script",
-        "en": ("Delete Script", "Use `/delete-script` to remove a script from Crystal Hub. The saved script entry is deleted and its hosted script route is disabled. This is a permanent management action, so use it only when you want the script removed."),
-        "ar": ("حذف السكربت", "استخدم `/delete-script` لإزالة السكربت من Crystal Hub. يتم حذف بيانات السكربت المحفوظة وتعطيل رابط السكربت المستضاف. هذا إجراء نهائي، لذلك استخدمه فقط إذا كنت تريد إزالة السكربت فعلًا."),
-    },
-    {
-        "name": "/avatar-bot",
-        "en": ("Avatar Bot", "Changes the bot profile for the server. Avatar usage is subject to the plan limits configured for the server/account."),
-        "ar": ("Avatar Bot", "يغير بروفايل البوت في السيرفر. استخدام الصور يخضع لحدود الخطة المحددة للحساب أو السيرفر."),
-    },
-    {
-        "name": "/redeem",
-        "en": ("Redeem", "Redeems a plan code. Free is the default and does not require redeem. Premium, Ultra and the hidden Admin access are unlocked by the configured codes."),
-        "ar": ("Redeem", "يستعمل كود الاشتراك. Free هو الوضع الافتراضي ولا يحتاج Redeem. Premium وUltra وصلاحية Admin المخفية يتم فتحها بالأكواد المحددة."),
-    },
-    {
-        "name": "/invite-reward",
-        "en": ("Invite Reward", "Sends the invite rewards panel so users can use the configured invite-reward system."),
-        "ar": ("دعوات المكافآت", "يرسل بانل مكافآت الدعوات حتى يقدر المستخدمون استعمال نظام المكافآت المخصص."),
-    },
-    {
-        "name": "/admin-role",
-        "en": ("Admin Role", "Sets the server-wide role allowed to manage Crystal Hub. The bot also checks that it has the permissions required for management."),
-        "ar": ("رتبة الإدارة", "يحدد الرتبة المسموح لها بإدارة Crystal Hub في السيرفر. والبوت يتأكد أيضًا من الصلاحيات المطلوبة للإدارة."),
-    },
-    {
-        "name": "/ai-information",
-        "en": ("AI Information", "Saves server-specific information and instructions that the AI should use when responding."),
-        "ar": ("معلومات AI", "يحفظ معلومات وتعليمات خاصة بالسيرفر حتى يستخدمها الذكاء الاصطناعي عند الرد."),
-    },
-    {
-        "name": "/ai-bot",
-        "en": ("AI Bot", "Turns AI replies ON or OFF in a channel."),
-        "ar": ("AI Bot", "يشغل أو يوقف ردود الذكاء الاصطناعي في قناة معينة."),
-    },
-    {
-        "name": "/explain",
-        "en": ("Explain", "Opens this bilingual Crystal Hub tutorial. Use the arrows to move through the command pages, Back to return, and the language button to switch Arabic/English."),
-        "ar": ("Explain", "يفتح شرح Crystal Hub بالعربي والإنجليزي. استخدم السهمين للتنقل بين صفحات الأوامر، وBack للرجوع، وزر اللغة للتبديل."),
-    },
-]
-
-
 class ExplainPageView(BlacklistAwareView):
-    """Bilingual explanation pages with previous/next arrows, Back and language toggle."""
-    def __init__(self, topic: str, language="en", page_index=0):
+    """A bilingual explanation page with Back + language toggle."""
+    def __init__(self, topic: str, language="en"):
         super().__init__(timeout=900)
         self.topic = topic
         self.language = language
-        self.page_index = max(0, min(page_index, len(EXPLAIN_COMMAND_PAGES) - 1))
-        self.back_btn.label = "رجوع" if language == "ar" else "Back"
-        self.prev_btn.label = "السابق" if language == "ar" else "Previous"
-        self.next_btn.label = "التالي" if language == "ar" else "Next"
         self.language_btn.label = "English" if language == "ar" else "العربية"
-        self._refresh_buttons()
-
-    def _refresh_buttons(self):
-        self.prev_btn.disabled = self.page_index <= 0
-        self.next_btn.disabled = self.page_index >= len(EXPLAIN_COMMAND_PAGES) - 1
-
-    async def _render(self, interaction):
-        self._refresh_buttons()
-        await interaction.response.edit_message(
-            embed=build_explain_embed(self.topic, self.language, self.page_index),
-            view=self,
-        )
 
     @discord.ui.button(label="Back", emoji="◀", style=discord.ButtonStyle.secondary, custom_id="crystal_explain_back")
     async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -5631,26 +5576,13 @@ class ExplainPageView(BlacklistAwareView):
             view=ExplainHomeView(self.language),
         )
 
-    @discord.ui.button(label="Previous", emoji="⬅️", style=discord.ButtonStyle.primary, custom_id="crystal_explain_previous")
-    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.page_index > 0:
-            self.page_index -= 1
-        await self._render(interaction)
-
-    @discord.ui.button(label="Next", emoji="➡️", style=discord.ButtonStyle.primary, custom_id="crystal_explain_next")
-    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.page_index < len(EXPLAIN_COMMAND_PAGES) - 1:
-            self.page_index += 1
-        await self._render(interaction)
-
     @discord.ui.button(label="العربية", emoji="🌐", style=discord.ButtonStyle.secondary, custom_id="crystal_explain_page_language")
     async def language_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.language = "ar" if self.language == "en" else "en"
-        self.back_btn.label = "رجوع" if self.language == "ar" else "Back"
-        self.prev_btn.label = "السابق" if self.language == "ar" else "Previous"
-        self.next_btn.label = "التالي" if self.language == "ar" else "Next"
-        self.language_btn.label = "English" if self.language == "ar" else "العربية"
-        await self._render(interaction)
+        await interaction.response.edit_message(
+            embed=build_explain_embed(self.topic, self.language),
+            view=ExplainPageView(self.topic, self.language),
+        )
 
 
 def build_explain_home_embed(language="en"):
@@ -5671,40 +5603,38 @@ def build_explain_videos_embed(language="en"):
     if language == "ar":
         return discord.Embed(
             title="Crystal Hub | فيديوهات الشرح",
-            description="اختر الفيديو. الفيديوهات محفوظة في Discord والبوت يرسل رابط رسالة الفيديو؛ لا تحتاج ملفات MP4 داخل Render.",
+            description="اختر الفيديو الذي تريد مشاهدته. هذه نفس فيديوهات Tutorial الموجودة في الموقع.",
             color=discord.Color.red(),
         )
     return discord.Embed(
         title="Crystal Hub | Tutorial Videos",
-        description="Choose a video. Videos stay in Discord and the bot sends the Discord message link; no MP4 files are needed on Render.",
+        description="Choose a video to watch. These are the same three videos used by the Dashboard Tutorial.",
         color=discord.Color.red(),
     )
 
 
-def build_explain_embed(topic: str, language="en", page_index=0):
-    if topic != "commands":
-        pages = {
-            "script": {
-                "en": ("Script Tutorial", "Create a script, give it a name, add your Lua source, then save it. After creation you can manage its access, source settings, keys and loader from the script workspace."),
-                "ar": ("شرح السكربت", "أنشئ السكربت، اختر اسمه، أضف سورس Lua ثم احفظه. بعد الإنشاء تقدر تدير الوصول والسورس والمفاتيح ورابط التحميل من مساحة السكربت."),
-            },
-            "website": {
-                "en": ("Website Tutorial", "Open the Dashboard, create or log in to your Crystal Hub Account API, then use Scripts → Create Script. Your scripts and account data are saved to the connected backend."),
-                "ar": ("شرح الموقع", "افتح الداشبورد، أنشئ أو سجّل دخولك باستخدام Account API، ثم ادخل Scripts → Create Script. يتم حفظ السكربتات وبيانات الحساب في النظام المرتبط."),
-            },
-            "bot": {
-                "en": ("Bot Tutorial", "Invite Crystal Hub to your server, use the command menus to create and manage scripts, and use /api to link your Discord account to your Dashboard Account API."),
-                "ar": ("شرح البوت", "أضف Crystal Hub إلى سيرفرك، واستخدم قوائم الأوامر لإنشاء وإدارة السكربتات، واستخدم /api لربط ديسكورد بحساب Account API في الداشبورد."),
-            },
-        }
-        title, description = pages.get(topic, pages["script"])[language]
-        return discord.Embed(title=f"Crystal Hub | {title}", description=description, color=discord.Color.red())
+def build_explain_embed(topic: str, language="en"):
+    pages = {
+        "script": {
+            "en": ("Script Tutorial", "Create a script, give it a name, add your Lua source, then save it. After creation you can manage its access, file/source settings, keys and loader from the script workspace."),
+            "ar": ("شرح السكربت", "أنشئ السكربت، اختر اسمه، أضف سورس Lua ثم احفظه. بعد الإنشاء تقدر تدير الوصول والملف أو السورس والمفاتيح ورابط التحميل من مساحة السكربت."),
+        },
+        "website": {
+            "en": ("Website Tutorial", "Open the Dashboard, create or log in to your Account API, then use Scripts → Create Script. Your scripts and account data are saved to the connected backend."),
+            "ar": ("شرح الموقع", "افتح الداشبورد، أنشئ أو سجّل دخولك باستخدام Account API، ثم ادخل Scripts → Create Script. يتم حفظ السكربتات وبيانات الحساب في النظام المرتبط."),
+        },
+        "bot": {
+            "en": ("Bot Tutorial", "Invite Crystal Hub to your server, use the command menus to create and manage scripts, and use /api to link your Discord account to your Dashboard Account API."),
+            "ar": ("شرح البوت", "أضف Crystal Hub إلى سيرفرك، واستخدم قوائم الأوامر لإنشاء وإدارة السكربتات، واستخدم /api لربط ديسكورد بحساب Account API في الداشبورد."),
+        },
+        "commands": {
+            "en": ("Commands", "Main commands include /create-script, /generate-key, /hwid, /api, /trial, /source-setup, /panel-setup, /update-script, /delete-script and /avatar. Use the command's Discord help/options for its exact arguments."),
+            "ar": ("الأوامر", "من أهم الأوامر: /create-script و /generate-key و /hwid و /api و /trial و /source-setup و /panel-setup و /update-script و /delete-script و /avatar. استخدم خيارات الأمر في ديسكورد لمعرفة البيانات المطلوبة."),
+        },
+    }
+    title, description = pages.get(topic, pages["commands"])[language]
+    return discord.Embed(title=f"Crystal Hub | {title}", description=description, color=discord.Color.red())
 
-    item = EXPLAIN_COMMAND_PAGES[max(0, min(page_index, len(EXPLAIN_COMMAND_PAGES) - 1))]
-    title, description = item[language]
-    embed = discord.Embed(title=f"Crystal Hub | {title}", description=description, color=discord.Color.red())
-    embed.set_footer(text=f"{page_index + 1}/{len(EXPLAIN_COMMAND_PAGES)} • {item['name']}")
-    return embed
 
 @bot.tree.command(name="explain", description="Open the Crystal Hub explanation and tutorial menu")
 async def explain_command(interaction: discord.Interaction):
