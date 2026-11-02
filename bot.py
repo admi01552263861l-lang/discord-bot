@@ -4960,6 +4960,32 @@ def _restore_settings_backup(snapshot, backup_type, guild_id=None):
 
     save_data()
 
+def _persist_admin_plan_for_discord(discord_user_id: str):
+    """Mirror a successful Admin redeem into the durable account record.
+    This makes Dashboard Admin state survive Render restarts and appear on every login.
+    """
+    did = str(discord_user_id or '').strip()
+    if not did.isdigit():
+        return False
+    try:
+        rows = _supabase_rest("crystal_accounts", {
+            "select": "guest_id,plan",
+            "discord_user_id": "eq." + urllib.parse.quote(did, safe=""),
+            "limit": "1"
+        })
+        if not rows:
+            return False
+        gid = str(rows[0].get("guest_id") or "").strip()
+        if not gid:
+            return False
+        _supabase_rest("crystal_accounts", {
+            "guest_id": "eq." + urllib.parse.quote(gid, safe="")
+        }, "PATCH", {"plan": "Admin", "plan_expires_at": None, "updated_at": _iso_now()}, "return=minimal")
+        return True
+    except Exception as exc:
+        print(f"Admin plan persistence warning: {type(exc).__name__}: {exc}")
+        return False
+
 # ==================== Admin Redeem + -massage ==================== #
 
 @bot.tree.command(name="redeem", description="Redeem a code, or generate a plan code (owner only)")
@@ -5039,7 +5065,12 @@ async def redeem_command(
             admin_redeemed_users.discard(user_id)
             await interaction.response.send_message("❌ Could not save redemption. Try again later.", ephemeral=True)
             return
-        await interaction.response.send_message("✅ Internal authorization activated.", ephemeral=True)
+        # Also persist the Admin entitlement in Supabase so the Dashboard sees it
+        # immediately and the entitlement survives Render restarts/redeploys.
+        persisted = await asyncio.to_thread(_persist_admin_plan_for_discord, user_id)
+        if not persisted:
+            print(f"WARNING: Admin redeem for {user_id} was saved locally but no durable crystal_accounts row was updated.")
+        await interaction.response.send_message("✅ Internal authorization activated. Admin is now enabled for your Crystal account.", ephemeral=True)
         return
 
     code_hash = _hash_redeem_code(supplied)
