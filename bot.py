@@ -2045,9 +2045,12 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 self._send_text(200,json.dumps({'ok':True,'account':account},ensure_ascii=False))
         except ValueError as exc:
             self._send_text(400,json.dumps({'error':str(exc)}))
+        except RuntimeError as exc:
+            print(f'Account create backend failed: {type(exc).__name__}: {exc}')
+            self._send_text(503,json.dumps({'error':'Account creation backend is not configured correctly: '+str(exc)[:500]}))
         except Exception as exc:
             print(f'Account create failed: {type(exc).__name__}: {exc}')
-            self._send_text(500,json.dumps({'error':'Could not create account.'}))
+            self._send_text(500,json.dumps({'error':'Could not create account. Please try again.'}))
 
     def _account_login_http(self):
         try:
