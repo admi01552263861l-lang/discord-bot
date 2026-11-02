@@ -1417,6 +1417,14 @@ def _crystal_account_public(row: dict) -> dict:
     }
 
 
+def _crystal_account_by_discord(discord_user_id: str):
+    did = str(discord_user_id or "").strip()
+    if not re.fullmatch(r"[0-9]{17,20}", did):
+        return None
+    rows = _supabase_rest("crystal_accounts", {"select": "*", "discord_user_id": "eq." + did, "limit": "1"})
+    return rows[0] if rows else None
+
+
 def _crystal_account_by_key(api_key: str):
     key = str(api_key or "").strip()
     if not re.fullmatch(r"CA-[A-Za-z0-9_-]{24,100}", key):
@@ -1532,7 +1540,7 @@ def _dashboard_state_http(handler):
         account=_dashboard_account_from_request(handler); q=urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query); gid=str((q.get("guildId") or [""])[0]).strip(); guilds=_dashboard_guilds(account)
         if gid and not any(x["id"]==gid for x in guilds): handler._send_text(403,json.dumps({"error":"You are not connected to that Discord server."})); return
         if not gid and guilds: gid=guilds[0]["id"]
-        scripts=_dashboard_scripts(account,gid); plan=str(account.get("plan") or _discord_plan(account.get("discord_user_id")) or "Free")
+        scripts=_dashboard_scripts(account,gid); discord_plan=str(_discord_plan(account.get("discord_user_id")) or "Free"); stored_plan=str(account.get("plan") or "Free"); plan="Admin" if discord_plan.lower()=="admin" else (stored_plan if stored_plan.lower() in ("premium","ultra") else discord_plan)
         admin=plan.lower()=="admin"; role=_global_admin_role_id(gid) if gid else None; _,member=_dashboard_member(account,gid) if gid else (None,None); server_admin=bool(member and (getattr(member.guild_permissions,"administrator",False) or (role and any(int(getattr(r,"id",0))==int(role) for r in member.roles))))
         handler._send_text(200,json.dumps({"ok":True,"account":_crystal_account_public(account),"plan":plan,"adminRedeemed":admin,"guilds":guilds,"guildId":gid,"scripts":scripts,"adminRoleId":role,"serverAdmin":server_admin},ensure_ascii=False))
     except PermissionError as exc: handler._send_text(401,json.dumps({"error":str(exc)}))
@@ -1584,6 +1592,55 @@ def _dashboard_script_delete_http(handler):
         _supabase_rest("crystal_scripts",{"id":"eq."+urllib.parse.quote(sid,safe=""),"guest_id":"eq."+urllib.parse.quote(str(account.get("guest_id")),safe="")},"DELETE",None,"return=minimal"); scripts_data.pop(str(row.get("name") or ""),None); save_data(); _sync_dashboard_scripts_from_supabase(); handler._send_text(200,json.dumps({"ok":True}))
     except PermissionError as exc: handler._send_text(401,json.dumps({"error":str(exc)}))
     except Exception as exc: handler._send_text(500,json.dumps({"error":"Could not delete script."}))
+
+def _discord_oauth_login_http(handler):
+    """Verify a short-lived Discord OAuth access token server-side and return the linked Crystal account."""
+    try:
+        length=int(handler.headers.get("Content-Length","0"))
+        if length<=0 or length>32768:
+            handler._send_text(400,json.dumps({"error":"Invalid Discord sign-in request."})); return
+        body=json.loads(handler.rfile.read(length).decode("utf-8"))
+        token=str(body.get("accessToken") or "").strip()
+        if not token or len(token)>4096:
+            handler._send_text(400,json.dumps({"error":"Discord authorization token is missing."})); return
+        req=urllib.request.Request("https://discord.com/api/users/@me",headers={"Authorization":"Bearer "+token,"User-Agent":"CrystalHub/1.0"})
+        with urllib.request.urlopen(req,timeout=12) as response:
+            profile=json.loads(response.read().decode("utf-8"))
+        did=str(profile.get("id") or "")
+        if not re.fullmatch(r"[0-9]{17,20}",did):
+            handler._send_text(401,json.dumps({"error":"Discord did not return a valid account."})); return
+        rows=_supabase_rest("crystal_accounts",{"select":"*","discord_user_id":"eq."+did,"limit":"1"})
+        if rows:
+            account=rows[0]
+            patch={"discord_username":str(profile.get("global_name") or profile.get("username") or did)[:100]}
+            avatar=profile.get("avatar")
+            if avatar:
+                ext="gif" if str(avatar).startswith("a_") else "png"
+                patch["avatar_url"]=f"https://cdn.discordapp.com/avatars/{did}/{avatar}.{ext}?size=256"
+            _supabase_rest("crystal_accounts",{"guest_id":"eq."+urllib.parse.quote(str(account.get("guest_id") or ""),safe="")},"PATCH",patch,"return=minimal")
+            account={**account,**patch}
+        else:
+            base=re.sub(r"[^A-Za-z0-9_]","",str(profile.get("global_name") or profile.get("username") or "Crystal"))[:18] or "CrystalUser"
+            username=base
+            for n in range(1,1000):
+                taken=_supabase_rest("crystal_accounts",{"select":"guest_id","website_username":"eq."+urllib.parse.quote(username,safe=""),"limit":"1"})
+                if not taken: break
+                username=(base[:18]+str(n))[:24]
+            avatar=""
+            if profile.get("avatar"):
+                ext="gif" if str(profile["avatar"]).startswith("a_") else "png"
+                avatar=f"https://cdn.discordapp.com/avatars/{did}/{profile['avatar']}.{ext}?size=256"
+            row={"guest_id":secrets.token_urlsafe(24),"discord_user_id":did,"discord_username":str(profile.get("global_name") or profile.get("username") or did)[:100],"website_username":username,"avatar_url":avatar,"api_key":_account_api_generate(),"plan":"Free"}
+            created=_supabase_rest("crystal_accounts",{},"POST",row,"return=representation")
+            account=created[0] if created else row
+        if not account.get("api_key"):
+            handler._send_text(500,json.dumps({"error":"Crystal account has no Account API key. Contact support."})); return
+        handler._send_text(200,json.dumps({"ok":True,"account":_crystal_account_public(account)},ensure_ascii=False))
+    except urllib.error.HTTPError as exc:
+        handler._send_text(401,json.dumps({"error":"Discord sign-in was rejected. Please authorize again."}))
+    except Exception as exc:
+        print(f"Discord OAuth login failed: {type(exc).__name__}: {exc}")
+        handler._send_text(500,json.dumps({"error":"Could not finish Discord sign-in."}))
 
 class DynamicScriptHandler(BaseHTTPRequestHandler):
     def _send_text(self, status, body):
@@ -2045,12 +2102,9 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 self._send_text(200,json.dumps({'ok':True,'account':account},ensure_ascii=False))
         except ValueError as exc:
             self._send_text(400,json.dumps({'error':str(exc)}))
-        except RuntimeError as exc:
-            print(f'Account create backend failed: {type(exc).__name__}: {exc}')
-            self._send_text(503,json.dumps({'error':'Account creation backend is not configured correctly: '+str(exc)[:500]}))
         except Exception as exc:
             print(f'Account create failed: {type(exc).__name__}: {exc}')
-            self._send_text(500,json.dumps({'error':'Could not create account. Please try again.'}))
+            self._send_text(500,json.dumps({'error':'Could not create account.'}))
 
     def _account_login_http(self):
         try:
@@ -2230,6 +2284,9 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             return
         if parsed_path.path == "/api/account-login":
             self._account_login_http()
+            return
+        if parsed_path.path == "/api/discord-auth":
+            _discord_oauth_login_http(self)
             return
         if parsed_path.path == '/api/account-api-reset':
             self._account_api_reset_http()
@@ -4188,61 +4245,42 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
 )
 async def api_account_command(interaction: discord.Interaction, acc: Optional[str] = None, unlink: bool = False):
     acc = str(acc or '').strip()
-    if not acc:
-        try:
-            rows = await asyncio.to_thread(_supabase_rest, 'crystal_accounts', {
-                'select': 'api_key,website_username,discord_user_id',
-                'discord_user_id': 'eq.' + str(interaction.user.id), 'limit': '1'
-            })
-            if rows:
+    try:
+        if unlink:
+            acct = await asyncio.to_thread(_crystal_account_by_discord, str(interaction.user.id))
+            if not acct:
+                acct = await asyncio.to_thread(_account_api_get_by_discord, str(interaction.user.id))
+            if not acct:
+                await interaction.response.send_message('❌ No Account API is linked to your Discord account.', ephemeral=True); return
+            if acc and str(acct.get('api_key') or '') != acc:
+                await interaction.response.send_message('❌ The supplied Account API does not match your linked account.', ephemeral=True); return
+            if acct.get('guest_id'):
+                await asyncio.to_thread(_supabase_rest, 'crystal_accounts', {'guest_id':'eq.'+urllib.parse.quote(str(acct.get('guest_id')),safe='')}, 'PATCH', {'discord_user_id':None,'discord_username':None}, 'return=minimal')
+            await interaction.response.send_message('✅ Account API unlinked. Your scripts and Script API keys were not changed.', ephemeral=True); return
+        if not acc:
+            acct = await asyncio.to_thread(_crystal_account_by_discord, str(interaction.user.id))
+            if acct and acct.get('api_key'):
                 await interaction.response.send_message(
-                    "🔑 **Your Crystal Hub Account API**\n"
-                    f"Username: `{rows[0].get('website_username', 'Unknown')}`\n"
-                    f"Account API: `{rows[0].get('api_key', '')}`\n"
-                    "Keep this key private. It is different from Script API keys (`CH-...`).",
-                    ephemeral=True)
-                return
+                    '🔑 **Your Crystal Hub Account API**\n'
+                    f"Username: `{acct.get('website_username') or 'Unknown'}`\n"
+                    f"Account API: `{acct.get('api_key')}`\n"
+                    'Keep this key private. It is different from Script API keys (`CH-...`).', ephemeral=True); return
             legacy = await asyncio.to_thread(_account_api_get_by_discord, str(interaction.user.id))
             if legacy and legacy.get('api_key'):
-                await interaction.response.send_message(
-                    f"🔑 **Your Account API:** `{legacy['api_key']}`\nKeep this key private.", ephemeral=True)
-                return
-            await interaction.response.send_message(
-                "❌ No Crystal Hub website account is linked to this Discord ID yet. Create one on the login page using your Discord ID, then run `/api` again.",
-                ephemeral=True)
-            return
-        except Exception as exc:
-            print(f'/api account lookup error: {type(exc).__name__}: {exc}')
-            await interaction.response.send_message('❌ Could not load your Account API. Check the Supabase connection.', ephemeral=True)
-            return
-    try:
+                await interaction.response.send_message(f"🔑 **Your Account API:** `{legacy['api_key']}`\nKeep this key private.", ephemeral=True); return
+            await interaction.response.send_message('❌ No Crystal Hub account is linked to this Discord ID yet. Sign in with Discord on the Crystal Login page first, then run `/api` again.', ephemeral=True); return
         if not acc.startswith('CA-'):
-            await interaction.response.send_message(
-                "❌ That is a **Script API key**. `/api` needs the standalone **Account API key** from Dashboard → Settings → Account API.\n"
-                "The Account API key starts with `CA-`.", ephemeral=True)
-            return
-        if unlink:
-            acct = await asyncio.to_thread(_account_api_get_by_discord, str(interaction.user.id))
-            if not acct or str(acct.get('api_key') or '') != acc:
-                await interaction.response.send_message('❌ This Account API key is not linked to your Discord account.', ephemeral=True)
-                return
-            await asyncio.to_thread(_supabase_rest, 'crystal_api_accounts', {'id':'eq.'+str(acct.get('id'))}, 'PATCH', {
-                'discord_user_id':None, 'discord_username':None, 'updated_at':_iso_now()
-            }, 'return=minimal')
-            await interaction.response.send_message('✅ Account API unlinked. Your scripts and Script API keys were not changed.', ephemeral=True)
-            return
+            await interaction.response.send_message('❌ `/api` needs your Account API key starting with `CA-`. Script API keys start with `CH-` and cannot be used here.', ephemeral=True); return
         account = await asyncio.to_thread(_account_api_link, acc, str(interaction.user.id), str(interaction.user))
+        # Keep the Dashboard account record linked as well, so Dashboard server/plan data uses this Discord identity.
+        await asyncio.to_thread(_supabase_rest, 'crystal_accounts', {'api_key':'eq.'+urllib.parse.quote(acc,safe='')}, 'PATCH', {'discord_user_id':str(interaction.user.id),'discord_username':str(interaction.user)[:100]}, 'return=minimal')
         await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
-        await interaction.response.send_message(
-            "✅ **Account API linked.**\n"
-            "Your Discord account is now connected to the Dashboard account.\n"
-            f"Account API: `{account.get('api_key', acc)}`\n"
-            "Your individual Script API keys (`CH-...`) remain separate.", ephemeral=True)
+        await interaction.response.send_message('✅ **Account API linked.** Your Discord and Dashboard accounts are now connected. Your Script API keys (`CH-...`) remain separate.', ephemeral=True)
     except ValueError as exc:
         await interaction.response.send_message(f'❌ {exc}', ephemeral=True)
     except Exception as exc:
-        print(f'/api account link error: {type(exc).__name__}: {exc}')
-        await interaction.response.send_message('❌ Could not link the Account API. Check that the key came from Dashboard → Settings.', ephemeral=True)
+        print(f'/api account error: {type(exc).__name__}: {exc}')
+        await interaction.response.send_message('❌ Could not complete `/api`. Check the Supabase connection and bot logs.', ephemeral=True)
 
 @bot.tree.command(name="hwid", description="Reset HWID binding so your key can lock to a new device")
 @app_commands.describe(script="Optional: one script only. Leave empty to reset HWID for all your keys.")
