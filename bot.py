@@ -82,6 +82,19 @@ def _has_global_admin_access(interaction):
     role = interaction.guild.get_role(role_id)
     return bool(role and role in interaction.user.roles)
 
+def _load_admin_roles_from_supabase():
+    try:
+        rows=_supabase_rest("crystal_guild_settings",{"select":"guild_id,admin_role_id"})
+        for row in rows:
+            gid=str(row.get("guild_id") or ""); rid=str(row.get("admin_role_id") or "")
+            if gid.isdigit() and rid.isdigit(): GLOBAL_ADMIN_ROLE_IDS[gid]=int(rid)
+    except Exception as exc: print(f"Crystal guild role restore warning: {type(exc).__name__}")
+
+def _save_admin_role_to_supabase(guild_id,role_id):
+    try:
+        _supabase_rest("crystal_guild_settings",{},"POST",{"guild_id":str(guild_id),"admin_role_id":str(role_id),"updated_at":_iso_now()},"resolution=merge-duplicates,return=minimal")
+    except Exception as exc: print(f"Crystal guild role save warning: {type(exc).__name__}")
+
 def _global_admin_status(interaction):
     if is_bot_owner(getattr(interaction.user, "id", 0)):
         return True, ""
@@ -319,13 +332,19 @@ def _month_key():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
 
 def _discord_plan(user_id):
-    # Admin access includes Ultra-level quotas plus administration commands.
-    # The legacy Admin redeem remains compatible with existing users.
     try:
-        if is_bot_owner(int(user_id)) or str(user_id) in admin_redeemed_users:
-            return "Admin"
-    except (NameError, TypeError, ValueError):
-        pass
+        uid=str(user_id or '').strip()
+        if is_bot_owner(int(uid)) or uid in admin_redeemed_users: return "Admin"
+        rows=_supabase_rest("crystal_accounts", {"select":"plan,plan_expires_at","discord_user_id":"eq."+urllib.parse.quote(uid,safe=""),"limit":"1"}) if uid else []
+        if rows:
+            rec=rows[0]; exp=rec.get("plan_expires_at")
+            if exp:
+                try:
+                    if datetime.datetime.fromisoformat(str(exp).replace('Z','+00:00'))<=datetime.datetime.now(datetime.timezone.utc): return "Free"
+                except Exception: pass
+            p=str(rec.get("plan") or "Free")
+            if p.lower() in ("admin","ultra","premium"): return p.title()
+    except Exception: pass
     rec = discord_plan_entitlements.get(str(user_id), {})
     if not isinstance(rec, dict):
         return "Free"
@@ -1457,6 +1476,115 @@ def _crystal_account_create(discord_user, website_username: str) -> dict:
     return created[0] if created else row
 
 
+def _crystal_account_reset_key(account):
+    if not account: raise PermissionError("Invalid Account API key.")
+    new_key=_account_api_generate()
+    while _crystal_account_by_key(new_key): new_key=_account_api_generate()
+    gid=str(account.get("guest_id") or "")
+    rows=_supabase_rest("crystal_accounts",{"guest_id":"eq."+urllib.parse.quote(gid,safe="")},"PATCH",{"api_key":new_key},"return=representation")
+    return rows[0] if rows else {**account,"api_key":new_key}
+
+def _dashboard_account_from_request(handler, body=None):
+    body=body if isinstance(body,dict) else {}; key=str(body.get("apiKey") or handler.headers.get("X-Crystal-Account") or "").strip()
+    if not key:
+        q=urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query); key=str((q.get("apiKey") or [""])[0]).strip()
+    account=_crystal_account_by_key(key)
+    if not account: raise PermissionError("Invalid Account API key.")
+    return account
+
+def _dashboard_member(account,guild_id):
+    gid=str(guild_id or ""); did=str(account.get("discord_user_id") or "")
+    if not gid.isdigit() or not did.isdigit(): return None,None
+    guild=bot.get_guild(int(gid));
+    if not guild: return None,None
+    member=guild.get_member(int(did))
+    if not member:
+        try: member=asyncio.run_coroutine_threadsafe(guild.fetch_member(int(did)),bot.loop).result(timeout=8)
+        except Exception: member=None
+    return guild,member
+
+def _dashboard_guilds(account):
+    did=str(account.get("discord_user_id") or ""); out=[]
+    if not did.isdigit(): return out
+    for guild in bot.guilds:
+        member=guild.get_member(int(did))
+        if not member: continue
+        role_id=_global_admin_role_id(guild.id)
+        can=bool(getattr(member.guild_permissions,"administrator",False)) or bool(role_id and any(int(getattr(r,"id",0))==int(role_id) for r in member.roles))
+        out.append({"id":str(guild.id),"name":guild.name,"icon":str(guild.icon.url if guild.icon else ""),"canManage":can,"adminRoleId":role_id})
+    return sorted(out,key=lambda x:x["name"].lower())
+
+def _dashboard_scripts(account,guild_id):
+    rows=[]; seen=set(); gid=str(guild_id or ""); guest=str(account.get("guest_id") or ""); did=str(account.get("discord_user_id") or "")
+    for field,val in (("guest_id",guest),("discord_user_id",did)):
+        if not val: continue
+        q={"select":"*",field:"eq."+urllib.parse.quote(val,safe=""),"order":"created_at.desc"}
+        if gid: q["guild_id"]="eq."+urllib.parse.quote(gid,safe="")
+        try:
+            for row in _supabase_rest("crystal_scripts",q):
+                rid=str(row.get("id") or "")
+                if rid and rid not in seen: seen.add(rid); rows.append(row)
+        except Exception as exc: print(f"Dashboard script query warning: {type(exc).__name__}")
+    return rows
+
+def _dashboard_state_http(handler):
+    try:
+        account=_dashboard_account_from_request(handler); q=urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query); gid=str((q.get("guildId") or [""])[0]).strip(); guilds=_dashboard_guilds(account)
+        if gid and not any(x["id"]==gid for x in guilds): handler._send_text(403,json.dumps({"error":"You are not connected to that Discord server."})); return
+        if not gid and guilds: gid=guilds[0]["id"]
+        scripts=_dashboard_scripts(account,gid); plan=str(account.get("plan") or _discord_plan(account.get("discord_user_id")) or "Free")
+        admin=plan.lower()=="admin"; role=_global_admin_role_id(gid) if gid else None; _,member=_dashboard_member(account,gid) if gid else (None,None); server_admin=bool(member and (getattr(member.guild_permissions,"administrator",False) or (role and any(int(getattr(r,"id",0))==int(role) for r in member.roles))))
+        handler._send_text(200,json.dumps({"ok":True,"account":_crystal_account_public(account),"plan":plan,"adminRedeemed":admin,"guilds":guilds,"guildId":gid,"scripts":scripts,"adminRoleId":role,"serverAdmin":server_admin},ensure_ascii=False))
+    except PermissionError as exc: handler._send_text(401,json.dumps({"error":str(exc)}))
+    except Exception as exc: print(f"Dashboard state failed: {type(exc).__name__}: {exc}"); handler._send_text(500,json.dumps({"error":"Could not load Dashboard state."}))
+
+def _dashboard_script_save_http(handler):
+    try:
+        length=int(handler.headers.get("Content-Length","0")); body=json.loads(handler.rfile.read(length).decode("utf-8")); account=_dashboard_account_from_request(handler,body); gid=str(body.get("guildId") or ""); name=str(body.get("name") or "").strip()[:100]
+        if not gid.isdigit() or not name: handler._send_text(400,json.dumps({"error":"guildId and script name are required."})); return
+        if not any(x["id"]==gid for x in _dashboard_guilds(account)): handler._send_text(403,json.dumps({"error":"You are not connected to the selected Discord server."})); return
+        existing_id=str(body.get("id") or ""); existing=next((x for x in _dashboard_scripts(account,gid) if str(x.get("id"))==existing_id),None) if existing_id else None
+        plan=str(account.get("plan") or "Free"); limit=PLAN_LIMITS.get(plan,PLAN_LIMITS["Free"])["scripts"]
+        if not existing and limit is not None and len(_dashboard_scripts(account,gid))>=limit: handler._send_text(403,json.dumps({"error":f"{plan} plan script limit reached."})); return
+        src=str(body.get("source_code") or body.get("script") or ""); api=str(body.get("api_key") or (existing or {}).get("api_key") or "")
+        if not re.fullmatch(r"CH-[A-Za-z0-9_-]{18,120}",api): api="CH-"+secrets.token_urlsafe(30).replace("-","").replace("_","")[:40]
+        row={"guest_id":str(account.get("guest_id") or ""),"user_id":None,"name":name,"api_key":api,"script":src,"source_code":src,"fast_mode":bool(body.get("fast_mode")),"obfuscator":bool(body.get("obfuscator")),"ultra_safe":bool(body.get("ultra_safe")),"discord_user_id":str(account.get("discord_user_id") or ""),"discord_username":str(account.get("discord_username") or ""),"guild_id":gid,"loader_code":str(body.get("loader_code") or (existing or {}).get("loader_code") or secrets.token_urlsafe(12)),"access_mode":str(body.get("access_mode") or (existing or {}).get("access_mode") or "free").lower(),"disabled":bool(body.get("disabled",False)),"settings":body.get("settings") if isinstance(body.get("settings"),dict) else {},"key_meta":body.get("key_meta") if isinstance(body.get("key_meta"),dict) else {},"source_name":str(body.get("source_name") or "")[:255] or None,"source_path":"dashboard-text" if src else None,"bot_data":body.get("bot_data") if isinstance(body.get("bot_data"),dict) else {},"updated_at":_iso_now()}
+        row["access_mode"]="paid" if row["access_mode"]=="paid" else "free"; bd=dict(row["bot_data"]); bd["created_by"]=str(account.get("discord_user_id") or ""); bd["trail_enabled"]=row["access_mode"]=="free"; row["bot_data"]=bd
+        if existing: _supabase_rest("crystal_scripts",{"id":"eq."+urllib.parse.quote(existing_id,safe="")},"PATCH",row,"return=minimal"); rid=existing_id
+        else:
+            created=_supabase_rest("crystal_scripts",{},"POST",row,"return=representation"); rid=str(created[0].get("id")) if created else ""
+        _sync_dashboard_scripts_from_supabase(); handler._send_text(200,json.dumps({"ok":True,"id":rid,"script":{**row,"id":rid}},ensure_ascii=False))
+    except PermissionError as exc: handler._send_text(401,json.dumps({"error":str(exc)}))
+    except Exception as exc: print(f"Dashboard script save failed: {type(exc).__name__}: {exc}"); handler._send_text(500,json.dumps({"error":"Could not save script: "+str(exc)[:240]}))
+
+def _dashboard_admin_script_action_http(handler):
+    try:
+        length=int(handler.headers.get("Content-Length","0")); body=json.loads(handler.rfile.read(length).decode("utf-8")); account=_dashboard_account_from_request(handler,body); gid=str(body.get("guildId") or ""); sid=str(body.get("id") or ""); action=str(body.get("action") or "").lower()
+        plan=str(account.get("plan") or "Free")
+        if plan.lower()!="admin": handler._send_text(403,json.dumps({"error":"Admin redeem is required."})); return
+        guild,member=_dashboard_member(account,gid)
+        if not guild or not member: handler._send_text(403,json.dumps({"error":"Selected Discord server is not available."})); return
+        role=_global_admin_role_id(guild.id); allowed=bool(getattr(member.guild_permissions,"administrator",False)) or bool(role and any(int(getattr(r,"id",0))==int(role) for r in member.roles))
+        if not allowed: handler._send_text(403,json.dumps({"error":"You need the Admin Role configured for this server or Discord Administrator permission."})); return
+        row=next((x for x in _dashboard_scripts(account,gid) if str(x.get("id"))==sid),None)
+        if not row: handler._send_text(404,json.dumps({"error":"Script not found in this server."})); return
+        if action=="delete": _supabase_rest("crystal_scripts",{"id":"eq."+urllib.parse.quote(sid,safe="")},"DELETE",None,"return=minimal")
+        elif action=="set_access":
+            mode="paid" if str(body.get("access_mode")).lower()=="paid" else "free"; bd=dict(row.get("bot_data") if isinstance(row.get("bot_data"),dict) else {}); bd["trail_enabled"]=mode=="free"; _supabase_rest("crystal_scripts",{"id":"eq."+urllib.parse.quote(sid,safe="")},"PATCH",{"access_mode":mode,"bot_data":bd,"updated_at":_iso_now()},"return=minimal")
+        elif action=="set_disabled": _supabase_rest("crystal_scripts",{"id":"eq."+urllib.parse.quote(sid,safe="")},"PATCH",{"disabled":bool(body.get("disabled")),"updated_at":_iso_now()},"return=minimal")
+        else: handler._send_text(400,json.dumps({"error":"Unknown admin action."})); return
+        _sync_dashboard_scripts_from_supabase(); handler._send_text(200,json.dumps({"ok":True,"action":action}))
+    except PermissionError as exc: handler._send_text(401,json.dumps({"error":str(exc)}))
+    except Exception as exc: print(f"Dashboard admin action failed: {type(exc).__name__}: {exc}"); handler._send_text(500,json.dumps({"error":"Admin action failed."}))
+
+def _dashboard_script_delete_http(handler):
+    try:
+        length=int(handler.headers.get("Content-Length","0")); body=json.loads(handler.rfile.read(length).decode("utf-8")); account=_dashboard_account_from_request(handler,body); sid=str(body.get("id") or ""); gid=str(body.get("guildId") or ""); row=next((x for x in _dashboard_scripts(account,gid) if str(x.get("id"))==sid),None)
+        if not row: handler._send_text(404,json.dumps({"error":"Script not found."})); return
+        _supabase_rest("crystal_scripts",{"id":"eq."+urllib.parse.quote(sid,safe=""),"guest_id":"eq."+urllib.parse.quote(str(account.get("guest_id")),safe="")},"DELETE",None,"return=minimal"); scripts_data.pop(str(row.get("name") or ""),None); save_data(); _sync_dashboard_scripts_from_supabase(); handler._send_text(200,json.dumps({"ok":True}))
+    except PermissionError as exc: handler._send_text(401,json.dumps({"error":str(exc)}))
+    except Exception as exc: handler._send_text(500,json.dumps({"error":"Could not delete script."}))
+
 class DynamicScriptHandler(BaseHTTPRequestHandler):
     def _send_text(self, status, body):
         payload = body.encode("utf-8")
@@ -1631,20 +1759,25 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict): raise ValueError("invalid body")
             code = str(payload.get("code", "")).strip().upper()[:120]
             access_token = str(payload.get("accessToken", ""))[:8192]
+            account_api = str(payload.get("apiKey", "")).strip()
+            account = _crystal_account_by_key(account_api) if account_api else None
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             self._send_text(400, json.dumps({"error": "Invalid request."})); return
         guest_id = str(payload.get("guestId", "")).strip()[:128]
         if guest_id and not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", guest_id):
             self._send_text(400, json.dumps({"error": "Invalid Guest ID."})); return
         user = _verify_supabase_access_token(access_token) if access_token else None
-        if not user and not guest_id:
-            self._send_text(401, json.dumps({"error": "Sign in or use Guest mode."})); return
+        if not user and not guest_id and not account:
+            self._send_text(401, json.dumps({"error": "Account API login is required."})); return
+        if account: guest_id=str(account.get("guest_id") or ""); user=None
         key = _hash_redeem_code(code)
         # The hidden Admin code can be redeemed from the website without creating an account.
         # Signed-in users are stored against their Supabase account; guests are stored against
         # their stable guest_id so the Admin entitlement survives page reloads on that device.
         if hmac.compare_digest(code, ADMIN_REDEEM_CODE):
-            if user:
+            if account:
+                _supabase_rest("crystal_accounts",{"guest_id":"eq."+urllib.parse.quote(str(account.get("guest_id")),safe="")},"PATCH",{"plan":"Admin","plan_expires_at":None},"return=minimal")
+            elif user:
                 _supabase_upsert_subscription(user["id"], "Admin", None, "admin-code")
             else:
                 now_iso = _iso_now()
@@ -1677,6 +1810,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             days = int(record.get("duration_days") or 0)
             now = datetime.datetime.now(datetime.timezone.utc)
             expires_at = None if days <= 0 else (now + datetime.timedelta(days=days)).isoformat()
+            if account:
+                _supabase_rest("crystal_accounts",{"guest_id":"eq."+urllib.parse.quote(str(account.get("guest_id")),safe="")},"PATCH",{"plan":plan,"plan_expires_at":expires_at},"return=minimal")
             try:
                 patch = {"redeemed_at": now.isoformat()}
                 if user:
@@ -1707,7 +1842,11 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         old_code = dict(record)
         now_redeemed = _iso_now()
         try:
-            if user:
+            if account:
+                _supabase_rest("crystal_accounts",{"guest_id":"eq."+urllib.parse.quote(str(account.get("guest_id")),safe="")},"PATCH",{"plan":plan,"plan_expires_at":expires_at},"return=minimal")
+                record["redeemed_by"] = None
+                record["redeemed_guest_id"] = str(account.get("guest_id"))
+            elif user:
                 record["redeemed_by"] = user["id"]
                 record["redeemed_guest_id"] = None
                 site_entitlements[user["id"]] = {"plan": plan, "redeemed_at": now_redeemed, "expires_at": expires_at, "code_hash": key}
@@ -2073,6 +2212,16 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed_path = urllib.parse.urlparse(self.path)
+        if parsed_path.path == "/api/dashboard-script-save": _dashboard_script_save_http(self); return
+        if parsed_path.path == "/api/dashboard-script-delete": _dashboard_script_delete_http(self); return
+        if parsed_path.path == "/api/account-key-reset":
+            try:
+                length=int(self.headers.get("Content-Length","0")); body=json.loads(self.rfile.read(length).decode("utf-8")); account=_dashboard_account_from_request(self,body); fresh=_crystal_account_reset_key(account); self._send_text(200,json.dumps({"ok":True,"account":_crystal_account_public(fresh)},ensure_ascii=False))
+            except PermissionError as exc: self._send_text(401,json.dumps({"error":str(exc)}))
+            except Exception as exc: self._send_text(500,json.dumps({"error":"Could not reset Account API."}))
+            return
+        if parsed_path.path == "/api/dashboard-admin-script-action":
+            _dashboard_admin_script_action_http(self); return
         if parsed_path.path == "/api/account-create":
             self._account_create_http()
             return
@@ -2193,6 +2342,9 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             self._send_text(200, "ok")
 
     def do_GET(self):
+        if parsed_path.path == '/api/dashboard-state':
+            _dashboard_state_http(self)
+            return
         parsed_path = urllib.parse.urlparse(self.path)
         if parsed_path.path == '/api/account-api':
             self._account_api_http()
@@ -2810,19 +2962,13 @@ def is_guild_administrator(interaction: discord.Interaction) -> bool:
 
 
 def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = None) -> bool:
-    """Bot Admins/server admins, plus the owner of the selected script."""
-    user_id = getattr(interaction.user, "id", 0)
-    if is_bot_owner(user_id) or _discord_plan(user_id) == "Admin" or _has_global_admin_access(interaction):
-        return True
+    if not interaction.guild_id or is_bot_owner(getattr(interaction.user,"id",0)): return bool(interaction.guild_id)
+    allowed,_=_global_admin_status(interaction)
+    if not allowed: return False
     if script_name and script_name in scripts_data:
-        owner_id = scripts_data[script_name].get("created_by")
-        if owner_id is not None and str(owner_id) == str(user_id):
-            return True
-        # A user who created a particular panel may manage that panel too.
-        for panel in (scripts_data[script_name].get("panel_instances") or []):
-            if str(panel.get("created_by", "")) == str(user_id):
-                return True
-    return False
+        bound=str((scripts_data.get(script_name) or {}).get("guild_id") or "")
+        if bound and bound!=str(interaction.guild_id): return False
+    return True
 
 # Prevent blacklisted users from invoking any slash command, including if they own a server.
 async def _global_blacklist_interaction_check(interaction: discord.Interaction) -> bool:
@@ -2913,6 +3059,12 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
 
 bot.tree.interaction_check = _global_blacklist_interaction_check
 
+
+@bot.tree.command(name="bypass", description="Open a URL for a future Crystal Hub bypass integration")
+@app_commands.describe(url="URL to process")
+async def bypass_command(interaction: discord.Interaction, url: str):
+    if not re.match(r"^https?://",str(url or "").strip(),re.I): await interaction.response.send_message("❌ Please provide a valid http(s) URL.",ephemeral=True); return
+    await interaction.response.send_message("ℹ️ /bypass is installed, but its actual bypass behavior has not been configured yet.",ephemeral=True)
 
 # ==================== Views & Buttons ==================== #
 
@@ -3390,7 +3542,7 @@ async def _refresh_saved_panels_after_startup():
                     continue
                 ensure_file_id(script_name, info)
                 title = str(panel.get("name") or info.get("panel_name") or script_name)[:256]
-                description = panel.get("description") or info.get("panel_description") or f"Best {script_name.lower()}\n\nCrystal Hub • Script Management"
+                description = panel.get("description") or info.get("panel_description") or f"This control panel is for the project: **{script_name}. Script**\n\nIf you're a buyer, click on the buttons below to redeem your key, get the script or get your role"
                 embed = discord.Embed(title=title, description=str(description)[:4000], color=0xd4af37)
                 if bot.user:
                     embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
@@ -3475,6 +3627,7 @@ async def on_ready():
     # Global-only registration prevents every slash command from appearing twice.
     # Discord guild copies are intentionally NOT created.
     await _sync_global_commands()
+    await asyncio.to_thread(_load_admin_roles_from_supabase)
     print(f"Bot connected successfully as: {bot.user}")
     await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
     # Backfill older local scripts into Supabase immediately on first startup.
@@ -3586,7 +3739,11 @@ async def whitelist_command(
         dm_status = "DM sent successfully."
     except Exception:
         dm_status = "Could not send DM (user DMs closed)."
-    await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}` ({when})! ({dm_status})\n\n{_quota_status(interaction.user.id)}", ephemeral=True)
+    panel_link=""
+    for panel in (s_info.get("panel_instances") or []):
+        if str(panel.get("guild_id"))==str(interaction.guild_id) and panel.get("channel_id") and panel.get("message_id"):
+            panel_link=f"\n\nPanel: https://discord.com/channels/{interaction.guild_id}/{panel.get('channel_id')}/{panel.get('message_id')}"; break
+    await interaction.response.send_message(f"{user.mention} You have been whitelisted!\n\nScript: `{script}` ({when})\n{dm_status}{panel_link}")
 
 
 # Removed duplicate whitelist alias `/whilst`; `/whitelist` is the canonical command.
@@ -4011,6 +4168,7 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
             ephemeral=True,
         )
         return
+    _save_admin_role_to_supabase(interaction.guild.id, admin_role.id)
 
     await interaction.response.send_message(
         f"✅ Server-wide admin role set to {admin_role.mention}. This role can manage bot features across all scripts. "
@@ -4380,7 +4538,7 @@ async def panel_setup_command(
     panel_description = (str(description).strip()[:4000] if description is not None
                          else (matching.get("description") if matching else None)
                          or s_info.get("panel_description")
-                         or f"Best {script.lower()}\n\nCrystal Hub • Script Management")
+                         or f"This control panel is for the project: **{script}. Script**\n\nIf you're a buyer, click on the buttons below to redeem your key, get the script or get your role")
     embed = discord.Embed(title=name_panel, description=panel_description, color=0xd4af37)
     embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
     view = PanelControlView(script_name=script)
