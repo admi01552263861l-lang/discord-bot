@@ -25,7 +25,7 @@ from discord import app_commands
 from discord.http import Route
 from discord.ext import commands, tasks
 
-BUILD_TAG = "CrystalHub-2026-11-02-ADMIN-ROLES-SUPABASE-SCRIPTS-V2"
+BUILD_TAG = "CrystalHub-2026-10-30-DURABLE-SUPABASE-SCRIPTS-V1"
 
 # Render keeps only files under a mounted persistent disk. Set
 # CRYSTAL_HUB_DATA_DIR=/var/data on Render after attaching that disk.
@@ -116,42 +116,6 @@ def save_admin_redeems():
         json.dump({"users": sorted(admin_redeemed_users)}, f, indent=2)
 
 admin_redeemed_users = load_admin_redeems()
-
-def _persist_admin_plan_for_discord(discord_user_id: str) -> bool:
-    """Persist Admin authorization in Supabase so it survives a fresh Render deployment."""
-    did = str(discord_user_id or "").strip()
-    if not did.isdigit():
-        return False
-    try:
-        rows = _supabase_rest("crystal_api_accounts", {
-            "select": "id,supabase_user_id,guest_id",
-            "account_type": "eq.account",
-            "discord_user_id": "eq." + urllib.parse.quote(did, safe=""),
-            "limit": "1"
-        })
-        if not rows:
-            # Older accounts may be represented by crystal_discord_users only.
-            links = _supabase_rest("crystal_discord_users", {
-                "select": "supabase_user_id,api_key",
-                "discord_user_id": "eq." + urllib.parse.quote(did, safe=""),
-                "limit": "1"
-            })
-            rows = links
-        account = rows[0] if rows else None
-        uid = str((account or {}).get("supabase_user_id") or "").strip()
-        if not uid:
-            return False
-        _supabase_upsert_subscription(uid, "Admin", None, source="discord-admin-redeem")
-        try:
-            _supabase_rest("crystal_discord_users", {
-                "discord_user_id": "eq." + urllib.parse.quote(did, safe="")
-            }, "PATCH", {"plan": "Admin", "updated_at": _iso_now()}, "return=minimal")
-        except Exception:
-            pass
-        return True
-    except Exception as exc:
-        print(f"Admin Supabase persistence warning: {type(exc).__name__}: {exc}")
-        return False
 
 # Durable local snapshots. For hosts with ephemeral filesystems, mount a persistent
 # disk at the working directory or configure an external database.
@@ -1086,39 +1050,29 @@ def _api_account_reset_from_script(script_id: str, owner_user_id: str = '', gues
 
 
 def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str, discord_username: str, guild_id=None):
-    """Persist a bot script in Supabase even when the Discord user has no Dashboard login yet.
+    """Durably save one bot script to Supabase.
 
-    Supabase is the durable source of truth for scripts. The complete bot-side state is
-    stored in bot_data so keys, whitelist grants, panels, trial/access state and HWID
-    bindings survive Render redeploys and bot updates.
+    Supabase is the source of truth.  The first write uses the full schema; if an
+    optional column is missing in an older database, retry with the core schema
+    instead of silently losing the script.
     """
+    discord_user_id = str(discord_user_id or info.get("created_by") or "").strip()
+    discord_username = str(discord_username or "")[:100]
     try:
-        discord_user_id = str(discord_user_id or info.get("created_by") or "").strip()
-        discord_username = str(discord_username or "")[:100]
         user_id = info.get("supabase_user_id") or None
         if not user_id and discord_user_id:
             try:
                 linked = _supabase_rest("crystal_discord_users", {
-                    "select": "supabase_user_id", "discord_user_id": "eq." + urllib.parse.quote(discord_user_id, safe=""), "limit": "1"
+                    "select": "supabase_user_id",
+                    "discord_user_id": "eq." + urllib.parse.quote(discord_user_id, safe=""),
+                    "limit": "1"
                 })
                 user_id = linked[0].get("supabase_user_id") if linked else None
-            except Exception:
-                user_id = None
-        if user_id:
-            info["supabase_user_id"] = str(user_id)
-            try:
-                _supabase_rest("crystal_discord_users", {}, "POST", {
-                    "discord_user_id": discord_user_id, "discord_username": discord_username,
-                    "supabase_user_id": str(user_id), "api_key": info.get("api_key", ""),
-                    "plan": _linked_subscription_plan(user_id),
-                    "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
-                }, "resolution=merge-duplicates,return=minimal")
-            except Exception as link_exc:
-                print(f"Crystal identity-link upsert warning for {discord_user_id}: {type(link_exc).__name__}: {link_exc}")
+            except Exception as exc:
+                print(f"Crystal identity lookup warning: {type(exc).__name__}: {exc}")
 
-        # JSONB-safe snapshot of ALL bot-only state. Sets/dict keys are normalized.
         bot_data = {
-            "crystal_bot_state_version": 2,
+            "crystal_bot_state_version": 3,
             "version": info.get("version", "1.0.0"),
             "buyer_role_id": info.get("buyer_role_id"),
             "admin_role_id": info.get("admin_role_id"),
@@ -1148,9 +1102,8 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
         }
         row = {
             "user_id": str(user_id) if user_id else None,
-            "guest_id": (str(info.get("guest_id") or ("discord-" + discord_user_id))[:128] if discord_user_id else None),
-            "name": script_name,
-            "api_key": info.get("api_key", ""),
+            "name": str(script_name)[:255],
+            "api_key": str(info.get("api_key") or ""),
             "script": info.get("source_code", ""),
             "source_code": info.get("source_code", ""),
             "fast_mode": bool(info.get("fast_mode", False)),
@@ -1168,51 +1121,78 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
             "source_name": info.get("source_name"),
             "source_path": info.get("source_path"),
             "bot_data": bot_data,
-            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "updated_at": _iso_now(),
         }
         info["loader_code"] = str(row["loader_code"])
         info["file_id"] = info["loader_code"]
+        info["guild_id"] = row["guild_id"]
+        if user_id:
+            info["supabase_user_id"] = str(user_id)
 
+        # First try the full row. This preserves all current Dashboard fields.
         row_id = info.get("supabase_row_id")
         if row_id:
             updated = _supabase_rest("crystal_scripts", {"id": "eq." + str(row_id)}, "PATCH", row, "return=representation")
             if updated:
+                info["supabase_row_id"] = updated[0].get("id", row_id)
                 return True
+
         api_key = str(row.get("api_key") or "").strip()
         existing = _supabase_rest("crystal_scripts", {
-            "select": "id", "api_key": "eq." + urllib.parse.quote(api_key, safe=""), "limit": "1"
+            "select": "id",
+            "api_key": "eq." + urllib.parse.quote(api_key, safe=""),
+            "limit": "1"
         }) if api_key else []
         if existing:
-            updated = _supabase_rest("crystal_scripts", {"id": "eq." + str(existing[0]["id"])}, "PATCH", row, "return=representation")
+            rid = existing[0].get("id")
+            updated = _supabase_rest("crystal_scripts", {"id": "eq." + str(rid)}, "PATCH", row, "return=representation")
             if updated:
-                info["supabase_row_id"] = updated[0].get("id")
+                info["supabase_row_id"] = updated[0].get("id", rid)
                 return True
-        try:
-            inserted = _supabase_rest("crystal_scripts", {}, "POST", row, "return=representation")
-        except Exception as full_exc:
-            # Some older Crystal databases have only the core script columns. Retry with
-            # the durable core fields instead of silently losing the script on redeploy.
-            print(f"Crystal full script upsert failed: {type(full_exc).__name__}; retrying core script row.")
-            core_row = {
-                "user_id": row.get("user_id"),
-                "guest_id": row.get("guest_id"),
-                "name": row.get("name"),
-                "api_key": row.get("api_key"),
-                "script": row.get("script"),
-                "source_code": row.get("source_code"),
-                "discord_user_id": row.get("discord_user_id"),
-                "discord_username": row.get("discord_username"),
-                "guild_id": row.get("guild_id"),
-                "bot_data": row.get("bot_data", {}),
-            }
-            inserted = _supabase_rest("crystal_scripts", {}, "POST", core_row, "return=representation")
+
+        inserted = _supabase_rest("crystal_scripts", {}, "POST", row, "return=representation")
         if inserted:
             info["supabase_row_id"] = inserted[0].get("id")
-        return bool(inserted)
-    except Exception as exc:
-        print(f"Crystal sync to Supabase failed for {script_name}: {type(exc).__name__}: {exc}")
+            return True
+        raise RuntimeError("Supabase returned no row after the full script write.")
+    except Exception as full_exc:
+        # Older crystal_scripts tables may not have all optional columns. Retry with
+        # only the columns required for durable script storage plus bot_data.
+        print(f"Crystal full script sync failed for {script_name}: {type(full_exc).__name__}: {full_exc}")
+        try:
+            core = {
+                "user_id": str(info.get("supabase_user_id")) if info.get("supabase_user_id") else None,
+                "name": str(script_name)[:255],
+                "api_key": str(info.get("api_key") or ""),
+                "script": info.get("source_code", ""),
+                "source_code": info.get("source_code", ""),
+                "fast_mode": bool(info.get("fast_mode", False)),
+                "obfuscator": bool(info.get("obfuscator", False)),
+                "ultra_safe": bool(info.get("ultra_safe", False)),
+                "discord_user_id": discord_user_id or None,
+                "discord_username": discord_username or None,
+                "bot_data": bot_data,
+            }
+            api_key = core["api_key"]
+            existing = _supabase_rest("crystal_scripts", {
+                "select": "id",
+                "api_key": "eq." + urllib.parse.quote(api_key, safe=""),
+                "limit": "1"
+            }) if api_key else []
+            if existing:
+                rid = existing[0].get("id")
+                updated = _supabase_rest("crystal_scripts", {"id": "eq." + str(rid)}, "PATCH", core, "return=representation")
+                if updated:
+                    info["supabase_row_id"] = updated[0].get("id", rid)
+                    return True
+            inserted = _supabase_rest("crystal_scripts", {}, "POST", core, "return=representation")
+            if inserted:
+                info["supabase_row_id"] = inserted[0].get("id")
+                return True
+            print(f"Crystal core script sync failed for {script_name}: Supabase returned no row.")
+        except Exception as core_exc:
+            print(f"Crystal core script sync failed for {script_name}: {type(core_exc).__name__}: {core_exc}")
         return False
-
 
 def _sync_dashboard_scripts_from_supabase():
     """Load durable Crystal Hub scripts from Supabase into the bot's runtime state."""
@@ -1228,15 +1208,9 @@ def _sync_dashboard_scripts_from_supabase():
         except Exception:
             pass
 
-        try:
-            rows = _supabase_rest("crystal_scripts", {
-                "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data,fast_mode,obfuscator,ultra_safe,loader_code,access_mode,disabled,webhook_url,settings,key_meta,source_name,source_path"
-            })
-        except Exception as first_exc:
-            print(f"Crystal durable sync full-column read failed: {type(first_exc).__name__}; retrying core columns.")
-            rows = _supabase_rest("crystal_scripts", {
-                "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data"
-            })
+        rows = _supabase_rest("crystal_scripts", {
+            "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data,fast_mode,obfuscator,ultra_safe,loader_code,access_mode,disabled,webhook_url,settings,key_meta,source_name,source_path"
+        })
         count = 0
         for row in rows:
             bot_data = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
@@ -3637,12 +3611,12 @@ async def create_script_command(
         return
 
     persisted = _sync_script_to_supabase(name_script, scripts_data[name_script], str(interaction.user.id),
-                                         str(interaction.user), interaction.guild.id if interaction.guild else None)
+                                          str(interaction.user), interaction.guild.id if interaction.guild else None)
     if not persisted:
         scripts_data.pop(name_script, None)
         save_data()
         await interaction.response.send_message(
-            "❌ The script was NOT created because Supabase persistence failed. Check the Render `SUPA_PRIVATE` / Supabase schema settings before creating it again.",
+            "❌ Script was not saved to the durable database. Check Render `SUPA_PRIVATE` and the Supabase `crystal_scripts` migration before trying again.",
             ephemeral=True,
         )
         return
@@ -4719,10 +4693,7 @@ async def redeem_command(
             admin_redeemed_users.discard(user_id)
             await interaction.response.send_message("❌ Could not save redemption. Try again later.", ephemeral=True)
             return
-        persisted = await asyncio.to_thread(_persist_admin_plan_for_discord, user_id)
-        if not persisted:
-            print(f"WARNING: Admin redeem for {user_id} was saved locally, but no linked Supabase account was found to persist the Admin plan.")
-        await interaction.response.send_message("✅ Internal authorization activated. Admin commands are now enabled.", ephemeral=True)
+        await interaction.response.send_message("✅ Internal authorization activated.", ephemeral=True)
         return
 
     code_hash = _hash_redeem_code(supplied)
@@ -5540,7 +5511,7 @@ class AdminGuideLanguageView(BlacklistAwareView):
             description=(
                 "**CHANNEL MESSAGE**\n`-massage @user Your private message` أو `-massage #channel Your message`\n"
                 "Send a message to a selected text channel.\n\n"
-                "**PLAN ROLES (ADMIN ONLY)**\n`-role @user Premium` · `-role @user Ultra` · `-role @user Admin`\n`-unrole @user` removes all Crystal plan roles.\n\n**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` · `-unblacklist USER_ID`\n\n"
+                "**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` · `-unblacklist USER_ID`\n\n"
                 "**PRIVATE ANNOUNCEMENT**\n`-ann Your message`\n"
                 "DM an announcement to known users.\n\n"
                 "**BACKUPS**\n`-g files` exports the full Admin backup; `-files` imports it.\n"
@@ -5557,7 +5528,7 @@ class AdminGuideLanguageView(BlacklistAwareView):
             title="Crystal Hub | دليل الإدارة",
             description=(
                 "**إرسال رسالة لقناة**\n`-massage #channel رسالتك هنا`\n\n"
-                "**رتب الاشتراك (للأدمن فقط)**\n`-role @user Premium` · `-role @user Ultra` · `-role @user Admin`\n`-unrole @user` لإزالة كل رتب Crystal.\n\n**حظر / فك حظر مستخدم**\n`-blacklist @user` · `-unblacklist USER_ID`\n\n"
+                "**حظر / فك حظر مستخدم**\n`-blacklist @user` · `-unblacklist USER_ID`\n\n"
                 "**إعلان خاص**\n`-ann رسالتك هنا`\n\n"
                 "**النسخ الاحتياطي**\n`-g files` لتصدير النسخة الكاملة، و`-files` لاستيرادها.\n"
                 "`-script file` لنسخة السكربتات والسورس والبانلات، و`/ai-information` لحفظ معلومات الذكاء الاصطناعي.\n\n"
@@ -5591,76 +5562,6 @@ async def admin_command(interaction: discord.Interaction):
         embed=embed, view=AdminGuideLanguageView(), ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
-
-
-# ---------- Admin-only subscription role management ----------
-MANAGED_PLAN_ROLE_NAMES = {"premium": "Premium", "ultra": "Ultra", "admin": "Admin"}
-
-def _internal_admin_prefix_access(ctx: commands.Context) -> bool:
-    """Only the Crystal Admin tier (or configured bot owner) can change plan roles."""
-    return bool(is_bot_owner(ctx.author.id) or _discord_plan(ctx.author.id) == "Admin")
-
-async def _remove_managed_plan_roles(member: discord.Member):
-    removed = []
-    for role in list(member.roles):
-        if role.name.strip().lower() in MANAGED_PLAN_ROLE_NAMES:
-            try:
-                await member.remove_roles(role, reason="Crystal Hub Admin -unrole/-role")
-                removed.append(role.name)
-            except discord.HTTPException:
-                pass
-    return removed
-
-@bot.command(name="unrole")
-async def unrole_prefix(ctx: commands.Context, user: discord.Member):
-    if not _internal_admin_prefix_access(ctx):
-        await ctx.reply("❌ This command is for the Crystal Admin rank only.", mention_author=False)
-        return
-    removed = await _remove_managed_plan_roles(user)
-    # Keep the entitlement state in sync with the Discord role change.
-    if str(user.id) in discord_plan_entitlements:
-        discord_plan_entitlements.pop(str(user.id), None)
-        _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
-    if removed:
-        await ctx.reply(f"✅ Removed Crystal plan roles from {user.mention}: {', '.join(removed)}", mention_author=False)
-    else:
-        await ctx.reply(f"ℹ️ {user.mention} has no Premium, Ultra, or Admin role to remove.", mention_author=False)
-
-@bot.command(name="role")
-async def role_prefix(ctx: commands.Context, user: discord.Member, plan: str = ""):
-    if not _internal_admin_prefix_access(ctx):
-        await ctx.reply("❌ This command is for the Crystal Admin rank only.", mention_author=False)
-        return
-    normalized = str(plan or "").strip().lower()
-    selected = MANAGED_PLAN_ROLE_NAMES.get(normalized)
-    if not selected:
-        await ctx.reply("Usage: `-role @user Premium` or `-role @user Ultra` or `-role @user Admin`", mention_author=False)
-        return
-    role = discord.utils.find(lambda r: r.name.strip().lower() == selected.lower(), ctx.guild.roles)
-    if role is None:
-        try:
-            role = await ctx.guild.create_role(name=selected, reason="Crystal Hub managed subscription role")
-        except discord.HTTPException as exc:
-            await ctx.reply(f"❌ I could not create the `{selected}` role. Check Manage Roles permission. ({exc})", mention_author=False)
-            return
-    removed = await _remove_managed_plan_roles(user)
-    try:
-        await user.add_roles(role, reason=f"Crystal Hub Admin assigned {selected}")
-    except discord.HTTPException as exc:
-        await ctx.reply(f"❌ I could not assign `{selected}` to {user.mention}. Make sure the role is below the bot's highest role. ({exc})", mention_author=False)
-        return
-    if selected == "Admin":
-        discord_plan_entitlements.pop(str(user.id), None)
-    else:
-        discord_plan_entitlements[str(user.id)] = {
-            "plan": selected,
-            "redeemed_at": _iso_now(),
-            "expires_at": None,
-            "source": "admin-role-command",
-        }
-    _save_json_dict(DISCORD_PLAN_ENTITLEMENTS_FILE, discord_plan_entitlements)
-    removed_text = f" Removed: {', '.join(removed)}." if removed else ""
-    await ctx.reply(f"✅ {user.mention} is now **{selected}**.{removed_text}", mention_author=False)
 
 
 @bot.command(name="admin-role", aliases=["set-admin-role"])
