@@ -361,8 +361,38 @@ def _active_owned_script_count(user_id):
                if str(item.get("created_by", "")) == str(user_id))
 
 
+def _script_in_guild(info, guild_id):
+    """Return True when a script belongs to the requested Discord guild.
+    Legacy scripts without a guild_id remain visible for backward compatibility.
+    """
+    if guild_id is None:
+        return True
+    stored = info.get("guild_id")
+    if stored in (None, "", 0, "0"):
+        return True
+    return str(stored) == str(guild_id)
+
+def _script_for_guild(script_name, guild_id):
+    """Resolve a script name only inside the current guild."""
+    name = str(script_name or "").strip()
+    if not name:
+        return None
+    info = scripts_data.get(name)
+    if info is not None and _script_in_guild(info, guild_id):
+        return info
+    return None
+
+def _guild_security_state(guild_id):
+    """Get/create HWID security settings isolated to one Discord guild."""
+    gid = str(guild_id or "0")
+    guilds = security_state.setdefault("guilds", {})
+    state = guilds.setdefault(gid, {})
+    state.setdefault("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN)
+    state.setdefault("reset_hwid_last_used", {})
+    return state
+
 def _active_owned_panel_count(user_id, guild_id=None):
-    """Count live panel records owned by this user in the current Discord guild."""
+    """Count active panels in the current guild. Panel quota is server-local."""
     count = 0
     for item in scripts_data.values():
         instances = item.get("panel_instances")
@@ -373,16 +403,13 @@ def _active_owned_panel_count(user_id, guild_id=None):
                 "guild_id": item.get("panel_guild_id"),
                 "channel_id": item.get("panel_channel_id"),
                 "message_id": item.get("panel_message_id"),
-                "created_by": item.get("panel_created_by", item.get("created_by", "")),
             }]
         for panel in instances:
             if not panel.get("message_id"):
                 continue
             if guild_id is not None and str(panel.get("guild_id")) != str(guild_id):
                 continue
-            owner = panel.get("created_by", item.get("panel_created_by", item.get("created_by", "")))
-            if str(owner) == str(user_id):
-                count += 1
+            count += 1
     return count
 
 
@@ -409,8 +436,13 @@ async def _remove_missing_guild_panels(guild_id):
                     continue
                 await channel.fetch_message(message_id)
                 kept.append(panel)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+            except discord.NotFound:
+                # The message is genuinely gone: remove its saved location.
                 changed = True
+            except (discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+                # We could not verify the message. Keep the record so a temporary
+                # permission/API problem never destroys a valid saved panel.
+                kept.append(panel)
         if len(kept) != len(instances):
             info["panel_instances"] = kept
             changed = True
@@ -559,15 +591,24 @@ def load_security_state():
         try:
             with open(SECURITY_STATE_FILE, "r", encoding="utf-8") as f:
                 state = json.load(f)
-            return {
-                "reset_hwid_cooldown": max(0, int(state.get("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN))),
-                "reset_hwid_last_used": {
-                    str(k): int(v) for k, v in state.get("reset_hwid_last_used", {}).items()
-                },
-            }
+            legacy_cooldown = max(0, int(state.get("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN)))
+            legacy_last = {str(k): int(v) for k, v in state.get("reset_hwid_last_used", {}).items()}
+            guilds = state.get("guilds", {}) if isinstance(state.get("guilds", {}), dict) else {}
+            # Migrate old global settings into a legacy bucket; new commands use guild buckets.
+            if not guilds and ("reset_hwid_cooldown" in state or "reset_hwid_last_used" in state):
+                guilds["0"] = {"reset_hwid_cooldown": legacy_cooldown, "reset_hwid_last_used": legacy_last}
+            normalized = {}
+            for gid, gstate in guilds.items():
+                if not isinstance(gstate, dict):
+                    gstate = {}
+                normalized[str(gid)] = {
+                    "reset_hwid_cooldown": max(300, min(2592000, int(gstate.get("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN)))),
+                    "reset_hwid_last_used": {str(k): int(v) for k, v in (gstate.get("reset_hwid_last_used") or {}).items()},
+                }
+            return {"guilds": normalized, "reset_hwid_cooldown": legacy_cooldown, "reset_hwid_last_used": legacy_last}
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
-    return {"reset_hwid_cooldown": DEFAULT_RESET_HWID_COOLDOWN, "reset_hwid_last_used": {}}
+    return {"guilds": {}, "reset_hwid_cooldown": DEFAULT_RESET_HWID_COOLDOWN, "reset_hwid_last_used": {}}
 
 
 security_state = load_security_state()
@@ -2781,7 +2822,9 @@ async def script_autocomplete(
     current: str
 ) -> list[app_commands.Choice[str]]:
     choices = []
-    for script_name in scripts_data.keys():
+    for script_name, info in scripts_data.items():
+        if not _script_in_guild(info, interaction.guild_id):
+            continue
         if current.lower() in script_name.lower():
             choices.append(app_commands.Choice(name=script_name, value=script_name))
     return choices[:25]
@@ -3402,14 +3445,21 @@ async def _refresh_saved_panels_after_startup():
                 if bot.user:
                     embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
                 view = PanelControlView(script_name=script_name)
-                new_message = await channel.send(embed=embed, view=view)
                 old_id = panel.get("message_id")
-                if old_id and int(old_id) != new_message.id:
+                new_message = None
+                if old_id:
                     try:
                         old_message = await channel.fetch_message(int(old_id))
-                        await old_message.delete()
-                    except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
-                        pass
+                        await old_message.edit(embed=embed, view=view)
+                        new_message = old_message
+                    except discord.NotFound:
+                        new_message = None
+                    except (discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+                        # Do not delete/replace a panel we cannot verify.
+                        refreshed.append(panel)
+                        continue
+                if new_message is None:
+                    new_message = await channel.send(embed=embed, view=view)
                 refreshed.append({
                     "guild_id": int(guild_id), "channel_id": int(channel_id),
                     "message_id": new_message.id, "name": title,
@@ -4119,91 +4169,71 @@ async def api_account_command(interaction: discord.Interaction, acc: Optional[st
         print(f'/api account link error: {type(exc).__name__}: {exc}')
         await interaction.response.send_message('❌ Could not link the Account API. Check that the key came from Dashboard → Settings.', ephemeral=True)
 
-@bot.tree.command(name="hwid", description="Reset HWID binding so your key can lock to a new device")
-@app_commands.describe(script="Optional: one script only. Leave empty to reset HWID for all your keys.")
+@bot.tree.command(name="hwid", description="Reset a user's HWID for one selected script")
+@app_commands.describe(
+    script="Required: choose the script",
+    user="Optional: user to reset; if empty, reset your own HWID",
+    cooldown="Optional cooldown in minutes for this server (5 minutes to 30 days)"
+)
 @app_commands.autocomplete(script=script_autocomplete)
-async def hwid_command(interaction: discord.Interaction, script: Optional[str] = None):
-    uid = str(interaction.user.id)
-    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-    last_used = int((security_state.get("reset_hwid_last_used") or {}).get(uid, 0) or 0)
-    cooldown = int(security_state.get("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN) or 0)
-    if cooldown > 0 and last_used > 0 and now - last_used < cooldown:
-        remaining = cooldown - (now - last_used)
-        await interaction.response.send_message(
-            f"⏳ You can reset your HWID again in **{format_duration(remaining)}**.",
-            ephemeral=True
-        )
+async def hwid_command(
+    interaction: discord.Interaction,
+    script: str,
+    user: Optional[discord.Member] = None,
+    cooldown: Optional[app_commands.Range[int, 5, 43200]] = None,
+):
+    # /hwid is server-admin controlled, independent of Premium/Ultra plan status.
+    allowed, message = _global_admin_status(interaction)
+    if not allowed:
+        await interaction.response.send_message(message or "❌ Admin role or Administrator permission required.", ephemeral=True)
         return
 
-    target_name = str(script or "").strip()
-    if target_name and target_name not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+    s_info = _script_for_guild(script, interaction.guild_id)
+    if not s_info:
+        await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
         return
 
+    target = user or interaction.user
+    uid = str(target.id)
     removed = 0
-    touched_scripts = []
-    for name, info in scripts_data.items():
-        if target_name and name != target_name:
-            continue
-        meta = info.get("key_meta") if isinstance(info.get("key_meta"), dict) else {}
-        access = info.get("user_access") if isinstance(info.get("user_access"), dict) else {}
-        keys_for_user = set()
-        for key_value, key_meta in meta.items():
-            if isinstance(key_meta, dict) and str(key_meta.get("discord_user_id") or "") == uid:
-                keys_for_user.add(str(key_value))
-        access_entry = access.get(uid)
-        if isinstance(access_entry, dict):
-            for field in ("key", "api_key", "script_key"):
-                if access_entry.get(field):
-                    keys_for_user.add(str(access_entry[field]))
-        elif isinstance(access_entry, str) and access_entry.strip():
-            keys_for_user.add(access_entry.strip())
+    meta = s_info.get("key_meta") if isinstance(s_info.get("key_meta"), dict) else {}
+    access = s_info.get("user_access") if isinstance(s_info.get("user_access"), dict) else {}
+    keys_for_user = set()
+    for key_value, key_meta in meta.items():
+        if isinstance(key_meta, dict) and str(key_meta.get("discord_user_id") or "") == uid:
+            keys_for_user.add(str(key_value))
+    access_entry = access.get(uid)
+    if isinstance(access_entry, dict):
+        for field in ("key", "api_key", "script_key"):
+            if access_entry.get(field):
+                keys_for_user.add(str(access_entry[field]))
+    elif isinstance(access_entry, str) and access_entry.strip():
+        keys_for_user.add(access_entry.strip())
+    direct_key = s_info.get("user_keys", {}).get(target.id) if isinstance(s_info.get("user_keys"), dict) else None
+    if direct_key:
+        keys_for_user.add(str(direct_key))
 
-        for key_value in keys_for_user:
-            binding_key = f"{name}:{key_value}"
-            if binding_key in hwid_bindings:
-                hwid_bindings.pop(binding_key, None)
-                removed += 1
-        if keys_for_user:
-            touched_scripts.append(name)
-            try:
-                _persist_script_row(info.get("supabase_row_id"), {
-                    "bot_data": {
-                        "version": info.get("version", "1.0.0"),
-                        "buyer_role_id": info.get("buyer_role_id"),
-                        "admin_role_id": info.get("admin_role_id"),
-                        "created_by": str(info.get("created_by") or ""),
-                        "trail_enabled": bool(info.get("trail_enabled", False)),
-                        "trail_mode": info.get("trail_mode", "PERM"),
-                        "trail_expires_at": info.get("trail_expires_at"),
-                        "user_access": info.get("user_access") if isinstance(info.get("user_access"), dict) else {},
-                        "hwid_bindings": {k: v for k, v in hwid_bindings.items() if str(k).startswith(str(name) + ":")}
-                    },
-                    "updated_at": _iso_now()
-                })
-            except Exception:
-                pass
+    for key_value in keys_for_user:
+        if hwid_bindings.pop(f"{script}:{key_value}", None) is not None:
+            removed += 1
 
-    security_state.setdefault("reset_hwid_last_used", {})[uid] = now
-    try:
-        save_hwid_bindings()
-        save_security_state()
-    except OSError:
-        await interaction.response.send_message("❌ Could not save the HWID reset. Please try again.", ephemeral=True)
-        return
-
-    if removed:
-        scope = f"for **{', '.join(touched_scripts[:5])}**" if touched_scripts else ""
-        more = " and more" if len(touched_scripts) > 5 else ""
-        await interaction.response.send_message(
-            f"✅ HWID reset successfully {scope}{more}. You can now run your key from the new device.",
-            ephemeral=True
-        )
+    # Optional cooldown changes this server's setting only. Default is one day.
+    guild_security = _guild_security_state(interaction.guild_id)
+    if cooldown is not None:
+        guild_security["reset_hwid_cooldown"] = int(cooldown) * 60
     else:
-        await interaction.response.send_message(
-            "ℹ️ No HWID binding was found for your account. Your next key use will bind normally.",
-            ephemeral=True
-        )
+        guild_security.setdefault("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN)
+    save_hwid_bindings()
+    save_security_state()
+    s_info["hwid_bindings"] = {k: v for k, v in hwid_bindings.items() if str(k).startswith(script + ":")}
+    save_data()
+
+    cooldown_text = format_duration(int(guild_security["reset_hwid_cooldown"]))
+    if removed:
+        result = f"✅ HWID reset for **{target.mention}** on `{script}`.\n🔄 Reset cooldown in this server: **{cooldown_text}**."
+    else:
+        result = f"ℹ️ No HWID binding was found for **{target.mention}** on `{script}`.\n🔄 Cooldown in this server: **{cooldown_text}**."
+    await interaction.response.send_message(result, ephemeral=True)
 
 
 @bot.tree.command(name="avatar-bot", description="Change the bot profile for this server")
@@ -5767,16 +5797,17 @@ async def admin_role_prefix(ctx: commands.Context, admin_role: discord.Role):
 
 
 @bot.command(name="reset-hwid-cooldown")
-async def reset_hwid_cooldown_prefix(ctx: commands.Context, seconds: int = -1):
+async def reset_hwid_cooldown_prefix(ctx: commands.Context, minutes: int = 1440):
     if not ctx.guild or not isinstance(ctx.author, discord.Member) or not ctx.author.guild_permissions.administrator:
         await ctx.reply("❌ Only server administrators can change this setting.", mention_author=False)
         return
-    if seconds < 0 or seconds > 31536000:
-        await ctx.reply("Usage: `-reset-hwid-cooldown seconds` (0 to 31536000; 0 disables the cooldown).", mention_author=False)
+    if minutes < 5 or minutes > 43200:
+        await ctx.reply("Usage: `-reset-hwid-cooldown minutes` (5 to 43200 minutes / 30 days). Default: 1440 minutes (1 day).", mention_author=False)
         return
-    security_state["reset_hwid_cooldown"] = int(seconds)
+    guild_security = _guild_security_state(ctx.guild.id)
+    guild_security["reset_hwid_cooldown"] = int(minutes) * 60
     save_security_state()
-    await ctx.reply(f"✅ HWID reset cooldown set to **{format_duration(seconds)}** ({seconds} seconds).", mention_author=False)
+    await ctx.reply(f"✅ HWID reset cooldown for this server set to **{format_duration(int(minutes) * 60)}**.", mention_author=False)
 
 
 # Removed slash registration: use the Admin prefix command -blacklist.
