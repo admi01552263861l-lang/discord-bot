@@ -2731,13 +2731,29 @@ def grant_user_access(
     register_key(s_info, key, mode, expires_at, created_by=created_by)
 
 
+def _script_belongs_to_guild(script_info: dict, guild_id) -> bool:
+    """A script is visible only inside the Discord server recorded on its row."""
+    if guild_id is None or not isinstance(script_info, dict):
+        return False
+    stored_guild = script_info.get("guild_id")
+    return stored_guild is not None and str(stored_guild) == str(guild_id)
+
+
+def _get_guild_script(script_name: str, guild_id):
+    """Return a script only when it belongs to the current Discord server."""
+    info = scripts_data.get(str(script_name))
+    return info if _script_belongs_to_guild(info, guild_id) else None
+
+
 async def script_autocomplete(
     interaction: discord.Interaction,
     current: str
 ) -> list[app_commands.Choice[str]]:
     choices = []
-    for script_name in scripts_data.keys():
-        if current.lower() in script_name.lower():
+    if interaction.guild_id is None:
+        return choices
+    for script_name, info in scripts_data.items():
+        if _script_belongs_to_guild(info, interaction.guild_id) and current.lower() in script_name.lower():
             choices.append(app_commands.Choice(name=script_name, value=script_name))
     return choices[:25]
 
@@ -2784,16 +2800,22 @@ def is_guild_administrator(interaction: discord.Interaction) -> bool:
 
 
 def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = None) -> bool:
-    """Bot Admins/server admins, plus the owner of the selected script."""
+    """Server admins/script owners may manage only scripts belonging to this server."""
     user_id = getattr(interaction.user, "id", 0)
+    if script_name:
+        scoped_info = _get_guild_script(script_name, getattr(interaction, "guild_id", None))
+        if scoped_info is None:
+            return False
+    else:
+        scoped_info = None
     if is_bot_owner(user_id) or _discord_plan(user_id) == "Admin" or _has_global_admin_access(interaction):
         return True
-    if script_name and script_name in scripts_data:
-        owner_id = scripts_data[script_name].get("created_by")
+    if script_name and scoped_info is not None:
+        owner_id = scoped_info.get("created_by")
         if owner_id is not None and str(owner_id) == str(user_id):
             return True
         # A user who created a particular panel may manage that panel too.
-        for panel in (scripts_data[script_name].get("panel_instances") or []):
+        for panel in (scoped_info.get("panel_instances") or []):
             if str(panel.get("created_by", "")) == str(user_id):
                 return True
     return False
@@ -3476,8 +3498,8 @@ async def generate_key_command(
     if not (is_bot_owner(interaction.user.id) or role_ok):
         await interaction.response.send_message("❌ You need the configured Admin role or Discord Administrator permission to generate keys.", ephemeral=True)
         return
-    if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+    if _get_guild_script(script, interaction.guild_id) is None:
+        await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
         return
     mode = (duration_type.value if duration_type else "PERM").upper()
     try:
@@ -3518,8 +3540,8 @@ async def whitelist_command(
             ephemeral=True,
         )
         return
-    if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+    if _get_guild_script(script, interaction.guild_id) is None:
+        await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
         return
     mode = (duration_type.value if duration_type else "PERM").upper()
     try:
@@ -3599,10 +3621,10 @@ async def trail_command(
     if not is_admin_or_has_role(interaction, script):
         await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to manage Trail.", ephemeral=True)
         return
-    if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+    s_info = _get_guild_script(script, interaction.guild_id)
+    if s_info is None:
+        await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
         return
-    s_info = scripts_data[script]
     if state.value == "OFF":
         s_info["trail_enabled"] = False
         s_info["trail_mode"] = "PERM"
@@ -3707,6 +3729,7 @@ async def create_script_command(
         "whitelisted_users": set(),
         "user_keys": {},
         "created_by": str(interaction.user.id),
+        "guild_id": str(interaction.guild_id) if interaction.guild_id else None,
         "api_key": api_key,
         "supabase_user_id": (imported or {}).get("_supabase_user_id"),
         "supabase_row_id": (imported or {}).get("_supabase_row_id"),
@@ -3765,8 +3788,8 @@ async def delete_script_command(interaction: discord.Interaction, script: str):
         _, admin_error = _global_admin_status(interaction)
         await interaction.response.send_message(admin_error or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
         return
-    if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+    if _get_guild_script(script, interaction.guild_id) is None:
+        await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
         return
 
     deleted_info = scripts_data.get(script, {})
@@ -4093,13 +4116,15 @@ async def hwid_command(interaction: discord.Interaction, script: Optional[str] =
         return
 
     target_name = str(script or "").strip()
-    if target_name and target_name not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+    if target_name and _get_guild_script(target_name, interaction.guild_id) is None:
+        await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
         return
 
     removed = 0
     touched_scripts = []
     for name, info in scripts_data.items():
+        if not _script_belongs_to_guild(info, interaction.guild_id):
+            continue
         if target_name and name != target_name:
             continue
         meta = info.get("key_meta") if isinstance(info.get("key_meta"), dict) else {}
@@ -5198,7 +5223,7 @@ def _crystal_ai_context():
             "Premium": {"price": "$1 USD", "duration": "lifetime", "active_scripts": 10, "active_panels": 10, "source_operations_per_month": 100, "active_keys_or_whitelist_slots": 500, "avatar_changes_per_month": 5},
             "Ultra": {"price": "$2 USD", "duration": "lifetime", "limits": "unlimited according to the current bot quota logic"}
         },
-        "configured_scripts": scripts,
+        "configured_scripts": [],
         "purchase_instructions": "Join https://discord.gg/DsQ2sQkBW3, go to the Buy channel, and open a ticket to purchase. Staff can confirm current prices and availability.",
         "server_invite": CRYSTAL_DISCORD_INVITE,
     }
