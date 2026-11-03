@@ -1166,6 +1166,7 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
 
 def _sync_dashboard_scripts_from_supabase():
     """Load durable Crystal Hub scripts from Supabase into the bot's runtime state."""
+    print("Crystal restore: starting Supabase script import.")
     try:
         links = _supabase_rest("crystal_discord_users", {"select": "discord_user_id,supabase_user_id"})
         user_map = {str(x.get("supabase_user_id")): str(x.get("discord_user_id"))
@@ -1181,12 +1182,18 @@ def _sync_dashboard_scripts_from_supabase():
         rows = _supabase_rest("crystal_scripts", {
             "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data,fast_mode,obfuscator,ultra_safe,loader_code,access_mode,disabled,webhook_url,settings,key_meta,source_name,source_path"
         })
+        print(f"Crystal restore: Supabase returned {len(rows)} script row(s).")
         count = 0
+        skipped = 0
         for row in rows:
             bot_data = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
-            owner = str(row.get("discord_user_id") or bot_data.get("created_by") or user_map.get(str(row.get("user_id")), ""))
+            owner = str(row.get("discord_user_id") or bot_data.get("created_by") or user_map.get(str(row.get("user_id")), "")).strip()
             name = str(row.get("name") or "").strip()
-            if not owner or not name:
+            # Dashboard-created scripts may not be linked to Discord yet.
+            # Do not discard valid Supabase rows just because they have no Discord owner.
+            if not name:
+                skipped += 1
+                print(f"Crystal restore: skipped row {row.get('id')} because its name is empty.")
                 continue
 
             info = scripts_data.get(name, {})
@@ -1230,7 +1237,7 @@ def _sync_dashboard_scripts_from_supabase():
                 "valid_keys": valid_keys,
                 "whitelisted_users": whitelisted,
                 "user_keys": user_keys,
-                "created_by": owner,
+                "created_by": owner or "",
                 "panel_created_by": bot_data.get("panel_created_by"),
                 "panel_guild_id": bot_data.get("panel_guild_id"),
                 "panel_channel_id": bot_data.get("panel_channel_id"),
@@ -1259,7 +1266,7 @@ def _sync_dashboard_scripts_from_supabase():
                 "source_path": row.get("source_path"),
                 "source_obfuscated": bool(bot_data.get("source_obfuscated", info.get("source_obfuscated", False))),
                 "guild_id": row.get("guild_id"),
-                "discord_user_id": owner,
+                "discord_user_id": owner or None,
                 "discord_username": row.get("discord_username"),
             })
             info["hwid_bindings"] = bot_data.get("hwid_bindings") if isinstance(bot_data.get("hwid_bindings"), dict) else info.get("hwid_bindings", {})
@@ -1267,8 +1274,9 @@ def _sync_dashboard_scripts_from_supabase():
             count += 1
 
         if count:
-            save_data()
-        print(f"Crystal durable sync: restored {count} script(s) from Supabase.")
+            saved = save_data()
+            print(f"Crystal restore: local snapshot {'saved' if saved else 'FAILED'} after importing {count} script(s).")
+        print(f"Crystal durable sync: restored {count} script(s) from Supabase; skipped {skipped} row(s).")
         return count
     except Exception as exc:
         print(f"Crystal sync from Supabase failed: {type(exc).__name__}: {exc}")
@@ -3430,7 +3438,9 @@ async def on_ready():
     # Discord guild copies are intentionally NOT created.
     await _sync_global_commands()
     print(f"Bot connected successfully as: {bot.user}")
-    await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
+    print("Crystal startup: calling Supabase script restore.")
+    restored_count = await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
+    print(f"Crystal startup: Supabase restore finished with {restored_count} script(s).")
     # Backfill older local scripts into Supabase immediately on first startup.
     await asyncio.to_thread(_push_all_local_scripts_to_supabase)
     if not getattr(bot, "_crystal_dashboard_sync_started", False):
