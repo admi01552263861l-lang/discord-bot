@@ -361,16 +361,69 @@ def _active_owned_script_count(user_id):
                if str(item.get("created_by", "")) == str(user_id))
 
 
-def _active_owned_panel_count(user_id):
-    return sum(
-        1 for item in scripts_data.values()
-        for panel in (item.get("panel_instances") or ([{
-            "message_id": item.get("panel_message_id"),
-            "created_by": item.get("panel_created_by", item.get("created_by", "")),
-        }] if item.get("panel_message_id") else []))
-        if str(panel.get("created_by", item.get("panel_created_by", item.get("created_by", "")))) == str(user_id)
-        and panel.get("message_id")
-    )
+def _active_owned_panel_count(user_id, guild_id=None):
+    """Count live panel records owned by this user in the current Discord guild."""
+    count = 0
+    for item in scripts_data.values():
+        instances = item.get("panel_instances")
+        if not isinstance(instances, list):
+            instances = []
+        if not instances and item.get("panel_message_id"):
+            instances = [{
+                "guild_id": item.get("panel_guild_id"),
+                "channel_id": item.get("panel_channel_id"),
+                "message_id": item.get("panel_message_id"),
+                "created_by": item.get("panel_created_by", item.get("created_by", "")),
+            }]
+        for panel in instances:
+            if not panel.get("message_id"):
+                continue
+            if guild_id is not None and str(panel.get("guild_id")) != str(guild_id):
+                continue
+            owner = panel.get("created_by", item.get("panel_created_by", item.get("created_by", "")))
+            if str(owner) == str(user_id):
+                count += 1
+    return count
+
+
+async def _remove_missing_guild_panels(guild_id):
+    """Verify saved panel messages against Discord; purge records deleted manually."""
+    changed = False
+    for info in scripts_data.values():
+        instances = info.get("panel_instances")
+        if not isinstance(instances, list):
+            instances = []
+            info["panel_instances"] = instances
+        kept = []
+        for panel in instances:
+            if str(panel.get("guild_id")) != str(guild_id):
+                kept.append(panel)
+                continue
+            try:
+                channel_id = int(panel.get("channel_id") or 0)
+                message_id = int(panel.get("message_id") or 0)
+                channel = bot.get_channel(channel_id)
+                if channel is None and channel_id:
+                    channel = await bot.fetch_channel(channel_id)
+                if channel is None or not message_id:
+                    continue
+                await channel.fetch_message(message_id)
+                kept.append(panel)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+                changed = True
+        if len(kept) != len(instances):
+            info["panel_instances"] = kept
+            changed = True
+        # Clear legacy pointer only when it refers to this guild and no longer exists.
+        if str(info.get("panel_guild_id")) == str(guild_id):
+            legacy_id = str(info.get("panel_message_id") or "")
+            if legacy_id and not any(str(p.get("message_id")) == legacy_id for p in kept):
+                info["panel_guild_id"] = None
+                info["panel_channel_id"] = None
+                info["panel_message_id"] = None
+                changed = True
+    if changed:
+        save_data()
 
 
 def _usage_record(user_id):
@@ -383,7 +436,7 @@ def _usage_record(user_id):
     return rec
 
 
-def _quota_check(user_id, category):
+def _quota_check(user_id, category, guild_id=None):
     plan = _discord_plan(user_id)
     if plan in ("Ultra", "Admin"):
         return True, None
@@ -403,8 +456,8 @@ def _quota_check(user_id, category):
             return False, f"{plan} script limit reached: { _active_owned_script_count(user_id)}/{limit} active slots used. Delete one to free a slot."
         return True, None
     if category == "panels":
-        if _active_owned_panel_count(user_id) >= limit:
-            return False, f"{plan} panel limit reached: { _active_owned_panel_count(user_id)}/{limit} active slots used. Delete one to free a slot."
+        if _active_owned_panel_count(user_id, guild_id) >= limit:
+            return False, f"{plan} panel limit reached: { _active_owned_panel_count(user_id, guild_id)}/{limit} active slots used. Delete one to free a slot."
         return True, None
 
     # Source and avatar operations use independent monthly counters.
@@ -423,7 +476,7 @@ def _quota_increment(user_id, category):
     _save_json_dict(MONTHLY_USAGE_FILE, monthly_usage)
 
 
-def _quota_status(user_id):
+def _quota_status(user_id, guild_id=None):
     plan = _discord_plan(user_id)
     if plan in ("Ultra", "Admin"):
         return "All usage limits bypassed."
@@ -438,7 +491,7 @@ def _quota_status(user_id):
     }
     active = {
         "scripts": _active_owned_script_count(user_id),
-        "panels": _active_owned_panel_count(user_id),
+        "panels": _active_owned_panel_count(user_id, guild_id),
         "keys": _active_owned_key_count(user_id),
     }
     parts = []
@@ -1166,7 +1219,6 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
 
 def _sync_dashboard_scripts_from_supabase():
     """Load durable Crystal Hub scripts from Supabase into the bot's runtime state."""
-    print("Crystal restore: starting Supabase script import.")
     try:
         links = _supabase_rest("crystal_discord_users", {"select": "discord_user_id,supabase_user_id"})
         user_map = {str(x.get("supabase_user_id")): str(x.get("discord_user_id"))
@@ -1182,18 +1234,12 @@ def _sync_dashboard_scripts_from_supabase():
         rows = _supabase_rest("crystal_scripts", {
             "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data,fast_mode,obfuscator,ultra_safe,loader_code,access_mode,disabled,webhook_url,settings,key_meta,source_name,source_path"
         })
-        print(f"Crystal restore: Supabase returned {len(rows)} script row(s).")
         count = 0
-        skipped = 0
         for row in rows:
             bot_data = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
-            owner = str(row.get("discord_user_id") or bot_data.get("created_by") or user_map.get(str(row.get("user_id")), "")).strip()
+            owner = str(row.get("discord_user_id") or bot_data.get("created_by") or user_map.get(str(row.get("user_id")), ""))
             name = str(row.get("name") or "").strip()
-            # Dashboard-created scripts may not be linked to Discord yet.
-            # Do not discard valid Supabase rows just because they have no Discord owner.
-            if not name:
-                skipped += 1
-                print(f"Crystal restore: skipped row {row.get('id')} because its name is empty.")
+            if not owner or not name:
                 continue
 
             info = scripts_data.get(name, {})
@@ -1237,7 +1283,7 @@ def _sync_dashboard_scripts_from_supabase():
                 "valid_keys": valid_keys,
                 "whitelisted_users": whitelisted,
                 "user_keys": user_keys,
-                "created_by": owner or "",
+                "created_by": owner,
                 "panel_created_by": bot_data.get("panel_created_by"),
                 "panel_guild_id": bot_data.get("panel_guild_id"),
                 "panel_channel_id": bot_data.get("panel_channel_id"),
@@ -1266,7 +1312,7 @@ def _sync_dashboard_scripts_from_supabase():
                 "source_path": row.get("source_path"),
                 "source_obfuscated": bool(bot_data.get("source_obfuscated", info.get("source_obfuscated", False))),
                 "guild_id": row.get("guild_id"),
-                "discord_user_id": owner or None,
+                "discord_user_id": owner,
                 "discord_username": row.get("discord_username"),
             })
             info["hwid_bindings"] = bot_data.get("hwid_bindings") if isinstance(bot_data.get("hwid_bindings"), dict) else info.get("hwid_bindings", {})
@@ -1274,9 +1320,8 @@ def _sync_dashboard_scripts_from_supabase():
             count += 1
 
         if count:
-            saved = save_data()
-            print(f"Crystal restore: local snapshot {'saved' if saved else 'FAILED'} after importing {count} script(s).")
-        print(f"Crystal durable sync: restored {count} script(s) from Supabase; skipped {skipped} row(s).")
+            save_data()
+        print(f"Crystal durable sync: restored {count} script(s) from Supabase.")
         return count
     except Exception as exc:
         print(f"Crystal sync from Supabase failed: {type(exc).__name__}: {exc}")
@@ -2731,29 +2776,13 @@ def grant_user_access(
     register_key(s_info, key, mode, expires_at, created_by=created_by)
 
 
-def _script_belongs_to_guild(script_info: dict, guild_id) -> bool:
-    """A script is visible only inside the Discord server recorded on its row."""
-    if guild_id is None or not isinstance(script_info, dict):
-        return False
-    stored_guild = script_info.get("guild_id")
-    return stored_guild is not None and str(stored_guild) == str(guild_id)
-
-
-def _get_guild_script(script_name: str, guild_id):
-    """Return a script only when it belongs to the current Discord server."""
-    info = scripts_data.get(str(script_name))
-    return info if _script_belongs_to_guild(info, guild_id) else None
-
-
 async def script_autocomplete(
     interaction: discord.Interaction,
     current: str
 ) -> list[app_commands.Choice[str]]:
     choices = []
-    if interaction.guild_id is None:
-        return choices
-    for script_name, info in scripts_data.items():
-        if _script_belongs_to_guild(info, interaction.guild_id) and current.lower() in script_name.lower():
+    for script_name in scripts_data.keys():
+        if current.lower() in script_name.lower():
             choices.append(app_commands.Choice(name=script_name, value=script_name))
     return choices[:25]
 
@@ -2800,22 +2829,16 @@ def is_guild_administrator(interaction: discord.Interaction) -> bool:
 
 
 def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = None) -> bool:
-    """Server admins/script owners may manage only scripts belonging to this server."""
+    """Bot Admins/server admins, plus the owner of the selected script."""
     user_id = getattr(interaction.user, "id", 0)
-    if script_name:
-        scoped_info = _get_guild_script(script_name, getattr(interaction, "guild_id", None))
-        if scoped_info is None:
-            return False
-    else:
-        scoped_info = None
     if is_bot_owner(user_id) or _discord_plan(user_id) == "Admin" or _has_global_admin_access(interaction):
         return True
-    if script_name and scoped_info is not None:
-        owner_id = scoped_info.get("created_by")
+    if script_name and script_name in scripts_data:
+        owner_id = scripts_data[script_name].get("created_by")
         if owner_id is not None and str(owner_id) == str(user_id):
             return True
         # A user who created a particular panel may manage that panel too.
-        for panel in (scoped_info.get("panel_instances") or []):
+        for panel in (scripts_data[script_name].get("panel_instances") or []):
             if str(panel.get("created_by", "")) == str(user_id):
                 return True
     return False
@@ -2838,7 +2861,7 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
     # / has been permanently removed — use /api to link Dashboard account.
     command_name = getattr(getattr(interaction, "command", None), "name", "")
     management_commands = {
-        "generate-key", "whitelist", "see-keys", "delete-key",
+        "generate-key", "whitelist", "see-keys", "delete-key", "hwid",
         "unwhitelist", "trail", "delete-script",
         "set-buyer-role", "update-script", "reset-hwid-cooldown",
         "ai-bot",
@@ -3007,7 +3030,7 @@ class ObfuscateConfirmView(BlacklistAwareView):
             await interaction.response.send_message("❌ Could not save the source.", ephemeral=True)
             return
         _quota_increment(interaction.user.id, "sources")
-        await interaction.response.send_message(f"⚡ Source file saved & protected for `{self.script_name}`!\\n{_quota_status(interaction.user.id)}", ephemeral=True)
+        await interaction.response.send_message(f"⚡ Source file saved & protected for `{self.script_name}`!\\n{_quota_status(interaction.user.id, interaction.guild_id)}", ephemeral=True)
 
     @discord.ui.button(label="No ❌", style=discord.ButtonStyle.danger)
     async def no_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3025,7 +3048,7 @@ class ObfuscateConfirmView(BlacklistAwareView):
             await interaction.response.send_message("❌ Could not save the source.", ephemeral=True)
             return
         _quota_increment(interaction.user.id, "sources")
-        await interaction.response.send_message(f"✅ Source file attached for `{self.script_name}`!\\n{_quota_status(interaction.user.id)}", ephemeral=True)
+        await interaction.response.send_message(f"✅ Source file attached for `{self.script_name}`!\\n{_quota_status(interaction.user.id, interaction.guild_id)}", ephemeral=True)
 
 
 class AddSourceModal(BlacklistAwareModal, title="Crystal Hub — Add Source"):
@@ -3460,9 +3483,7 @@ async def on_ready():
     # Discord guild copies are intentionally NOT created.
     await _sync_global_commands()
     print(f"Bot connected successfully as: {bot.user}")
-    print("Crystal startup: calling Supabase script restore.")
-    restored_count = await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
-    print(f"Crystal startup: Supabase restore finished with {restored_count} script(s).")
+    await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
     # Backfill older local scripts into Supabase immediately on first startup.
     await asyncio.to_thread(_push_all_local_scripts_to_supabase)
     if not getattr(bot, "_crystal_dashboard_sync_started", False):
@@ -3498,8 +3519,8 @@ async def generate_key_command(
     if not (is_bot_owner(interaction.user.id) or role_ok):
         await interaction.response.send_message("❌ You need the configured Admin role or Discord Administrator permission to generate keys.", ephemeral=True)
         return
-    if _get_guild_script(script, interaction.guild_id) is None:
-        await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
         return
     mode = (duration_type.value if duration_type else "PERM").upper()
     try:
@@ -3513,7 +3534,7 @@ async def generate_key_command(
     _sync_script_to_supabase(script, scripts_data[script], str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
     when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
     await interaction.response.send_message(
-        f"🔑 **New Key Generated for `{script}`** ({mode} — {when}):\n```text\n{new_key}\n```\n\n{_quota_status(interaction.user.id)}",
+        f"🔑 **New Key Generated for `{script}`** ({mode} — {when}):\n```text\n{new_key}\n```\n\n{_quota_status(interaction.user.id, interaction.guild_id)}",
         ephemeral=True
     )
 
@@ -3540,8 +3561,8 @@ async def whitelist_command(
             ephemeral=True,
         )
         return
-    if _get_guild_script(script, interaction.guild_id) is None:
-        await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
         return
     mode = (duration_type.value if duration_type else "PERM").upper()
     try:
@@ -3592,7 +3613,7 @@ async def whitelist_command(
         dm_status = "DM sent successfully."
     except Exception:
         dm_status = "Could not send DM (user DMs closed)."
-    await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}` ({when})! ({dm_status})\n\n{_quota_status(interaction.user.id)}", ephemeral=True)
+    await interaction.response.send_message(f"✅ {user.mention} has been whitelisted for `{script}` ({when})! ({dm_status})\n\n{_quota_status(interaction.user.id, interaction.guild_id)}", ephemeral=True)
 
 
 # Removed duplicate whitelist alias `/whilst`; `/whitelist` is the canonical command.
@@ -3621,10 +3642,10 @@ async def trail_command(
     if not is_admin_or_has_role(interaction, script):
         await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to manage Trail.", ephemeral=True)
         return
-    s_info = _get_guild_script(script, interaction.guild_id)
-    if s_info is None:
-        await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
         return
+    s_info = scripts_data[script]
     if state.value == "OFF":
         s_info["trail_enabled"] = False
         s_info["trail_mode"] = "PERM"
@@ -3729,7 +3750,6 @@ async def create_script_command(
         "whitelisted_users": set(),
         "user_keys": {},
         "created_by": str(interaction.user.id),
-        "guild_id": str(interaction.guild_id) if interaction.guild_id else None,
         "api_key": api_key,
         "supabase_user_id": (imported or {}).get("_supabase_user_id"),
         "supabase_row_id": (imported or {}).get("_supabase_row_id"),
@@ -3768,7 +3788,7 @@ async def create_script_command(
             f"📜 **Script Name:** `{name_script}`\n"
             f"👤 **Buyer Role:** {f'<@&{buyer_role_id}>' if buyer_role_id else 'Not configured'}\n"
             f"🛡️ **Admin Role:** {f'<@&{admin_role_id}>' if admin_role_id else 'Not configured'}\n"
-            f"🔗 **Source:** {'Imported from API' if imported else 'Created manually'}\n\n{_quota_status(interaction.user.id)}"
+            f"🔗 **Source:** {'Imported from API' if imported else 'Created manually'}\n\n{_quota_status(interaction.user.id, interaction.guild_id)}"
         ),
         color=0x00ff00
     )
@@ -3788,8 +3808,8 @@ async def delete_script_command(interaction: discord.Interaction, script: str):
         _, admin_error = _global_admin_status(interaction)
         await interaction.response.send_message(admin_error or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
         return
-    if _get_guild_script(script, interaction.guild_id) is None:
-        await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
+    if script not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
         return
 
     deleted_info = scripts_data.get(script, {})
@@ -4116,15 +4136,13 @@ async def hwid_command(interaction: discord.Interaction, script: Optional[str] =
         return
 
     target_name = str(script or "").strip()
-    if target_name and _get_guild_script(target_name, interaction.guild_id) is None:
-        await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
+    if target_name and target_name not in scripts_data:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
         return
 
     removed = 0
     touched_scripts = []
     for name, info in scripts_data.items():
-        if not _script_belongs_to_guild(info, interaction.guild_id):
-            continue
         if target_name and name != target_name:
             continue
         meta = info.get("key_meta") if isinstance(info.get("key_meta"), dict) else {}
@@ -4336,7 +4354,7 @@ async def avatar_bot_command(
     _quota_increment(interaction.user.id, "avatars")
     await interaction.response.send_message(
         "✅ Crystal Hub: " + ", ".join(changes) +
-        f".\nThe avatar and bio changes apply to this server only.\n{_quota_status(interaction.user.id)}",
+        f".\nThe avatar and bio changes apply to this server only.\n{_quota_status(interaction.user.id, interaction.guild_id)}",
         ephemeral=True,
     )
 
@@ -4371,6 +4389,7 @@ async def panel_setup_command(
         await interaction.response.send_message("❌ Selected script does not exist.", ephemeral=True)
         return
 
+    await _remove_missing_guild_panels(interaction.guild_id)
     instances = s_info.get("panel_instances")
     if not isinstance(instances, list):
         instances = []
@@ -4389,7 +4408,9 @@ async def panel_setup_command(
                      if str(p.get("guild_id")) == str(interaction.guild_id)
                      and str(p.get("channel_id")) == str(target_channel.id)), None)
     if matching is None:
-        quota_ok, quota_error = _quota_check(interaction.user.id, "panels")
+        quota_ok, quota_error = _quota_check(
+            interaction.user.id, "panels", guild_id=interaction.guild_id
+        )
         if not quota_ok:
             await interaction.response.send_message("❌ " + quota_error, ephemeral=True)
             return
@@ -4439,7 +4460,7 @@ async def panel_setup_command(
     save_data()
 
     await interaction.response.send_message(
-        f"✅ Panel ready in {target_channel.mention}. This panel is saved and will be refreshed after the bot restarts/updates.\n\n{_quota_status(interaction.user.id)}",
+        f"✅ Panel ready in {target_channel.mention}. This panel is saved and will be refreshed after the bot restarts/updates.\n\n{_quota_status(interaction.user.id, interaction.guild_id)}",
         ephemeral=True
     )
 
@@ -4493,7 +4514,7 @@ async def panel_delete_command(
         s_info["panel_description"] = latest.get("description", "")
         s_info["panel_created_by"] = latest.get("created_by")
     save_data()
-    await interaction.response.send_message(f"✅ Panel deleted from the saved inventory. Its quota slot is now free.\n\n{_quota_status(interaction.user.id)}", ephemeral=True)
+    await interaction.response.send_message(f"✅ Panel deleted from the saved inventory. Its quota slot is now free.\n\n{_quota_status(interaction.user.id, interaction.guild_id)}", ephemeral=True)
 
 
 # 8. تحديث السكربت
@@ -4890,7 +4911,7 @@ async def redeem_command(
 
     await interaction.response.send_message(
         f"✅ Crystal Hub **{plan}** activated — {'Lifetime' if days <= 0 else str(days) + ' days'}.\n"
-        f"{_quota_status(interaction.user.id)}",
+        f"{_quota_status(interaction.user.id, interaction.guild_id)}",
         ephemeral=True
     )
 
@@ -5223,7 +5244,7 @@ def _crystal_ai_context():
             "Premium": {"price": "$1 USD", "duration": "lifetime", "active_scripts": 10, "active_panels": 10, "source_operations_per_month": 100, "active_keys_or_whitelist_slots": 500, "avatar_changes_per_month": 5},
             "Ultra": {"price": "$2 USD", "duration": "lifetime", "limits": "unlimited according to the current bot quota logic"}
         },
-        "configured_scripts": [],
+        "configured_scripts": scripts,
         "purchase_instructions": "Join https://discord.gg/DsQ2sQkBW3, go to the Buy channel, and open a ticket to purchase. Staff can confirm current prices and availability.",
         "server_invite": CRYSTAL_DISCORD_INVITE,
     }
