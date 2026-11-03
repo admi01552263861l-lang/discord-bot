@@ -1140,6 +1140,8 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
         if row_id:
             updated = _supabase_rest("crystal_scripts", {"id": "eq." + str(row_id)}, "PATCH", row, "return=representation")
             if updated:
+                info["supabase_row_id"] = updated[0].get("id") if isinstance(updated[0], dict) else row_id
+                print(f"Crystal script persisted to Supabase: {script_name} row={info.get('supabase_row_id')}")
                 return True
         api_key = str(row.get("api_key") or "").strip()
         existing = _supabase_rest("crystal_scripts", {
@@ -1149,11 +1151,14 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
             updated = _supabase_rest("crystal_scripts", {"id": "eq." + str(existing[0]["id"])}, "PATCH", row, "return=representation")
             if updated:
                 info["supabase_row_id"] = updated[0].get("id")
+                print(f"Crystal script persisted to Supabase: {script_name} row={info.get('supabase_row_id')}")
                 return True
         inserted = _supabase_rest("crystal_scripts", {}, "POST", row, "return=representation")
         if inserted:
             info["supabase_row_id"] = inserted[0].get("id")
-        return bool(inserted)
+            print(f"Crystal script persisted to Supabase: {script_name} row={info.get('supabase_row_id')}")
+            return True
+        return False
     except Exception as exc:
         print(f"Crystal sync to Supabase failed for {script_name}: {type(exc).__name__}: {exc}")
         return False
@@ -2771,13 +2776,9 @@ def is_guild_administrator(interaction: discord.Interaction) -> bool:
 
 
 def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = None) -> bool:
-    """Discord-side management access; no Account API link is required."""
+    """Bot Admins/server admins, plus the owner of the selected script."""
     user_id = getattr(interaction.user, "id", 0)
-    if (is_bot_owner(user_id)
-        or _discord_plan(user_id) == "Admin"
-        or _has_global_admin_access(interaction)
-        or has_admin_editor_role(interaction)
-        or is_guild_administrator(interaction)):
+    if is_bot_owner(user_id) or _discord_plan(user_id) == "Admin" or _has_global_admin_access(interaction):
         return True
     if script_name and script_name in scripts_data:
         owner_id = scripts_data[script_name].get("created_by")
@@ -2814,6 +2815,22 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
         "list-servers", "send-server-message",
     }
     if command_name in management_commands:
+        # /whitelist is strictly server-wide: configured Admin role OR Discord
+        # Administrator. It must never require Dashboard/API linking, Admin redeem,
+        # script ownership, or a per-script admin role.
+        if command_name == "whitelist":
+            allowed, message = _global_admin_status(interaction)
+            if not allowed:
+                try:
+                    await interaction.response.send_message(
+                        message or "❌ You need the server-wide Admin role or Discord Administrator permission.",
+                        ephemeral=True,
+                    )
+                except discord.HTTPException:
+                    pass
+                return False
+            return True
+
         is_admin_tier = _discord_plan(interaction.user.id) == "Admin"
         # /generate-key is intentionally available on every plan, but still requires
         # the configured Admin role or Discord Administrator permission.
@@ -3413,11 +3430,9 @@ async def on_ready():
     # Discord guild copies are intentionally NOT created.
     await _sync_global_commands()
     print(f"Bot connected successfully as: {bot.user}")
-    restored = await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
-    print(f"Crystal durable startup restore: {restored} script(s).")
+    await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
     # Backfill older local scripts into Supabase immediately on first startup.
-    pushed = await asyncio.to_thread(_push_all_local_scripts_to_supabase)
-    print(f"Crystal durable startup persist: {pushed} script(s).")
+    await asyncio.to_thread(_push_all_local_scripts_to_supabase)
     if not getattr(bot, "_crystal_dashboard_sync_started", False):
         bot._crystal_dashboard_sync_started = True
         asyncio.create_task(_crystal_dashboard_sync_loop())
@@ -3486,8 +3501,12 @@ async def whitelist_command(
     duration_type: app_commands.Choice[str] = None,
     duration: str = None,
 ):
-    if not is_admin_or_has_role(interaction, script):
-        await interaction.response.send_message("❌ You need the **Admin Editor** role (or script admin role) to whitelist users.", ephemeral=True)
+    allowed, permission_error = _global_admin_status(interaction)
+    if not allowed:
+        await interaction.response.send_message(
+            permission_error or "❌ You need the server-wide Admin role or Discord Administrator permission.",
+            ephemeral=True,
+        )
         return
     if script not in scripts_data:
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
@@ -3506,11 +3525,22 @@ async def whitelist_command(
     new_key = generate_random_key()
     grant_user_access(s_info, user.id, new_key, mode, expires_at, created_by=interaction.user.id)
     save_data()
-    persisted = await asyncio.to_thread(
-        _sync_script_to_supabase, script, s_info, str(interaction.user.id), str(interaction.user), interaction.guild_id
+    persisted = _sync_script_to_supabase(
+        script, s_info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild.id
     )
     if not persisted:
-        print(f"Crystal whitelist persistence warning: {script}")
+        # Roll back the in-memory grant if the durable write failed.
+        s_info.get("whitelisted_users", set()).discard(user.id)
+        s_info.get("user_keys", {}).pop(user.id, None)
+        s_info.get("user_access", {}).pop(user.id, None)
+        s_info.get("valid_keys", set()).discard(new_key)
+        s_info.get("key_meta", {}).pop(new_key, None)
+        save_data()
+        await interaction.response.send_message(
+            "❌ Whitelist was not saved because Supabase persistence failed. Check the Render logs.",
+            ephemeral=True,
+        )
+        return
     _quota_increment(interaction.user.id, "keys")
     if s_info.get("buyer_role_id"):
         role = interaction.guild.get_role(s_info["buyer_role_id"])
@@ -3686,20 +3716,15 @@ async def create_script_command(
         )
         return
 
-    persisted = await asyncio.to_thread(
-        _sync_script_to_supabase,
-        name_script,
-        scripts_data[name_script],
-        str(interaction.user.id),
-        str(interaction.user),
-        interaction.guild.id if interaction.guild else None,
+    persisted = _sync_script_to_supabase(
+        name_script, scripts_data[name_script], str(interaction.user.id),
+        str(interaction.user), interaction.guild.id if interaction.guild else None
     )
     if not persisted:
         scripts_data.pop(name_script, None)
         save_data()
         await interaction.response.send_message(
-            "❌ Script was not created because the durable Supabase save failed. "
-            "Check Render `SUPA_PRIVATE` and the `crystal_scripts` schema.",
+            "❌ Script was not created because Supabase persistence failed. Check the Render logs for the exact Supabase error.",
             ephemeral=True,
         )
         return
@@ -5462,7 +5487,7 @@ class ExplainVideosView(BlacklistAwareView):
         )
 
 class ExplainHomeView(BlacklistAwareView):
-    """Persistent public bilingual /explain menu."""
+    """Public bilingual /explain menu. Every screen includes its own language toggle."""
     def __init__(self, language="en"):
         super().__init__(timeout=None)
         self.language = language
