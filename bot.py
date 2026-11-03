@@ -362,14 +362,17 @@ def _active_owned_script_count(user_id):
 
 
 def _script_in_guild(info, guild_id):
-    """Return True when a script belongs to the requested Discord guild.
-    Legacy scripts without a guild_id remain visible for backward compatibility.
+    """Return True only when the script is explicitly bound to this Discord guild.
+
+    Unbound legacy records are intentionally hidden from guild-scoped commands so
+    scripts from another server can never leak into the current server. The
+    Supabase restore path below migrates guild_id from bot_data when needed.
     """
     if guild_id is None:
-        return True
+        return False
     stored = info.get("guild_id")
     if stored in (None, "", 0, "0"):
-        return True
+        return False
     return str(stored) == str(guild_id)
 
 def _script_for_guild(script_name, guild_id):
@@ -1316,6 +1319,9 @@ def _sync_dashboard_scripts_from_supabase():
             if not user_access and isinstance(bot_data.get("user_access"), dict) is False:
                 user_access = info.get("user_access", {})
 
+            # Guild binding is server-local. Older rows may have stored it only
+            # inside bot_data, so restore that value before exposing the script.
+            restored_guild_id = row.get("guild_id") or bot_data.get("guild_id")
             info.update({
                 "version": bot_data.get("version", "1.0.0"),
                 "source_code": row.get("source_code") or row.get("script") or "-- Default Script",
@@ -1352,7 +1358,7 @@ def _sync_dashboard_scripts_from_supabase():
                 "source_name": row.get("source_name"),
                 "source_path": row.get("source_path"),
                 "source_obfuscated": bool(bot_data.get("source_obfuscated", info.get("source_obfuscated", False))),
-                "guild_id": row.get("guild_id"),
+                "guild_id": restored_guild_id,
                 "discord_user_id": owner,
                 "discord_username": row.get("discord_username"),
             })
@@ -3854,15 +3860,23 @@ async def create_script_command(
 @app_commands.describe(script="Script to delete")
 @app_commands.autocomplete(script=script_autocomplete)
 async def delete_script_command(interaction: discord.Interaction, script: str):
-    if not is_admin_or_has_role(interaction, script):
-        _, admin_error = _global_admin_status(interaction)
-        await interaction.response.send_message(admin_error or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
-        return
-    if script not in scripts_data:
-        await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+    # /delete-script is strictly a server-admin action: either Discord
+    # Administrator or this server's configured Admin Role. Script owners and
+    # per-script roles do not bypass this requirement.
+    allowed, admin_error = _global_admin_status(interaction)
+    if not allowed:
+        await interaction.response.send_message(
+            admin_error or "❌ You need the configured admin role or Discord Administrator permission.",
+            ephemeral=True,
+        )
         return
 
-    deleted_info = scripts_data.get(script, {})
+    s_info = _script_for_guild(script, interaction.guild_id)
+    if s_info is None:
+        await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
+        return
+
+    deleted_info = s_info
     row_id = deleted_info.get("supabase_row_id")
     api_key = str(deleted_info.get("api_key") or "").strip()
     del scripts_data[script]
