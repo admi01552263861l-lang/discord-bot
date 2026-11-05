@@ -584,14 +584,29 @@ def _verify_supabase_access_token(access_token):
             discord_identity = next((item for item in identities if isinstance(item, dict) and str(item.get("provider", "")).lower() == "discord"), {})
             identity_data = discord_identity.get("identity_data") if isinstance(discord_identity.get("identity_data"), dict) else {}
             # Discord OAuth's stable user ID is provider_id/sub, never a browser-supplied ID.
-            discord_id = (identity_data.get("provider_id") or identity_data.get("sub") or
-                          metadata.get("provider_id") or metadata.get("sub") or "")
-            username = (metadata.get("global_name") or metadata.get("name") or metadata.get("full_name") or
+            app_metadata = user.get("app_metadata") if isinstance(user.get("app_metadata"), dict) else {}
+            provider_data = app_metadata.get("provider_data") if isinstance(app_metadata.get("provider_data"), dict) else {}
+            discord_id = (identity_data.get("provider_id") or identity_data.get("sub") or identity_data.get("id") or identity_data.get("user_id") or
+                          metadata.get("provider_id") or metadata.get("sub") or metadata.get("id") or metadata.get("user_id") or
+                          provider_data.get("provider_id") or provider_data.get("sub") or provider_data.get("id") or "")
+            username = (metadata.get("global_name") or metadata.get("username") or metadata.get("name") or metadata.get("full_name") or
                         metadata.get("user_name") or metadata.get("preferred_username") or
-                        identity_data.get("global_name") or identity_data.get("name") or
-                        identity_data.get("username") or "")
-            avatar = (metadata.get("avatar_url") or metadata.get("picture") or metadata.get("avatar") or
-                      identity_data.get("avatar_url") or identity_data.get("picture") or "")
+                        identity_data.get("global_name") or identity_data.get("username") or identity_data.get("user_name") or
+                        identity_data.get("name") or identity_data.get("full_name") or provider_data.get("username") or "")
+            avatar = (metadata.get("avatar_url") or metadata.get("avatarUrl") or metadata.get("picture") or metadata.get("avatar") or
+                      identity_data.get("avatar_url") or identity_data.get("avatarUrl") or identity_data.get("picture") or
+                      provider_data.get("avatar_url") or provider_data.get("picture") or "")
+            avatar_hash = metadata.get("avatar") or identity_data.get("avatar") or provider_data.get("avatar") or ""
+            if not avatar and str(discord_id).isdigit() and avatar_hash:
+                avatar = f"https://cdn.discordapp.com/avatars/{discord_id}/{avatar_hash}.png?size=128"
+            if not avatar and str(discord_id).isdigit():
+                try: avatar = f"https://cdn.discordapp.com/embed/avatars/{int(str(discord_id)[-6:]) % 6}.png"
+                except Exception: pass
+            if not str(discord_id).isdigit():
+                # Log only field names and booleans; never log access tokens or profile values.
+                print("Supabase Discord identity incomplete:", {"providers": [str(x.get("provider", "")) for x in identities if isinstance(x, dict)],
+                      "metadata_keys": sorted(str(k) for k in metadata.keys()), "identity_keys": sorted(str(k) for k in identity_data.keys()),
+                      "has_discord_provider": bool(discord_identity)})
             return {"id": str(user["id"]), "email": str(user.get("email", ""))[:254],
                     "discord_user_id": str(discord_id)[:32], "discord_username": str(username)[:100],
                     "avatar_url": str(avatar)[:2000], "user_metadata": metadata}
@@ -1659,12 +1674,26 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             return guild
         return None
 
+    def _dashboard_profile(self):
+        """Return the Discord profile derived from the verified Supabase session."""
+        account = self._dashboard_account()
+        if not account:
+            self._send_json(401, {"ok": False, "error": "Your login session could not be verified. Sign in again."}); return
+        discord_id = str(account.get("discord_user_id") or "").strip()
+        self._send_json(200, {"ok": True, "linked": discord_id.isdigit(), "profile": {
+            "discord_user_id": discord_id,
+            "username": str(account.get("discord_username") or account.get("username") or "Discord User"),
+            "avatar_url": str(account.get("avatar_url") or ""),
+            "supabase_user_id": str(account.get("supabase_user_id") or "")
+        }})
+
     def _dashboard_bot_guilds(self):
         account = self._dashboard_account()
         if not account:
             self._send_json(401, {"ok": False, "error": "Valid Account API key required."}); return
         discord_id = str(account.get('discord_user_id') or '').strip()
         if not discord_id.isdigit():
+            print("Dashboard guild lookup blocked: verified session has no numeric Discord identity")
             self._send_json(409, {"ok": False, "linked": False, "guilds": [], "error": "Your Supabase session is not linked to a Discord identity. Sign in with Discord again."}); return
         if not bot.is_ready():
             self._send_json(503, {"ok": False, "error": "Discord bot is not ready."}); return
@@ -2015,6 +2044,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 self._send_json(401, {"error": "Valid Account API key required."}); return
             discord_id = str(account.get('discord_user_id') or '').strip()
             if not discord_id.isdigit():
+                print("Dashboard script sync blocked: verified session has no numeric Discord identity")
                 self._send_json(409, {"error": "Your Supabase session is not linked to a Discord identity. Sign in with Discord again."}); return
             data = body.get("script") if isinstance(body.get("script"), dict) else body
             guild_id = str(data.get('guild_id') or data.get('guildId') or '').strip()
@@ -2499,6 +2529,9 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             return
         if parsed_path.path == '/api/dashboard-scripts':
             self._dashboard_scripts_list()
+            return
+        if parsed_path.path == '/api/dashboard-profile':
+            self._dashboard_profile()
             return
         if parsed_path.path == '/api/account-api':
             self._account_api_http()
