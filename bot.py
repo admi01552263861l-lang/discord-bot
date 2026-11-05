@@ -25,7 +25,7 @@ from discord import app_commands
 from discord.http import Route
 from discord.ext import commands, tasks
 
-BUILD_TAG = "CrystalHub-2026-10-30-ACCOUNT-LOGIN-API-V2"
+BUILD_TAG = "CrystalHub-2026-11-05-SUPABASE-AUTO-LINK-PERMANENT-DELETE-V1"
 
 # Render keeps only files under a mounted persistent disk. Set
 # CRYSTAL_HUB_DATA_DIR=/var/data on Render after attaching that disk.
@@ -1301,6 +1301,8 @@ def _sync_dashboard_scripts_from_supabase():
             "select": "id,user_id,name,api_key,source_code,script,discord_user_id,discord_username,guild_id,bot_data,fast_mode,obfuscator,ultra_safe,loader_code,access_mode,disabled,webhook_url,settings,key_meta,source_name,source_path"
         })
         count = 0
+        active_supabase_ids = {str(row.get("id")) for row in rows if row.get("id") is not None}
+        active_script_keys = {str(row.get("api_key") or "") for row in rows if row.get("api_key")}
         for row in rows:
             bot_data = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
             owner = str(row.get("discord_user_id") or bot_data.get("created_by") or user_map.get(str(row.get("user_id")), ""))
@@ -1388,9 +1390,21 @@ def _sync_dashboard_scripts_from_supabase():
             scripts_data[name] = info
             count += 1
 
-        if count:
+        # Supabase is authoritative: stale local snapshots of rows deleted from Supabase
+        # must not resurrect old scripts or their panels after a redeploy.
+        pruned = 0
+        for local_name, local_info in list(scripts_data.items()):
+            local_row_id = str(local_info.get("supabase_row_id") or "")
+            local_key = str(local_info.get("api_key") or "")
+            if local_row_id and local_row_id not in active_supabase_ids:
+                scripts_data.pop(local_name, None)
+                pruned += 1
+            elif local_key and local_row_id and local_key not in active_script_keys:
+                scripts_data.pop(local_name, None)
+                pruned += 1
+        if count or pruned:
             save_data()
-        print(f"Crystal durable sync: restored {count} script(s) from Supabase.")
+        print(f"Crystal durable sync: restored {count} script(s); pruned {pruned} deleted local snapshot(s).")
         return count
     except Exception as exc:
         print(f"Crystal sync from Supabase failed: {type(exc).__name__}: {exc}")
@@ -1485,6 +1499,7 @@ def _crystal_account_public(row: dict) -> dict:
         "guestId": str(row.get("guest_id") or ""),
         "discordId": str(row.get("discord_user_id") or ""),
         "discordUsername": str(row.get("discord_username") or ""),
+        "globalName": str(row.get("discord_username") or ""),
         "username": str(row.get("website_username") or ""),
         "avatarUrl": str(row.get("avatar_url") or ""),
         "apiKey": str(row.get("api_key") or ""),
@@ -1501,7 +1516,24 @@ def _crystal_account_by_key(api_key: str):
     rows = _supabase_rest("crystal_accounts", {
         "select": "*", "api_key": "eq." + urllib.parse.quote(key, safe=""), "limit": "1"
     })
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    row = rows[0]
+    # Repair missing/stale profile snapshots from the Discord cache without adding
+    # new Supabase columns or exposing bot credentials to the browser.
+    did = str(row.get("discord_user_id") or "")
+    try:
+        discord_user = bot.get_user(int(did)) if did.isdigit() and bot.is_ready() else None
+        if discord_user:
+            avatar_url = str(discord_user.display_avatar.url)
+            display_name = str(getattr(discord_user, "global_name", None) or getattr(discord_user, "name", None) or discord_user)[:100]
+            patch = {"avatar_url": avatar_url[:2000], "discord_username": display_name}
+            if row.get("avatar_url") != patch["avatar_url"] or row.get("discord_username") != display_name:
+                _supabase_rest("crystal_accounts", {"guest_id": "eq." + urllib.parse.quote(str(row.get("guest_id") or ""), safe="")}, "PATCH", patch, "return=minimal")
+                row.update(patch)
+    except Exception as profile_exc:
+        print(f"Dashboard Discord profile repair warning: {type(profile_exc).__name__}: {profile_exc}")
+    return row
 
 
 def _crystal_account_create(discord_user, website_username: str) -> dict:
@@ -1517,6 +1549,21 @@ def _crystal_account_create(discord_user, website_username: str) -> dict:
     # A Discord identity can own only one site account. Do not silently replace its API key.
     if existing:
         row = existing[0]
+        # Refresh the Discord profile snapshot on each account creation/login attempt.
+        try:
+            fresh_avatar = str(discord_user.display_avatar.url)
+        except Exception:
+            fresh_avatar = str(row.get("avatar_url") or "")
+        fresh_name = str(getattr(discord_user, "global_name", None) or getattr(discord_user, "name", None) or str(discord_user))[:100]
+        profile_patch = {
+            "discord_username": fresh_name,
+            "avatar_url": fresh_avatar[:2000],
+        }
+        try:
+            _supabase_rest("crystal_accounts", {"guest_id": "eq." + urllib.parse.quote(str(row.get("guest_id") or ""), safe="")}, "PATCH", profile_patch, "return=minimal")
+            row.update(profile_patch)
+        except Exception as profile_exc:
+            print(f"Discord profile refresh warning: {type(profile_exc).__name__}: {profile_exc}")
         if str(row.get("website_username") or "").lower() != uname.lower():
             taken = _supabase_rest("crystal_accounts", {
                 "select": "guest_id", "website_username": "eq." + urllib.parse.quote(uname, safe=""), "limit": "1"
@@ -1543,7 +1590,7 @@ def _crystal_account_create(discord_user, website_username: str) -> dict:
     row = {
         "guest_id": guest_id,
         "discord_user_id": did,
-        "discord_username": str(discord_user)[:100],
+        "discord_username": str(getattr(discord_user, "global_name", None) or getattr(discord_user, "name", None) or str(discord_user))[:100],
         "website_username": uname,
         "avatar_url": avatar[:2000],
         "api_key": api_key,
@@ -1620,7 +1667,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"ok": False, "error": "Valid Account API key required."}); return
         discord_id = str(account.get('discord_user_id') or '').strip()
         if not discord_id.isdigit():
-            self._send_json(409, {"ok": False, "linked": False, "guilds": [], "error": "Link your Account API to Discord using /api in the bot first."}); return
+            self._send_json(409, {"ok": False, "linked": False, "guilds": [], "error": "This Discord account is not connected to a Crystal account yet. Create your site account with the same Discord ID."}); return
         if not bot.is_ready():
             self._send_json(503, {"ok": False, "error": "Discord bot is not ready."}); return
         guilds = []
@@ -1678,12 +1725,21 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             if not same_owner:
                 self._send_json(403, {"ok": False, "error": "This script does not belong to this Account API."}); return
             if action == 'delete':
+                # Delete the Supabase row first and verify it is gone.
                 _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'DELETE', None, 'return=minimal')
+                remaining = _supabase_rest('crystal_scripts', {'select':'id', 'id':'eq.' + urllib.parse.quote(sid, safe='')})
+                if remaining:
+                    raise RuntimeError('Supabase did not confirm permanent deletion.')
                 for name, info in list(scripts_data.items()):
                     if str(info.get('supabase_row_id') or '') == sid:
+                        # Remove the matching Discord panel messages on the bot loop.
+                        if bot.is_ready():
+                            future = asyncio.run_coroutine_threadsafe(_delete_script_panel_messages(dict(info)), bot.loop)
+                            try: future.result(timeout=10)
+                            except Exception as panel_exc: print(f'Dashboard delete panel cleanup warning: {type(panel_exc).__name__}')
                         scripts_data.pop(name, None)
                 save_data()
-                self._send_json(200, {"ok": True, "deleted": True}); return
+                self._send_json(200, {"ok": True, "deleted": True, "permanent": True}); return
             disabled = bool(body.get('disabled'))
             _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', {'disabled': disabled, 'updated_at': _iso_now()}, 'return=minimal')
             for info in scripts_data.values():
@@ -1970,7 +2026,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 self._send_json(401, {"error": "Valid Account API key required."}); return
             discord_id = str(account.get('discord_user_id') or '').strip()
             if not discord_id.isdigit():
-                self._send_json(409, {"error": "Link your Account API to Discord with /api before managing scripts."}); return
+                self._send_json(409, {"error": "Create/sign in to the Dashboard with the same Discord ID used in this server."}); return
             data = body.get("script") if isinstance(body.get("script"), dict) else body
             guild_id = str(data.get('guild_id') or data.get('guildId') or '').strip()
             guild = self._dashboard_can_manage_guild(account, guild_id) if guild_id else None
@@ -3095,9 +3151,8 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
             pass
         return False
 
-    # Gate bot-management slash commands with the server-wide role. Keep user-facing
-    # commands (/api, /hwid, /redeem) available to everyone; quota checks remain in place.
-    # / has been permanently removed — use /api to link Dashboard account.
+    # Gate management commands. Dashboard accounts are matched automatically by Discord ID in Supabase;
+    # the /api slash command is intentionally removed.
     command_name = getattr(getattr(interaction, "command", None), "name", "")
     management_commands = {
         "generate-key", "whitelist", "see-keys", "delete-key", "hwid",
@@ -3110,12 +3165,12 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
         # /whitelist is strictly server-wide: configured Admin role OR Discord
         # Administrator. It must never require Dashboard/API linking, Admin redeem,
         # script ownership, or a per-script admin role.
-        if command_name == "whitelist":
+        if command_name in ("whitelist", "delete-script"):
             allowed, message = _global_admin_status(interaction)
             if not allowed:
                 try:
                     await interaction.response.send_message(
-                        message or "❌ You need the server-wide Admin role or Discord Administrator permission.",
+                        message or "❌ You need the configured Admin role or Discord Administrator permission.",
                         ephemeral=True,
                     )
                 except discord.HTTPException:
@@ -4045,20 +4100,79 @@ async def create_script_command(
     )
 
 
-# Delete a script and disable its hosted route.
-@bot.tree.command(name="delete-script", description="Permanently delete a script entry and disable its URL")
+# Delete every Discord panel message attached to a script before removing its state.
+async def _delete_script_panel_messages(info: dict):
+    if not isinstance(info, dict) or not bot.is_ready():
+        return
+    panels = list(info.get("panel_instances") or [])
+    legacy = {
+        "guild_id": info.get("panel_guild_id"),
+        "channel_id": info.get("panel_channel_id"),
+        "message_id": info.get("panel_message_id"),
+    }
+    if legacy.get("channel_id") and legacy.get("message_id"):
+        panels.append(legacy)
+    seen = set()
+    for panel in panels:
+        try:
+            channel_id = int(panel.get("channel_id") or 0)
+            message_id = int(panel.get("message_id") or 0)
+            if not channel_id or not message_id or (channel_id, message_id) in seen:
+                continue
+            seen.add((channel_id, message_id))
+            channel = bot.get_channel(channel_id)
+            if channel is None:
+                channel = await bot.fetch_channel(channel_id)
+            message = await channel.fetch_message(message_id)
+            await message.delete()
+        except discord.NotFound:
+            continue
+        except (discord.Forbidden, discord.HTTPException, ValueError, TypeError) as exc:
+            print(f"Could not remove deleted script panel: {type(exc).__name__}: {exc}")
+
+
+def _delete_script_rows_permanently(info: dict, script_name: str, guild_id=None):
+    """Delete matching Supabase rows and verify they are gone before local deletion."""
+    row_id = str(info.get("supabase_row_id") or "").strip()
+    api_key = str(info.get("api_key") or "").strip()
+    discord_id = str(info.get("created_by") or info.get("discord_user_id") or "").strip()
+    targets = []
+    if row_id:
+        targets = _supabase_rest("crystal_scripts", {"select": "id", "id": "eq." + urllib.parse.quote(row_id, safe="")})
+    elif api_key:
+        targets = _supabase_rest("crystal_scripts", {"select": "id", "api_key": "eq." + urllib.parse.quote(api_key, safe="")})
+    else:
+        q = {"select": "id", "name": "eq." + urllib.parse.quote(script_name, safe=""), "limit": "100"}
+        if guild_id:
+            q["guild_id"] = "eq." + str(guild_id)
+        if discord_id.isdigit():
+            q["discord_user_id"] = "eq." + discord_id
+        targets = _supabase_rest("crystal_scripts", q)
+
+    ids = [str(x.get("id")) for x in targets if x.get("id") is not None]
+    for rid in ids:
+        _supabase_rest("crystal_scripts", {"id": "eq." + urllib.parse.quote(rid, safe="")}, "DELETE", None, "return=minimal")
+    if api_key:
+        _supabase_rest("crystal_scripts", {"api_key": "eq." + urllib.parse.quote(api_key, safe="")}, "DELETE", None, "return=minimal")
+    # Verify both identifiers. A failed delete must never be reported as successful.
+    remaining = []
+    if row_id:
+        remaining += _supabase_rest("crystal_scripts", {"select": "id", "id": "eq." + urllib.parse.quote(row_id, safe="")})
+    if api_key:
+        remaining += _supabase_rest("crystal_scripts", {"select": "id", "api_key": "eq." + urllib.parse.quote(api_key, safe="")})
+    if remaining:
+        raise RuntimeError("Supabase still contains a row for this script; deletion was not confirmed.")
+    return ids
+
+
+# Delete a script permanently. Only Discord Administrator or configured Admin Role is required.
+@bot.tree.command(name="delete-script", description="Permanently delete a script and its panels")
 @app_commands.describe(script="Script to delete")
 @app_commands.autocomplete(script=script_autocomplete)
 async def delete_script_command(interaction: discord.Interaction, script: str):
-    # /delete-script is strictly a server-admin action: either Discord
-    # Administrator or this server's configured Admin Role. Script owners and
-    # per-script roles do not bypass this requirement.
     allowed, admin_error = _global_admin_status(interaction)
     if not allowed:
-        await interaction.response.send_message(
-            admin_error or "❌ You need the configured admin role or Discord Administrator permission.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(admin_error or "❌ Admin role or Discord Administrator permission required.", ephemeral=True)
         return
 
     s_info = _script_for_guild(script, interaction.guild_id)
@@ -4066,22 +4180,22 @@ async def delete_script_command(interaction: discord.Interaction, script: str):
         await interaction.response.send_message("❌ Script not found in this server.", ephemeral=True)
         return
 
-    deleted_info = s_info
-    row_id = deleted_info.get("supabase_row_id")
-    api_key = str(deleted_info.get("api_key") or "").strip()
-    del scripts_data[script]
-    save_data()
+    await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        if row_id:
-            _supabase_rest("crystal_scripts", {"id": "eq." + str(row_id)}, "DELETE", None, "return=minimal")
-        elif api_key:
-            _supabase_rest("crystal_scripts", {"api_key": "eq." + urllib.parse.quote(api_key, safe="")}, "DELETE", None, "return=minimal")
+        await _delete_script_panel_messages(s_info)
+        await asyncio.to_thread(_delete_script_rows_permanently, dict(s_info), script, interaction.guild_id)
+        scripts_data.pop(script, None)
+        save_data()
+        await interaction.followup.send(
+            f"🗑️ Permanently deleted `{script}` from Supabase and the bot. Its saved panels and old runtime entry were removed.",
+            ephemeral=True
+        )
     except Exception as exc:
-        print(f"Crystal Supabase delete warning for {script}: {type(exc).__name__}: {exc}")
-    await interaction.response.send_message(
-        f"🗑️ Deleted `{script}` from the bot database. Its `/script/{urllib.parse.quote(script)}` route now returns 404.",
-        ephemeral=True
-    )
+        print(f"Permanent script delete failed for {script}: {type(exc).__name__}: {exc}")
+        await interaction.followup.send(
+            "❌ I could not confirm permanent deletion in Supabase, so I kept the local script data to prevent it from becoming inconsistent. Check the Render logs and Supabase permissions.",
+            ephemeral=True
+        )
 
 
 # 4. ربط السورس
@@ -4309,69 +4423,7 @@ async def set_admin_role_command(interaction: discord.Interaction, admin_role: d
     )
 
 
-# API account linking — connects a Dashboard API key to this Discord account.
-@bot.tree.command(name="api", description="Link your Discord account to your Crystal Hub Account API")
-@app_commands.describe(
-    acc="Your standalone Crystal Hub Account API key from Dashboard Settings (CA-...)",
-    unlink="Unlink this Discord account from the Account API"
-)
-async def api_account_command(interaction: discord.Interaction, acc: Optional[str] = None, unlink: bool = False):
-    acc = str(acc or '').strip()
-    if not acc:
-        try:
-            rows = await asyncio.to_thread(_supabase_rest, 'crystal_accounts', {
-                'select': 'api_key,website_username,discord_user_id',
-                'discord_user_id': 'eq.' + str(interaction.user.id), 'limit': '1'
-            })
-            if rows:
-                await interaction.response.send_message(
-                    "🔑 **Your Crystal Hub Account API**\n"
-                    f"Username: `{rows[0].get('website_username', 'Unknown')}`\n"
-                    f"Account API: `{rows[0].get('api_key', '')}`\n"
-                    "Keep this key private. It is different from Script API keys (`CH-...`).",
-                    ephemeral=True)
-                return
-            legacy = await asyncio.to_thread(_account_api_get_by_discord, str(interaction.user.id))
-            if legacy and legacy.get('api_key'):
-                await interaction.response.send_message(
-                    f"🔑 **Your Account API:** `{legacy['api_key']}`\nKeep this key private.", ephemeral=True)
-                return
-            await interaction.response.send_message(
-                "❌ No Crystal Hub website account is linked to this Discord ID yet. Create one on the login page using your Discord ID, then run `/api` again.",
-                ephemeral=True)
-            return
-        except Exception as exc:
-            print(f'/api account lookup error: {type(exc).__name__}: {exc}')
-            await interaction.response.send_message('❌ Could not load your Account API. Check the Supabase connection.', ephemeral=True)
-            return
-    try:
-        if not acc.startswith('CA-'):
-            await interaction.response.send_message(
-                "❌ That is a **Script API key**. `/api` needs the standalone **Account API key** from Dashboard → Settings → Account API.\n"
-                "The Account API key starts with `CA-`.", ephemeral=True)
-            return
-        if unlink:
-            acct = await asyncio.to_thread(_account_api_get_by_discord, str(interaction.user.id))
-            if not acct or str(acct.get('api_key') or '') != acc:
-                await interaction.response.send_message('❌ This Account API key is not linked to your Discord account.', ephemeral=True)
-                return
-            await asyncio.to_thread(_supabase_rest, 'crystal_api_accounts', {'id':'eq.'+str(acct.get('id'))}, 'PATCH', {
-                'discord_user_id':None, 'discord_username':None, 'updated_at':_iso_now()
-            }, 'return=minimal')
-            await interaction.response.send_message('✅ Account API unlinked. Your scripts and Script API keys were not changed.', ephemeral=True)
-            return
-        account = await asyncio.to_thread(_account_api_link, acc, str(interaction.user.id), str(interaction.user))
-        await asyncio.to_thread(_sync_dashboard_scripts_from_supabase)
-        await interaction.response.send_message(
-            "✅ **Account API linked.**\n"
-            "Your Discord account is now connected to the Dashboard account.\n"
-            f"Account API: `{account.get('api_key', acc)}`\n"
-            "Your individual Script API keys (`CH-...`) remain separate.", ephemeral=True)
-    except ValueError as exc:
-        await interaction.response.send_message(f'❌ {exc}', ephemeral=True)
-    except Exception as exc:
-        print(f'/api account link error: {type(exc).__name__}: {exc}')
-        await interaction.response.send_message('❌ Could not link the Account API. Check that the key came from Dashboard → Settings.', ephemeral=True)
+# Dashboard accounts are matched automatically through crystal_accounts.discord_user_id.
 
 @bot.tree.command(name="hwid", description="Reset a user's HWID for one selected script")
 @app_commands.describe(
@@ -5893,16 +5945,16 @@ def build_explain_embed(topic: str, language="en"):
             "ar": ("شرح السكربت", "أنشئ السكربت، اختر اسمه، أضف سورس Lua ثم احفظه. بعد الإنشاء تقدر تدير الوصول والملف أو السورس والمفاتيح ورابط التحميل من مساحة السكربت."),
         },
         "website": {
-            "en": ("Website Tutorial", "Open the Dashboard, create or log in to your Account API, then use Scripts → Create Script. Your scripts and account data are saved to the connected backend."),
-            "ar": ("شرح الموقع", "افتح الداشبورد، أنشئ أو سجّل دخولك باستخدام Account API، ثم ادخل Scripts → Create Script. يتم حفظ السكربتات وبيانات الحساب في النظام المرتبط."),
+            "en": ("Website Tutorial", "Open the Dashboard and sign in with the Discord ID used in your server, then use Scripts → Create Script. Your scripts and account data are saved in Supabase."),
+            "ar": ("شرح الموقع", "افتح الداشبورد وسجّل الدخول باستخدام Discord ID نفسه الموجود في سيرفرك، ثم ادخل Scripts → Create Script. يتم حفظ السكربتات وبيانات الحساب في Supabase."),
         },
         "bot": {
-            "en": ("Bot Tutorial", "Invite Crystal Hub to your server, use the command menus to create and manage scripts, and use /api to link your Discord account to your Dashboard Account API."),
-            "ar": ("شرح البوت", "أضف Crystal Hub إلى سيرفرك، واستخدم قوائم الأوامر لإنشاء وإدارة السكربتات، واستخدم /api لربط ديسكورد بحساب Account API في الداشبورد."),
+            "en": ("Bot Tutorial", "Invite Crystal Hub to your server and use the command menus to create and manage scripts. The Dashboard matches your Discord ID automatically through Supabase."),
+            "ar": ("شرح البوت", "أضف Crystal Hub إلى سيرفرك واستخدم قوائم الأوامر لإنشاء وإدارة السكربتات. الداشبورد يطابق حسابك تلقائياً باستخدام Discord ID عبر Supabase."),
         },
         "commands": {
-            "en": ("Commands", "Main commands include /create-script, /generate-key, /hwid, /api, /trial, /source-setup, /panel-setup, /update-script, /delete-script and /avatar. Use the command's Discord help/options for its exact arguments."),
-            "ar": ("الأوامر", "من أهم الأوامر: /create-script و /generate-key و /hwid و /api و /trial و /source-setup و /panel-setup و /update-script و /delete-script و /avatar. استخدم خيارات الأمر في ديسكورد لمعرفة البيانات المطلوبة."),
+            "en": ("Commands", "Main commands include /create-script, /generate-key, /hwid, /trial, /source-setup, /panel-setup, /update-script, /delete-script and /avatar. Use the command's Discord help/options for its exact arguments."),
+            "ar": ("الأوامر", "من أهم الأوامر: /create-script و /generate-key و /hwid و /trial و /source-setup و /panel-setup و /update-script و /delete-script و /avatar. استخدم خيارات الأمر في ديسكورد لمعرفة البيانات المطلوبة."),
         },
     }
     title, description = pages.get(topic, pages["commands"])[language]
