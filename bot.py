@@ -514,7 +514,7 @@ def _quota_increment(user_id, category):
 def _quota_status(user_id, guild_id=None):
     plan = _discord_plan(user_id)
     if plan in ("Ultra", "Admin"):
-        return "All usage limits bypassed."
+        return f"{plan} plan — scripts: unlimited • panels: unlimited • sources: unlimited • keys/whitelists: unlimited • avatars: unlimited."
     limits = PREMIUM_LIMITS if plan == "Premium" else FREE_LIMITS
     rec = _usage_record(user_id)
     names = {
@@ -1311,7 +1311,7 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
             "discord_username": discord_username or None,
             "guild_id": str(guild_id) if guild_id else info.get("guild_id"),
             "loader_code": info.get("loader_code") or info.get("file_id") or secrets.token_urlsafe(12).replace("-", "").replace("_", ""),
-            "access_mode": info.get("access_mode", "free"),
+            "access_mode": info.get("access_mode", "paid"),
             "disabled": bool(info.get("disabled", False)),
             "webhook_url": str(info.get("webhook_url") or "")[:2000],
             "settings": info.get("settings", {}) if isinstance(info.get("settings", {}), dict) else {},
@@ -1669,6 +1669,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             if not user:
                 return None
             discord_id = str(user.get('discord_user_id') or '').strip()
+            if discord_id.isdigit() and int(discord_id) in blacklisted_users:
+                return None
             username = str(user.get('discord_username') or '').strip()
             avatar = str(user.get('avatar_url') or '').strip()
             # A Discord OAuth identity must be present to manage bot servers/scripts.
@@ -1773,6 +1775,17 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                         for bind_key, bind_value in hwid_bindings.items()
                         if str(bind_key).startswith(prefix)
                     ]
+                    bd = row.get('bot_data') if isinstance(row.get('bot_data'), dict) else {}
+                    user_keys = bd.get('user_keys') if isinstance(bd.get('user_keys'), dict) else {}
+                    key_names = {}
+                    for user_id, used_key in user_keys.items():
+                        username = 'unknown'
+                        if str(user_id).isdigit():
+                            cached_user = bot.get_user(int(user_id))
+                            if cached_user:
+                                username = str(cached_user)
+                        key_names[str(used_key)] = username
+                    row['user_key_names'] = key_names
                     unique[str(row['id'])] = row
             self._send_json(200, {"ok": True, "scripts": list(unique.values())})
         except Exception as exc:
@@ -1785,7 +1798,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"ok": False, "error": "Valid Account API key required."}); return
         sid = str(body.get('id') or '').strip()[:128]
         action = str(body.get('action') or '').strip().lower()
-        allowed = ('delete', 'set_disabled', 'update_settings', 'save_webhooks', 'unlink_guild', 'set_hwid_cooldown', 'reset_hwid')
+        allowed = ('delete', 'set_disabled', 'update_settings', 'update_source', 'save_webhooks', 'unlink_guild', 'set_hwid_cooldown', 'reset_hwid')
         if not sid or action not in allowed:
             self._send_json(400, {"ok": False, "error": "Invalid script action."}); return
         try:
@@ -1884,12 +1897,42 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                     if cooldown_minutes < 5 or cooldown_minutes > 43200:
                         self._send_json(400, {"ok": False, "error": "HWID cooldown must be between 5 minutes and 30 days."}); return
                     settings['reset_hwid_cooldown_seconds'] = cooldown_minutes * 60
-                add_log('Script settings updated', {'source': 'dashboard', 'auto_panel': settings.get('auto_panel', False)})
-                patch = {'name': name, 'fast_mode': fast, 'ultra_safe': strong, 'obfuscator': bool(incoming.get('obfuscator', row.get('obfuscator', False))), 'settings': settings, 'updated_at': _iso_now()}
+                access_mode = 'paid' if str(incoming.get('script_type', row.get('access_mode', 'paid'))).lower() == 'paid' else 'free'
+                bot_data = row.get('bot_data') if isinstance(row.get('bot_data'), dict) else {}
+                bot_data = dict(bot_data)
+                bot_data['trail_enabled'] = (access_mode == 'free')
+                if access_mode == 'paid':
+                    bot_data['trail_mode'] = 'PERM'
+                    bot_data['trail_expires_at'] = None
+                settings['script_type'] = access_mode
+                add_log('Script settings updated', {'source': 'dashboard', 'auto_panel': settings.get('auto_panel', False), 'access_mode': access_mode})
+                patch = {'name': name, 'access_mode': access_mode, 'bot_data': bot_data, 'fast_mode': fast, 'ultra_safe': strong, 'obfuscator': bool(incoming.get('obfuscator', row.get('obfuscator', False))), 'settings': settings, 'updated_at': _iso_now()}
                 _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', patch, 'return=minimal')
-                _send_script_webhook({**row, 'name': name, 'settings': settings}, 'Script Settings Updated', extra={'Source': 'Dashboard'})
+                for cached in scripts_data.values():
+                    if str(cached.get('supabase_row_id') or '') == sid:
+                        cached['access_mode'] = access_mode
+                        cached['trail_enabled'] = access_mode == 'free'
+                        cached['settings'] = settings
+                save_data()
+                _send_script_webhook({**row, 'name': name, 'settings': settings, 'access_mode': access_mode}, 'Script Settings Updated', extra={'Source': 'Dashboard'})
                 _sync_dashboard_scripts_from_supabase()
-                self._send_json(200, {"ok": True, "name": name, "settings": settings}); return
+                self._send_json(200, {"ok": True, "name": name, "settings": settings, "access_mode": access_mode}); return
+            if action == 'update_source':
+                source = body.get('source_code')
+                source_name = str(body.get('source_name') or 'source.lua')[:255]
+                if not isinstance(source, str) or not source.strip() or len(source) > 1_500_000:
+                    self._send_json(400, {"ok": False, "error": "Choose a non-empty source file smaller than 1.5 MB."}); return
+                add_log('Source updated', {'source': 'dashboard', 'source_name': source_name})
+                _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', {'source_code': source, 'script': source, 'source_name': source_name, 'settings': settings, 'updated_at': _iso_now()}, 'return=minimal')
+                script_name = str(row.get('name') or '')
+                if script_name in scripts_data:
+                    scripts_data[script_name]['source_code'] = source
+                    scripts_data[script_name]['source_name'] = source_name
+                    scripts_data[script_name]['settings'] = settings
+                    save_data()
+                _send_script_webhook({**row, 'settings': settings}, 'Source Updated', extra={'Source': 'Dashboard', 'File': source_name})
+                _sync_dashboard_scripts_from_supabase()
+                self._send_json(200, {"ok": True, "source_name": source_name, "settings": settings}); return
             if action == 'save_webhooks':
                 hooks = body.get('webhooks') if isinstance(body.get('webhooks'), dict) else {}
                 clean = {}
@@ -1995,6 +2038,127 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             return
         self._send_text(200, json.dumps({"ok": True, "message": "sent to Discord"}))
 
+    def _admin_site_action(self):
+        """Admin-code protected dashboard actions for messaging and global blacklist."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 16384:
+                self._send_json(400, {"ok": False, "error": "Invalid request."}); return
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict): raise ValueError("invalid body")
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "Invalid request."}); return
+        expected = os.getenv("ADMIN_ACCESS_CODE", "").strip()
+        supplied = str(payload.get("adminCode", ""))
+        if not expected or not secrets.compare_digest(supplied, expected):
+            self._send_json(403, {"ok": False, "error": "Admin authorization failed."}); return
+        action = str(payload.get("action", "")).strip().lower()
+        if action == "blacklist_list":
+            rows = []
+            for uid in sorted(blacklisted_users):
+                user = bot.get_user(int(uid))
+                rows.append({"id": str(uid), "username": str(user) if user else "Unknown user", "avatar": str(user.display_avatar.url) if user else ""})
+            self._send_json(200, {"ok": True, "users": rows}); return
+        if action in ("blacklist_add", "blacklist_remove"):
+            raw_id = str(payload.get("userId", "")).strip()
+            match = re.search(r"\d{15,22}", raw_id)
+            if match:
+                uid = int(match.group(0))
+            else:
+                matches = [u for u in bot.users if raw_id.lower() in (str(u).lower(), str(u.name).lower(), str(getattr(u, "global_name", "") or "").lower())]
+                if len(matches) != 1:
+                    self._send_json(400, {"ok": False, "error": "Enter a user ID or a unique username currently known to the bot."}); return
+                uid = int(matches[0].id)
+            if action == "blacklist_add":
+                if uid == int(os.getenv("OWNER_DISCORD_ID", "0") or 0):
+                    self._send_json(400, {"ok": False, "error": "The bot owner cannot be blacklisted here."}); return
+                blacklisted_users.add(uid)
+            else:
+                blacklisted_users.discard(uid)
+            if not save_data():
+                if action == "blacklist_add": blacklisted_users.discard(uid)
+                else: blacklisted_users.add(uid)
+                self._send_json(500, {"ok": False, "error": "Could not save the blacklist."}); return
+            self._send_json(200, {"ok": True, "userId": str(uid), "blacklisted": action == "blacklist_add"}); return
+        if action == "expire_key":
+            key = str(payload.get("key", "")).strip()[:200]
+            if not key:
+                self._send_json(400, {"ok": False, "error": "Enter the exact script key to expire."}); return
+            try:
+                rows = _supabase_rest("crystal_scripts", {"select": "id,name,bot_data,key_meta", "limit": "1000"})
+                for row in rows:
+                    bd = row.get("bot_data") if isinstance(row.get("bot_data"), dict) else {}
+                    meta = row.get("key_meta") if isinstance(row.get("key_meta"), dict) else {}
+                    bd = dict(bd); meta = dict(meta)
+                    valid = bd.get("valid_keys") if isinstance(bd.get("valid_keys"), list) else []
+                    user_keys = bd.get("user_keys") if isinstance(bd.get("user_keys"), dict) else {}
+                    matched = key in [str(x) for x in valid] or key in meta or key in [str(x) for x in user_keys.values()]
+                    if not matched: continue
+                    bd["valid_keys"] = [x for x in valid if str(x) != key]
+                    removed_uids = {str(uid) for uid, value in user_keys.items() if str(value) == key}
+                    bd["user_keys"] = {uid: value for uid, value in user_keys.items() if str(value) != key}
+                    user_access = bd.get("user_access") if isinstance(bd.get("user_access"), dict) else {}
+                    bd["user_access"] = {uid: value for uid, value in user_access.items() if str((value or {}).get("key") if isinstance(value, dict) else value) != key}
+                    bd["whitelisted_users"] = [uid for uid in (bd.get("whitelisted_users") or []) if str(uid) not in removed_uids]
+                    meta.pop(key, None)
+                    embedded_meta = bd.get("key_meta") if isinstance(bd.get("key_meta"), dict) else {}
+                    embedded_meta = dict(embedded_meta); embedded_meta.pop(key, None); bd["key_meta"] = embedded_meta
+                    _supabase_rest("crystal_scripts", {"id": "eq." + str(row.get("id"))}, "PATCH", {"bot_data": bd, "key_meta": meta, "updated_at": _iso_now()}, "return=minimal")
+                    script_name = str(row.get("name") or "")
+                    cached = scripts_data.get(script_name)
+                    if cached:
+                        cached["valid_keys"] = set(str(x) for x in bd["valid_keys"])
+                        cached["user_keys"] = {int(uid) if str(uid).isdigit() else uid: value for uid, value in bd["user_keys"].items()}
+                        cached["user_access"] = {int(uid) if str(uid).isdigit() else uid: value for uid, value in bd["user_access"].items()}
+                        cached["whitelisted_users"] = {int(uid) if str(uid).isdigit() else uid for uid in bd["whitelisted_users"]}
+                        cached["key_meta"] = meta
+                    save_data()
+                    _sync_dashboard_scripts_from_supabase()
+                    self._send_json(200, {"ok": True, "script": script_name, "expired": True}); return
+                self._send_json(404, {"ok": False, "error": "That key was not found in any script."}); return
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": "Could not expire key: " + str(exc)[:180]}); return
+        if action == "send_message":
+            target = str(payload.get("target", "")).strip()
+            message = str(payload.get("message", "")).strip()
+            if not target or not message or len(message) > 1800:
+                self._send_json(400, {"ok": False, "error": "Enter a target and a message (maximum 1800 characters)."}); return
+            is_channel_link = "discord.com/channels/" in target or "discordapp.com/channels/" in target
+            target_username = ""
+            if is_channel_link:
+                parts = [x for x in target.rstrip("/").split("/") if x.isdigit()]
+                target_id = int(parts[-2] if len(parts) >= 3 else parts[-1]) if len(parts) >= 2 else 0
+            else:
+                match = re.search(r"\d{15,22}", target)
+                target_id = int(match.group(0)) if match else 0
+                if not target_id:
+                    candidates = [u for u in bot.users if target.lower() in (str(u).lower(), str(u.name).lower(), str(getattr(u, "global_name", "") or "").lower())]
+                    if len(candidates) == 1:
+                        target_id = int(candidates[0].id)
+                    elif len(candidates) > 1:
+                        self._send_json(400, {"ok": False, "error": "More than one user matches. Use the Discord user ID."}); return
+            if not target_id:
+                self._send_json(400, {"ok": False, "error": "Enter a Discord user ID, unique username, or channel link."}); return
+            async def deliver():
+                # Discord channel links contain guild/channel IDs; use the last numeric segment.
+                if is_channel_link:
+                    channel = bot.get_channel(target_id)
+                    if channel is None: channel = await bot.fetch_channel(target_id)
+                    await channel.send(message, allowed_mentions=discord.AllowedMentions.none())
+                    return "channel"
+                user = bot.get_user(target_id)
+                if user is None: user = await bot.fetch_user(target_id)
+                await user.send(message, allowed_mentions=discord.AllowedMentions.none())
+                return "dm"
+            try:
+                if not bot.is_ready(): raise RuntimeError("Discord bot is not ready.")
+                future = asyncio.run_coroutine_threadsafe(deliver(), bot.loop)
+                kind = future.result(timeout=15)
+            except Exception as exc:
+                self._send_json(502, {"ok": False, "error": "Could not send the Discord message: " + str(exc)[:180]}); return
+            self._send_json(200, {"ok": True, "sent_to": kind}); return
+        self._send_json(400, {"ok": False, "error": "Unknown admin action."})
+
     def _create_admin_site_code(self):
         # Code creation is performed server-side; the admin code must be configured as a Render secret.
         try:
@@ -2006,6 +2170,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             supplied = str(payload.get("adminCode", ""))
             plan = str(payload.get("codeType", ""))
             label = str(payload.get("codeLabel", ""))[:60]
+            days = int(payload.get("durationDays", 30))
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             self._send_text(400, json.dumps({"error": "Invalid request."})); return
         expected = os.getenv("ADMIN_ACCESS_CODE", "").strip()
@@ -2015,7 +2180,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             self._send_text(400, json.dumps({"error": "Choose Premium or Ultra."})); return
         prefix = {"Premium": "PREM", "Ultra": "ULTRA"}[plan]
         raw = "CH-" + prefix + "-" + secrets.token_hex(6).upper()
-        days = 30 if plan == "Premium" else 0
+        if days not in (0, 7, 30, 90, 365):
+            self._send_text(400, json.dumps({"error": "Choose 7, 30, 90, 365 days, or Lifetime."})); return
         key = _hash_redeem_code(raw)
         site_redeem_codes[key] = {"plan": plan, "duration_days": days, "label": label, "code": raw, "created_by": "website-admin", "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "redeemed_by": None, "redeemed_at": None, "revoked": False}
         try:
@@ -2023,7 +2189,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         except OSError:
             site_redeem_codes.pop(key, None)
             self._send_text(500, json.dumps({"error": "Could not save the code. Check persistent storage on Render."})); return
-        self._send_text(200, json.dumps({"ok": True, "code": raw, "plan": plan, "duration": "30 days" if days else "Lifetime", "label": label}))
+        self._send_text(200, json.dumps({"ok": True, "code": raw, "plan": plan, "duration": "Lifetime" if days == 0 else f"{days} days", "label": label}))
 
     def _admin_manage_site_codes(self, action):
         try:
@@ -2041,7 +2207,9 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         if action == "list":
             rows = []
             for key, rec in site_redeem_codes.items():
-                rows.append({"id": key, "code": rec.get("code", ""), "plan": rec.get("plan", "Unknown"), "label": rec.get("label", ""), "redeemed": bool(rec.get("redeemed_by")), "revoked": bool(rec.get("revoked")), "created_at": rec.get("created_at", "")})
+                redeemed_by = str(rec.get("redeemed_by") or "")
+                profile = bot.get_user(int(redeemed_by)) if redeemed_by.isdigit() else None
+                rows.append({"id": key, "code": rec.get("code", ""), "plan": rec.get("plan", "Unknown"), "label": rec.get("label", ""), "redeemed": bool(redeemed_by), "revoked": bool(rec.get("revoked")), "created_at": rec.get("created_at", ""), "redeemed_by": redeemed_by, "redeemed_username": str(profile) if profile else ("unknown" if redeemed_by else ""), "redeemed_avatar": str(profile.display_avatar.url) if profile else "", "redeemed_at": rec.get("redeemed_at") or ""})
             self._send_text(200, json.dumps({"ok": True, "codes": rows})); return
         key = str(payload.get("codeHash", ""))
         rec = site_redeem_codes.get(key)
@@ -2231,7 +2399,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 'guild_id': guild_id, 'created_by': discord_id,
                 'valid_keys': [str(k) for k in valid_keys if isinstance(k, (str, int))],
                 'key_meta': data.get('key_meta') if isinstance(data.get('key_meta'), dict) else bot_data.get('key_meta', {}),
-                'trail_enabled': str(data.get('access_mode', 'free')).lower() != 'paid'
+                'trail_enabled': str(data.get('access_mode', 'paid')).lower() != 'paid'
             })
             row = {
                 "user_id": user_id, "guest_id": guest_id, "name": name[:100], "api_key": api_key[:200],
@@ -2244,7 +2412,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 "discord_username": str(account.get('discord_username') or account.get('username') or '')[:100] or None,
                 "guild_id": guild_id,
                 "loader_code": str(data.get("loader_code") or "")[:300] or None,
-                "access_mode": "paid" if str(data.get("access_mode", "free")).lower()=="paid" else "free",
+                "access_mode": "free" if str(data.get("access_mode", "paid")).lower()=="free" else "paid",
                 "disabled": bool(data.get("disabled", False)),
                 "webhook_url": str(data.get("webhook_url") or "")[:2000],
                 "settings": data.get("settings") if isinstance(data.get("settings"), dict) else {},
@@ -2308,7 +2476,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 "ultra_safe": bool(data.get("ultra_safe", False)),
                 "discord_user_id": None, "discord_username": None,
                 "loader_code": str(data.get("loader_code") or "")[:300] or None,
-                "access_mode": "paid" if str(data.get("access_mode", "free")).lower() == "paid" else "free",
+                "access_mode": "free" if str(data.get("access_mode", "paid")).lower() == "free" else "paid",
                 "disabled": bool(data.get("disabled", False)),
                 "webhook_url": str(data.get("webhook_url") or "")[:2000],
                 "settings": data.get("settings") if isinstance(data.get("settings"), dict) else {},
@@ -2602,6 +2770,9 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             return
         if parsed_path.path == "/api/redeem-code":
             self._redeem_site_code()
+            return
+        if parsed_path.path == "/api/admin/action":
+            self._admin_site_action()
             return
         if parsed_path.path == "/api/admin/create-code":
             self._create_admin_site_code()
@@ -4112,6 +4283,7 @@ async def whitelist_command(
             except Exception:
                 pass
     when = "permanent" if mode == "PERM" else f"TIME — {format_remaining(expires_at)} remaining"
+    _send_script_webhook(s_info, "Whitelist Granted", username=getattr(user, "name", ""), discord_user_id=str(user.id), key=new_key, duration=when, extra={"Granted By": getattr(interaction.user, "name", "")})
     try:
         dm_embed = discord.Embed(
             title="🎉 Whitelist Granted!",
@@ -4263,6 +4435,7 @@ async def create_script_command(
         "supabase_user_id": (imported or {}).get("_supabase_user_id"),
         "supabase_row_id": (imported or {}).get("_supabase_row_id"),
         "trail_enabled": False,
+        "access_mode": "paid",
         "trail_mode": "PERM",
         "trail_expires_at": None,
         "file_id": None,
