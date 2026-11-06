@@ -758,7 +758,17 @@ def _send_script_webhook(s_info, event_type, *, username="", discord_user_id="",
         except Exception as exc:
             print(f"Crystal webhook failed: {type(exc).__name__}")
     return sent
-
+def _record_script_activity(s_info, event, details=None):
+    settings = s_info.setdefault("settings", {})
+    if not isinstance(settings, dict):
+        settings = {}
+        s_info["settings"] = settings
+    logs = settings.get("activity_logs") if isinstance(settings.get("activity_logs"), list) else []
+    logs.append({"event": str(event)[:120], "created_at": _iso_now(), "details": details or {}})
+    settings["activity_logs"] = logs[-200:]
+    row_id = s_info.get("supabase_row_id")
+    if row_id:
+        _persist_script_row(row_id, {"settings": settings, "updated_at": _iso_now()})
 def _persist_script_row(row_id, patch):
     if not row_id:
         return False
@@ -1060,6 +1070,39 @@ def _linked_subscription_plan(user_id):
             return 'Free'
     except Exception as exc:
         print(f'Crystal subscription lookup warning: {type(exc).__name__}')
+    return 'Free'
+
+def _dashboard_account_plan(account):
+    account = account if isinstance(account, dict) else {}
+    user_id = str(account.get('supabase_user_id') or '').strip()
+    plan = _linked_subscription_plan(user_id) if user_id else 'Free'
+    if plan != 'Free':
+        return plan
+    discord_id = str(account.get('discord_user_id') or '').strip()
+    if discord_id.isdigit():
+        if discord_id in admin_redeemed_users:
+            return 'Admin'
+        try:
+            discord_plan = _discord_plan(int(discord_id))
+            if discord_plan in ('Admin', 'Ultra', 'Premium'):
+                return discord_plan
+        except Exception:
+            pass
+    guest_id = str(account.get('guest_id') or '').strip()
+    if guest_id:
+        try:
+            rows = _supabase_rest('crystal_guest_subscriptions', {
+                'select': 'plan,expires_at', 'guest_id': 'eq.' + urllib.parse.quote(guest_id, safe=''), 'limit': '1'
+            })
+            if rows:
+                row = rows[0]
+                if row.get('expires_at') and is_expired(row.get('expires_at')):
+                    return 'Free'
+                guest_plan = str(row.get('plan') or 'Free').title()
+                if guest_plan in ('Admin', 'Ultra', 'Premium'):
+                    return guest_plan
+        except Exception as exc:
+            print(f'Crystal guest plan lookup warning: {type(exc).__name__}')
     return 'Free'
 
 def _api_account_link(api_key: str, discord_user_id: str, discord_username: str):
@@ -1680,7 +1723,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             "discord_user_id": discord_id,
             "username": str(account.get("discord_username") or account.get("username") or "Discord User"),
             "avatar_url": str(account.get("avatar_url") or ""),
-            "supabase_user_id": str(account.get("supabase_user_id") or "")
+            "supabase_user_id": str(account.get("supabase_user_id") or ""),
+            "plan": _dashboard_account_plan(account)
         }})
 
     def _dashboard_bot_guilds(self):
@@ -1722,6 +1766,13 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             unique = {}
             for row in rows:
                 if row.get('id') is not None:
+                    script_name = str(row.get('name') or '')
+                    prefix = script_name + ':'
+                    row['hwid_bindings'] = [
+                        {"key": str(bind_key)[len(prefix):], **(bind_value if isinstance(bind_value, dict) else {"hwid": bind_value})}
+                        for bind_key, bind_value in hwid_bindings.items()
+                        if str(bind_key).startswith(prefix)
+                    ]
                     unique[str(row['id'])] = row
             self._send_json(200, {"ok": True, "scripts": list(unique.values())})
         except Exception as exc:
@@ -1734,7 +1785,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"ok": False, "error": "Valid Account API key required."}); return
         sid = str(body.get('id') or '').strip()[:128]
         action = str(body.get('action') or '').strip().lower()
-        allowed = ('delete', 'set_disabled', 'update_settings', 'save_webhooks', 'unlink_guild')
+        allowed = ('delete', 'set_disabled', 'update_settings', 'save_webhooks', 'unlink_guild', 'set_hwid_cooldown', 'reset_hwid')
         if not sid or action not in allowed:
             self._send_json(400, {"ok": False, "error": "Invalid script action."}); return
         try:
@@ -1772,6 +1823,42 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                         scripts_data.pop(name, None)
                 save_data()
                 self._send_json(200, {"ok": True, "deleted": True}); return
+            if action == 'set_hwid_cooldown':
+                try:
+                    minutes = int(body.get('cooldown_minutes', 1440))
+                except (TypeError, ValueError):
+                    self._send_json(400, {"ok": False, "error": "Cooldown must be an integer number of minutes."}); return
+                if minutes < 5 or minutes > 43200:
+                    self._send_json(400, {"ok": False, "error": "Cooldown must be between 5 minutes and 30 days."}); return
+                settings['reset_hwid_cooldown_seconds'] = minutes * 60
+                add_log('HWID cooldown updated', {'minutes': minutes})
+                _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', {'settings': settings, 'updated_at': _iso_now()}, 'return=minimal')
+                for info in scripts_data.values():
+                    if str(info.get('supabase_row_id') or '') == sid:
+                        info['settings'] = settings
+                save_data()
+                self._send_json(200, {"ok": True, "cooldown_minutes": minutes, "settings": settings}); return
+            if action == 'reset_hwid':
+                key = str(body.get('key') or '').strip()[:200]
+                if not key:
+                    self._send_json(400, {"ok": False, "error": "Select a key to reset."}); return
+                script_name = str(row.get('name') or '')
+                binding_key = script_name + ':' + key
+                if binding_key not in hwid_bindings:
+                    self._send_json(404, {"ok": False, "error": "No HWID binding exists for that key."}); return
+                hwid_bindings.pop(binding_key, None)
+                try:
+                    save_hwid_bindings()
+                except OSError:
+                    self._send_json(500, {"ok": False, "error": "Could not save the HWID reset."}); return
+                bot_data = row.get('bot_data') if isinstance(row.get('bot_data'), dict) else {}
+                if isinstance(bot_data.get('hwid_bindings'), dict):
+                    bot_data['hwid_bindings'].pop(binding_key, None)
+                add_log('HWID reset from dashboard', {'key': key, 'source': 'dashboard'})
+                _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', {'bot_data': bot_data, 'settings': settings, 'updated_at': _iso_now()}, 'return=minimal')
+                s_info = scripts_data.get(script_name) or {**row, 'settings': settings}
+                _send_script_webhook(s_info, 'HWID Reset', key=key, extra={'Source': 'Dashboard'})
+                self._send_json(200, {"ok": True, "key": key, "settings": settings}); return
             if action == 'set_disabled':
                 disabled = bool(body.get('disabled'))
                 add_log('Script disabled' if disabled else 'Script enabled', {'source': 'dashboard'})
@@ -1789,9 +1876,18 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 if fast and strong:
                     self._send_json(409, {"ok": False, "error": "You can't use this feature together."}); return
                 settings.update({k: incoming[k] for k in ('fast_mode','strong_security','anti_ai','auto_panel','script_type') if k in incoming})
+                if 'reset_hwid_cooldown_minutes' in incoming:
+                    try:
+                        cooldown_minutes = int(incoming['reset_hwid_cooldown_minutes'])
+                    except (TypeError, ValueError):
+                        self._send_json(400, {"ok": False, "error": "HWID cooldown must be a number of minutes."}); return
+                    if cooldown_minutes < 5 or cooldown_minutes > 43200:
+                        self._send_json(400, {"ok": False, "error": "HWID cooldown must be between 5 minutes and 30 days."}); return
+                    settings['reset_hwid_cooldown_seconds'] = cooldown_minutes * 60
                 add_log('Script settings updated', {'source': 'dashboard', 'auto_panel': settings.get('auto_panel', False)})
                 patch = {'name': name, 'fast_mode': fast, 'ultra_safe': strong, 'obfuscator': bool(incoming.get('obfuscator', row.get('obfuscator', False))), 'settings': settings, 'updated_at': _iso_now()}
                 _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', patch, 'return=minimal')
+                _send_script_webhook({**row, 'name': name, 'settings': settings}, 'Script Settings Updated', extra={'Source': 'Dashboard'})
                 _sync_dashboard_scripts_from_supabase()
                 self._send_json(200, {"ok": True, "name": name, "settings": settings}); return
             if action == 'save_webhooks':
@@ -1826,7 +1922,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         sid = str(query.get('id', [''])[0] or '').strip()[:128]
         if not account or not sid:
             self._send_json(401, {'ok': False, 'error': 'Valid Account API key required.'}); return
-        plan = _linked_subscription_plan(str(account.get('supabase_user_id') or '')) if account.get('supabase_user_id') else 'Free'
+        plan = _dashboard_account_plan(account)
         if plan not in ('Ultra', 'Admin', 'Ultra Admin'):
             self._send_json(403, {'ok': False, 'error': 'Logs are available to Ultra or Admin accounts only.'}); return
         rows = _supabase_rest('crystal_scripts', {'select':'id,user_id,guest_id,discord_user_id,settings', 'id':'eq.' + urllib.parse.quote(sid, safe=''), 'limit':'1'})
@@ -2169,8 +2265,15 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 _supabase_rest("crystal_scripts", {"id":"eq."+str(existing[0]["id"])}, "PATCH", row, "return=minimal")
                 row_id=existing[0]["id"]
             else:
+                new_settings = row.get('settings') if isinstance(row.get('settings'), dict) else {}
+                logs = new_settings.get('activity_logs') if isinstance(new_settings.get('activity_logs'), list) else []
+                logs.append({'event': 'Script created', 'created_at': _iso_now(), 'details': {'source': 'Dashboard'}})
+                new_settings['activity_logs'] = logs[-200:]
+                new_settings['creation_source'] = 'Dashboard'
+                row['settings'] = new_settings
                 created=_supabase_rest("crystal_scripts", {}, "POST", row, "return=representation")
                 row_id=created[0].get("id") if created else None
+                _send_script_webhook({**row, 'settings': new_settings}, 'Script Created', username=str(account.get('discord_username') or account.get('username') or ''), discord_user_id=discord_id)
             _sync_dashboard_scripts_from_supabase()
             self._send_json(200, {"ok":True,"id":row_id,"api_key":api_key,"name":name,"guild_id":guild_id})
         except Exception as exc:
@@ -3707,10 +3810,12 @@ class PanelControlView(BlacklistAwareView):
         if not s_info or user_id not in s_info.get("user_keys", {}):
             await interaction.response.send_message("❌ You don't have an active key for this script.", ephemeral=True)
             return
-        cooldown = int(security_state.get("reset_hwid_cooldown", DEFAULT_RESET_HWID_COOLDOWN))
-        cooldown_key = f"{interaction.guild_id}:{self.script_name}:{user_id}"
+        script_settings = s_info.setdefault("settings", {})
+        cooldown = int(script_settings.get("reset_hwid_cooldown_seconds", DEFAULT_RESET_HWID_COOLDOWN))
+        cooldown_key = str(user_id)
         now = int(time.time())
-        last_used = int(security_state.get("reset_hwid_last_used", {}).get(cooldown_key, 0))
+        reset_last = script_settings.setdefault("reset_hwid_last_used", {})
+        last_used = int(reset_last.get(cooldown_key, 0))
         remaining = cooldown - (now - last_used)
         if remaining > 0:
             await interaction.response.send_message(
@@ -3722,8 +3827,10 @@ class PanelControlView(BlacklistAwareView):
         hwid_bindings.pop(f"{self.script_name}:{user_key}", None)
         save_hwid_bindings()
         s_info["hwid_bindings"] = {k:v for k,v in hwid_bindings.items() if str(k).startswith(self.script_name + ":")}
-        security_state.setdefault("reset_hwid_last_used", {})[cooldown_key] = now
-        save_security_state()
+        reset_last[cooldown_key] = now
+        _record_script_activity(s_info, 'HWID reset', {'key': user_key, 'source': 'Discord panel'})
+        save_data()
+        _persist_script_row(s_info.get('supabase_row_id'), {'settings': script_settings, 'updated_at': _iso_now()})
         _send_script_webhook(s_info, "HWID Reset", username=getattr(interaction.user, "name", ""), discord_user_id=str(interaction.user.id), key=user_key, device="Unknown", duration=format_remaining((s_info.get("key_meta") or {}).get(user_key, {}).get("expires_at")))
         await interaction.response.send_message("✅ HWID reset successfully.", ephemeral=True)
 
@@ -3930,7 +4037,9 @@ async def generate_key_command(
         return
     new_key = generate_random_key()
     register_key(scripts_data[script], new_key, mode, expires_at, created_by=interaction.user.id)
+    _record_script_activity(scripts_data[script], 'Key created', {'key': new_key, 'created_by': getattr(interaction.user, 'name', '')})
     save_data()
+    _send_script_webhook(scripts_data[script], 'Key Created', username=getattr(interaction.user, 'name', ''), discord_user_id=str(interaction.user.id), key=new_key, duration=format_remaining(expires_at))
     _sync_script_to_supabase(script, scripts_data[script], str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
     when = "permanent" if mode == "PERM" else f"expires in {format_remaining(expires_at)}"
     await interaction.response.send_message(
@@ -4782,7 +4891,9 @@ async def panel_setup_command(
     s_info["panel_name"] = name_panel
     s_info["panel_description"] = panel_description
     s_info["panel_created_by"] = str(interaction.user.id)
+    _record_script_activity(s_info, 'Panel created or updated', {'guild_id': str(interaction.guild_id), 'channel_id': str(target_channel.id)})
     save_data()
+    _send_script_webhook(s_info, 'Panel Created', username=getattr(interaction.user, 'name', ''), discord_user_id=str(interaction.user.id), extra={'Server': getattr(interaction.guild, 'name', 'Unknown'), 'Channel': getattr(target_channel, 'name', 'Unknown')})
 
     await interaction.response.send_message(
         f"✅ Panel ready in {target_channel.mention}. This panel is saved and will be refreshed after the bot restarts/updates.\n\n{_quota_status(interaction.user.id, interaction.guild_id)}",
