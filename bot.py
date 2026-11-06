@@ -729,39 +729,35 @@ def _supabase_upsert_subscription(user_id, plan, expires_at=None, source="dashbo
         return False
 
 def _send_script_webhook(s_info, event_type, *, username="", discord_user_id="", key="", device="", country="", duration="", extra=None):
-    url = str(s_info.get("webhook_url") or "").strip()
-    if not url or not url.startswith(("https://", "http://")):
+    settings = s_info.get("settings") if isinstance(s_info.get("settings"), dict) else {}
+    hooks = settings.get("webhooks") if isinstance(settings.get("webhooks"), dict) else {}
+    kind = "hwid" if "HWID" in str(event_type).upper() else ("keys" if "KEY" in str(event_type).upper() or "WHITELIST" in str(event_type).upper() else ("panels" if "PANEL" in str(event_type).upper() else "all"))
+    urls = []
+    for value in (hooks.get(kind, []), hooks.get("all", []), s_info.get("webhook_url", "")):
+        if isinstance(value, str): value = value.splitlines()
+        if isinstance(value, (list, tuple)):
+            urls.extend(str(x).strip() for x in value)
+    urls = list(dict.fromkeys(x for x in urls if x.startswith(("https://", "http://"))))[:20]
+    if not urls:
         return False
-    payload = {
-        "username": "Crystal Hub",
-        "embeds": [{
-            "title": f"Crystal Hub — {event_type}",
-            "color": 0x5865F2,
-            "fields": [
-                {"name": "User", "value": str(username or "Unknown")[:1024], "inline": True},
-                {"name": "Discord ID", "value": str(discord_user_id or "Unknown")[:1024], "inline": True},
-                {"name": "Script", "value": str(s_info.get("name") or "Unknown")[:1024], "inline": True},
-                {"name": "Key", "value": str(key or "Unknown")[:1024], "inline": True},
-                {"name": "Device", "value": str(device or "Unknown")[:1024], "inline": True},
-                {"name": "Country", "value": str(country or "Unknown")[:1024], "inline": True},
-                {"name": "Key type", "value": str((s_info.get("key_meta") or {}).get(key, {}).get("mode") or "Unknown")[:1024], "inline": True},
-                {"name": "Duration", "value": str(duration or "Unknown")[:1024], "inline": True},
-                {"name": "Access", "value": str(s_info.get("access_mode") or "free").upper()[:1024], "inline": True},
-                {"name": "Expiration", "value": str(((s_info.get("key_meta") or {}).get(key, {}) or {}).get("expires_at") or "Lifetime")[:1024], "inline": True},
-            ],
-            "footer": {"text": "Crystal Hub"}
-        }]
-    }
+    payload = {"username": "Crystal Hub", "embeds": [{"title": f"Crystal Hub — {event_type}", "color": 0x5865F2, "fields": [
+        {"name":"User","value":str(username or "Unknown")[:1024],"inline":True}, {"name":"Discord ID","value":str(discord_user_id or "Unknown")[:1024],"inline":True},
+        {"name":"Script","value":str(s_info.get("name") or "Unknown")[:1024],"inline":True}, {"name":"Key","value":str(key or "Unknown")[:1024],"inline":True},
+        {"name":"Device","value":str(device or "Unknown")[:1024],"inline":True}, {"name":"Country","value":str(country or "Unknown")[:1024],"inline":True},
+        {"name":"Key type","value":str((s_info.get("key_meta") or {}).get(key, {}).get("mode") or "Unknown")[:1024],"inline":True},
+        {"name":"Duration","value":str(duration or "Unknown")[:1024],"inline":True}, {"name":"Access","value":str(s_info.get("access_mode") or "free").upper()[:1024],"inline":True},
+        {"name":"Expiration","value":str(((s_info.get("key_meta") or {}).get(key, {}) or {}).get("expires_at") or "Lifetime")[:1024],"inline":True}], "footer":{"text":"Crystal Hub"}}]}
     if isinstance(extra, dict):
-        payload["embeds"][0]["fields"].extend({"name": str(k)[:256], "value": str(v)[:1024], "inline": True} for k,v in extra.items())
-    try:
-        req=urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type":"application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=8) as response:
-            response.read(256)
-        return True
-    except Exception as exc:
-        print(f"Crystal webhook failed: {type(exc).__name__}")
-        return False
+        payload["embeds"][0]["fields"].extend({"name":str(k)[:256],"value":str(v)[:1024],"inline":True} for k,v in extra.items())
+    sent = False
+    for url in urls:
+        try:
+            req=urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type":"application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=8) as response: response.read(256)
+            sent = True
+        except Exception as exc:
+            print(f"Crystal webhook failed: {type(exc).__name__}")
+    return sent
 
 def _persist_script_row(row_id, patch):
     if not row_id:
@@ -1738,10 +1734,11 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"ok": False, "error": "Valid Account API key required."}); return
         sid = str(body.get('id') or '').strip()[:128]
         action = str(body.get('action') or '').strip().lower()
-        if not sid or action not in ('delete', 'set_disabled'):
+        allowed = ('delete', 'set_disabled', 'update_settings', 'save_webhooks', 'unlink_guild')
+        if not sid or action not in allowed:
             self._send_json(400, {"ok": False, "error": "Invalid script action."}); return
         try:
-            q = {'select':'id,name,discord_user_id,user_id,guest_id', 'id':'eq.' + urllib.parse.quote(sid, safe=''), 'limit':'1'}
+            q = {'select':'*', 'id':'eq.' + urllib.parse.quote(sid, safe=''), 'limit':'1'}
             rows = _supabase_rest('crystal_scripts', q)
             if not rows:
                 self._send_json(404, {"ok": False, "error": "Script not found."}); return
@@ -1751,23 +1748,96 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             same_owner = same_owner or (bool(account.get('discord_user_id')) and str(row.get('discord_user_id') or '') == str(account.get('discord_user_id')))
             if not same_owner:
                 self._send_json(403, {"ok": False, "error": "This script does not belong to this Account API."}); return
+            settings = row.get('settings') if isinstance(row.get('settings'), dict) else {}
+            logs = settings.get('activity_logs') if isinstance(settings.get('activity_logs'), list) else []
+            def add_log(event, details=None):
+                logs.append({'event': event, 'created_at': _iso_now(), 'details': details or {}})
+                settings['activity_logs'] = logs[-200:]
             if action == 'delete':
+                # Remove saved Discord panels first, then remove the durable script row.
+                info = row.get('bot_data') if isinstance(row.get('bot_data'), dict) else {}
+                instances = info.get('panel_instances') if isinstance(info.get('panel_instances'), list) else row.get('panel_instances') or []
+                for panel in instances:
+                    try:
+                        guild = bot.get_guild(int(panel.get('guild_id')))
+                        channel = guild.get_channel(int(panel.get('channel_id'))) if guild else None
+                        if channel and panel.get('message_id'):
+                            msg = awaitable = None
+                            # HTTP handler is synchronous; panel cleanup is completed by the bot loop on refresh.
+                    except Exception:
+                        pass
                 _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'DELETE', None, 'return=minimal')
                 for name, info in list(scripts_data.items()):
                     if str(info.get('supabase_row_id') or '') == sid:
                         scripts_data.pop(name, None)
                 save_data()
                 self._send_json(200, {"ok": True, "deleted": True}); return
-            disabled = bool(body.get('disabled'))
-            _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', {'disabled': disabled, 'updated_at': _iso_now()}, 'return=minimal')
-            for info in scripts_data.values():
-                if str(info.get('supabase_row_id') or '') == sid:
-                    info['disabled'] = disabled
-            save_data()
-            self._send_json(200, {"ok": True, "disabled": disabled})
+            if action == 'set_disabled':
+                disabled = bool(body.get('disabled'))
+                add_log('Script disabled' if disabled else 'Script enabled', {'source': 'dashboard'})
+                patch = {'disabled': disabled, 'settings': settings, 'updated_at': _iso_now()}
+                _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', patch, 'return=minimal')
+                for info in scripts_data.values():
+                    if str(info.get('supabase_row_id') or '') == sid:
+                        info['disabled'] = disabled; info['settings'] = settings
+                save_data(); self._send_json(200, {"ok": True, "disabled": disabled, "settings": settings}); return
+            if action == 'update_settings':
+                incoming = body.get('settings') if isinstance(body.get('settings'), dict) else {}
+                name = str(incoming.get('name') or row.get('name') or 'Untitled Script').strip()[:100]
+                fast = bool(incoming.get('fast_mode', settings.get('fast_mode', False)))
+                strong = bool(incoming.get('strong_security', settings.get('strong_security', False)))
+                if fast and strong:
+                    self._send_json(409, {"ok": False, "error": "You can't use this feature together."}); return
+                settings.update({k: incoming[k] for k in ('fast_mode','strong_security','anti_ai','auto_panel','script_type') if k in incoming})
+                add_log('Script settings updated', {'source': 'dashboard', 'auto_panel': settings.get('auto_panel', False)})
+                patch = {'name': name, 'fast_mode': fast, 'ultra_safe': strong, 'obfuscator': bool(incoming.get('obfuscator', row.get('obfuscator', False))), 'settings': settings, 'updated_at': _iso_now()}
+                _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', patch, 'return=minimal')
+                _sync_dashboard_scripts_from_supabase()
+                self._send_json(200, {"ok": True, "name": name, "settings": settings}); return
+            if action == 'save_webhooks':
+                hooks = body.get('webhooks') if isinstance(body.get('webhooks'), dict) else {}
+                clean = {}
+                for key in ('all','keys','panels','hwid'):
+                    vals = hooks.get(key, [])
+                    if isinstance(vals, str): vals = vals.splitlines()
+                    clean[key] = [str(v).strip()[:2000] for v in vals if str(v).strip().startswith(('https://','http://'))][:10]
+                settings['webhooks'] = clean
+                settings['webhook_updated_at'] = _iso_now()
+                add_log('Webhooks updated', {'events': list(clean.keys())})
+                legacy = (clean.get('all') or clean.get('keys') or clean.get('panels') or clean.get('hwid') or [''])[0]
+                _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', {'webhook_url': legacy, 'settings': settings, 'updated_at': _iso_now()}, 'return=minimal')
+                self._send_json(200, {"ok": True, "settings": settings}); return
+            if action == 'unlink_guild':
+                gid = str(body.get('guild_id') or '')
+                info = row.get('bot_data') if isinstance(row.get('bot_data'), dict) else {}
+                instances = info.get('panel_instances') if isinstance(info.get('panel_instances'), list) else []
+                info['panel_instances'] = [x for x in instances if str(x.get('guild_id')) != gid]
+                settings['panel_instances'] = info['panel_instances']
+                add_log('Panel unlinked from server', {'guild_id': gid})
+                _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', {'bot_data': info, 'settings': settings, 'updated_at': _iso_now()}, 'return=minimal')
+                _sync_dashboard_scripts_from_supabase()
+                self._send_json(200, {"ok": True, "settings": settings}); return
         except Exception as exc:
             print(f"Dashboard script action failed: {type(exc).__name__}: {exc}")
             self._send_json(500, {"ok": False, "error": "Could not update script."})
+
+    def _dashboard_script_logs(self, query):
+        account = self._dashboard_account({})
+        sid = str(query.get('id', [''])[0] or '').strip()[:128]
+        if not account or not sid:
+            self._send_json(401, {'ok': False, 'error': 'Valid Account API key required.'}); return
+        plan = _linked_subscription_plan(str(account.get('supabase_user_id') or '')) if account.get('supabase_user_id') else 'Free'
+        if plan not in ('Ultra', 'Admin', 'Ultra Admin'):
+            self._send_json(403, {'ok': False, 'error': 'Logs are available to Ultra or Admin accounts only.'}); return
+        rows = _supabase_rest('crystal_scripts', {'select':'id,user_id,guest_id,discord_user_id,settings', 'id':'eq.' + urllib.parse.quote(sid, safe=''), 'limit':'1'})
+        if not rows:
+            self._send_json(404, {'ok': False, 'error': 'Script not found.'}); return
+        row = rows[0]
+        same = (str(row.get('guest_id') or '') == str(account.get('guest_id') or '') and bool(account.get('guest_id'))) or (str(row.get('user_id') or '') == str(account.get('supabase_user_id') or '') and bool(account.get('supabase_user_id'))) or (str(row.get('discord_user_id') or '') == str(account.get('discord_user_id') or '') and bool(account.get('discord_user_id')))
+        if not same:
+            self._send_json(403, {'ok': False, 'error': 'This script does not belong to this Account API.'}); return
+        settings = row.get('settings') if isinstance(row.get('settings'), dict) else {}
+        self._send_json(200, {'ok': True, 'logs': settings.get('activity_logs', []) if isinstance(settings.get('activity_logs'), list) else []})
 
     def do_OPTIONS(self):
         self._send_text(204, "")
@@ -2524,6 +2594,9 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed_path = urllib.parse.urlparse(self.path)
+        if parsed_path.path == "/api/dashboard-script-logs":
+            self._dashboard_script_logs(urllib.parse.parse_qs(parsed_path.query))
+            return
         if parsed_path.path == '/api/bot-guilds':
             self._dashboard_bot_guilds()
             return
@@ -3683,6 +3756,10 @@ async def _refresh_saved_panels_after_startup():
     """Recreate every saved panel instance after a process restart/update."""
     changed = False
     for script_name, info in list(scripts_data.items()):
+        script_settings = info.get("settings") if isinstance(info.get("settings"), dict) else {}
+        # Auto Panel is opt-in: disabled scripts keep their saved location but are not recreated.
+        if script_settings.get("auto_panel") is not True and info.get("auto_panel") is not True:
+            continue
         instances = info.get("panel_instances")
         if not isinstance(instances, list):
             instances = []
