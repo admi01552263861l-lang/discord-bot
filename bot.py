@@ -25,7 +25,7 @@ from discord import app_commands
 from discord.http import Route
 from discord.ext import commands, tasks
 
-BUILD_TAG = "CrystalHub-2026-11-06-SOURCE-QUOTAS-KEY-BLACKLIST-V2"
+BUILD_TAG = "CrystalHub-2026-11-07-LOCAL-OBFUSCATOR-SOURCE-MODES-DISABLE-UNBLACKLIST-V1"
 
 # Render keeps only files under a mounted persistent disk. Set
 # CRYSTAL_HUB_DATA_DIR=/var/data on Render after attaching that disk.
@@ -167,6 +167,9 @@ def load_data():
                     s_info.setdefault("trail_expires_at", None)
                     s_info.setdefault("file_id", None)
                     s_info.setdefault("source_obfuscated", False)
+                    s_info.setdefault("original_source_code", s_info.get("source_code", ""))
+                    s_info.setdefault("source_language", "lua")
+                    s_info.setdefault("protection_mode", "Standard")
                     s_info.setdefault("key_meta", {})
                     s_info.setdefault("user_access", {})
                     s_info.setdefault("loader_code", None)
@@ -204,6 +207,9 @@ def save_data():
                 "blacklisted_keys": sorted(str(x) for x in s_info.get("blacklisted_keys", set())),
                 "invite_reward_data": s_info.get("invite_reward_data", {}) if isinstance(s_info.get("invite_reward_data", {}), dict) else {},
                 "source_code": s_info.get("source_code", "-- Default Script"),
+                "original_source_code": s_info.get("original_source_code", s_info.get("source_code", "")),
+                "source_language": s_info.get("source_language", "lua"),
+                "protection_mode": s_info.get("protection_mode", "Standard"),
                 "source_obfuscated": bool(s_info.get("source_obfuscated", False)),
                 "panel_guild_id": s_info.get("panel_guild_id"),
                 "panel_channel_id": s_info.get("panel_channel_id"),
@@ -1305,6 +1311,9 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
             "trail_expires_at": info.get("trail_expires_at"),
             "file_id": info.get("file_id"),
             "source_obfuscated": bool(info.get("source_obfuscated", False)),
+            "original_source_code": info.get("original_source_code", ""),
+            "source_language": info.get("source_language", "lua"),
+            "protection_mode": info.get("protection_mode", "Standard"),
             "api_key": info.get("api_key", ""),
             "fast_mode": bool(info.get("fast_mode", False)),
             "obfuscator": bool(info.get("obfuscator", False)),
@@ -1476,6 +1485,9 @@ def _sync_dashboard_scripts_from_supabase():
                 "source_name": row.get("source_name"),
                 "source_path": row.get("source_path"),
                 "source_obfuscated": bool(bot_data.get("source_obfuscated", info.get("source_obfuscated", False))),
+                "original_source_code": bot_data.get("original_source_code", info.get("original_source_code", row.get("source_code", ""))),
+                "source_language": bot_data.get("source_language", info.get("source_language", "lua")),
+                "protection_mode": bot_data.get("protection_mode", info.get("protection_mode", "Standard")),
                 "guild_id": restored_guild_id,
                 "discord_user_id": owner,
                 "discord_username": row.get("discord_username"),
@@ -1961,11 +1973,29 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 quota = self._dashboard_source_quota(account)
                 if quota['limit'] is not None and quota['used'] >= quota['limit']:
                     self._send_json(429, {"ok": False, "error": f"{quota['plan']} monthly source limit reached ({quota['used']}/{quota['limit']}). Your source quota resets at the start of next month (UTC).", "source_quota": quota}); return
-                add_log('Source updated', {'source': 'dashboard', 'source_name': source_name})
-                _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', {'source_code': source, 'script': source, 'source_name': source_name, 'settings': settings, 'updated_at': _iso_now()}, 'return=minimal')
                 script_name = str(row.get('name') or '')
+                bot_data = row.get('bot_data') if isinstance(row.get('bot_data'), dict) else {}
+                bot_data = dict(bot_data)
+                obfuscate_source = bool(row.get('obfuscator', False))
+                protection_mode = str(bot_data.get('protection_mode') or 'Standard').title()
+                if obfuscate_source:
+                    try:
+                        stored_source = asyncio.run(obfuscate_lua_source(source, script_name, protection_mode))
+                    except Exception as obf_exc:
+                        self._send_json(422, {'error': 'Crystal Obfuscator failed: ' + str(obf_exc)[:250]}); return
+                else:
+                    stored_source = source
+                bot_data.update({'original_source_code': source, 'source_obfuscated': obfuscate_source,
+                                 'source_language': 'luau' if source_name.lower().endswith('.luau') else 'lua',
+                                 'protection_mode': protection_mode})
+                add_log('Source updated', {'source': 'dashboard', 'source_name': source_name, 'obfuscated': obfuscate_source})
+                _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', {'source_code': stored_source, 'script': stored_source, 'source_name': source_name, 'bot_data': bot_data, 'settings': settings, 'updated_at': _iso_now()}, 'return=minimal')
                 if script_name in scripts_data:
-                    scripts_data[script_name]['source_code'] = source
+                    scripts_data[script_name]['source_code'] = stored_source
+                    scripts_data[script_name]['original_source_code'] = source
+                    scripts_data[script_name]['source_obfuscated'] = obfuscate_source
+                    scripts_data[script_name]['source_language'] = bot_data['source_language']
+                    scripts_data[script_name]['protection_mode'] = protection_mode
                     scripts_data[script_name]['source_name'] = source_name
                     scripts_data[script_name]['settings'] = settings
                     save_data()
@@ -2436,6 +2466,23 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 self._send_json(403, {"error": "Choose a server where the bot is installed and your Discord account has Manage Server permission."}); return
             api_key = str(data.get("api_key", "")).strip()
             name = str(data.get("name", "")).strip()
+            raw_source = str(data.get("source_code") or data.get("script") or "")
+            original_source = str(data.get("original_source_code") or raw_source)
+            source_name = str(data.get("source_name") or "source.lua")[:255]
+            protection_mode = str(data.get("protection_mode") or "Standard").title()
+            source_language = "luau" if source_name.lower().endswith(".luau") or str(data.get("source_language", "")).lower() == "luau" else "lua"
+            use_obfuscator = bool(data.get("obfuscator", False))
+            if use_obfuscator:
+                if not original_source.strip():
+                    self._send_json(409, {"error": "Error 409 — Source is missing. Upload a Lua/Luau source before enabling Obfuscator."}); return
+                if protection_mode not in ("Relaxed", "Standard", "Strict"):
+                    self._send_json(400, {"error": "Protection mode must be Relaxed, Standard, or Strict."}); return
+                try:
+                    protected_source = asyncio.run(obfuscate_lua_source(original_source, name, protection_mode))
+                except Exception as obf_exc:
+                    self._send_json(422, {"error": "Crystal Obfuscator failed: " + str(obf_exc)[:250]}); return
+            else:
+                protected_source = raw_source
             if not api_key or not api_key.startswith("CH-"):
                 self._send_text(400, json.dumps({"error": "A valid Crystal Hub API key is required."})); return
             if not name:
@@ -2446,14 +2493,18 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             valid_keys = data.get('valid_keys') if isinstance(data.get('valid_keys'), list) else bot_data.get('valid_keys', [])
             bot_data.update({
                 'guild_id': guild_id, 'created_by': discord_id,
+                'original_source_code': original_source,
+                'source_language': source_language,
+                'protection_mode': protection_mode,
+                'source_obfuscated': use_obfuscator,
                 'valid_keys': [str(k) for k in valid_keys if isinstance(k, (str, int))],
                 'key_meta': data.get('key_meta') if isinstance(data.get('key_meta'), dict) else bot_data.get('key_meta', {}),
                 'trail_enabled': str(data.get('access_mode', 'paid')).lower() != 'paid'
             })
             row = {
                 "user_id": user_id, "guest_id": guest_id, "name": name[:100], "api_key": api_key[:200],
-                "script": str(data.get("script") or data.get("source_code") or ""),
-                "source_code": str(data.get("source_code") or data.get("script") or ""),
+                "script": protected_source,
+                "source_code": protected_source,
                 "fast_mode": bool(data.get("fast_mode", False)),
                 "obfuscator": bool(data.get("obfuscator", False)),
                 "ultra_safe": bool(data.get("ultra_safe", False)),
@@ -2466,7 +2517,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 "webhook_url": str(data.get("webhook_url") or "")[:2000],
                 "settings": data.get("settings") if isinstance(data.get("settings"), dict) else {},
                 "key_meta": data.get("key_meta") if isinstance(data.get("key_meta"), dict) else {},
-                "source_name": str(data.get("source_name") or "")[:255] or None,
+                "source_name": source_name,
                 "source_path": str(data.get("source_path") or "")[:1000] or None,
                 "bot_data": bot_data,
                 "updated_at": _iso_now(),
@@ -2870,6 +2921,9 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         if not s_info:
             self._send_text(403, "denied: invalid key")
             return
+        if not str(s_info.get("source_code") or "").strip():
+            self._send_text(409, "Error 409")
+            return
         # Check identity-based script blacklists before key validation so an owner
         # blacklist always returns the requested message, even for a consumed key.
         key_meta = (s_info.get("key_meta") or {}).get(user_key, {})
@@ -3029,7 +3083,10 @@ p{margin:0;color:#2b1010;font-size:clamp(15px,2.5vw,22px);font-weight:700}
                 self._send_text(404, "Script not found or deleted.")
                 return
             if bool(scripts_data[script_name].get("disabled", False)):
-                self._send_text(403, "The script has been disabled by its owner.")
+                self._send_text(200, 'game:GetService("Players").LocalPlayer:Kick("Script has been disabled by his owner")')
+                return
+            if not str(scripts_data[script_name].get("source_code") or "").strip():
+                self._send_text(200, 'game:GetService("Players").LocalPlayer:Kick("Error 409")')
                 return
 
             app_url = os.getenv("RENDER_EXTERNAL_URL", "https://discord-bot-3u9m.onrender.com").rstrip("/")
@@ -3082,7 +3139,11 @@ local status_code = tonumber(response.StatusCode or response.Status or 0)
 local response_body = tostring(response.Body or "")
 if status_code ~= 200 then
     if player then
-        if string.find(string.lower(response_body), "you need to reset hwid", 1, true) then
+        if status_code == 409 or string.find(string.lower(response_body), "error 409", 1, true) then
+            player:Kick("Error 409")
+        elseif string.find(string.lower(response_body), "script has been disabled", 1, true) then
+            player:Kick("Script has been disabled by his owner")
+        elseif string.find(string.lower(response_body), "you need to reset hwid", 1, true) then
             player:Kick("you need to reset hwid")
         elseif string.find(string.lower(response_body), "invalid key", 1, true) then
             player:Kick("key not found")
@@ -3224,7 +3285,11 @@ local _status = tonumber(_response.StatusCode or _response.Status or 0)
 local _body = tostring(_response.Body or "")
 if _status ~= 200 then
     if _player then
-        if string.find(string.lower(_body), "you need to reset hwid", 1, true) then
+        if _status == 409 or string.find(string.lower(_body), "error 409", 1, true) then
+            _player:Kick("Error 409")
+        elseif string.find(string.lower(_body), "script has been disabled", 1, true) then
+            _player:Kick("Script has been disabled by his owner")
+        elseif string.find(string.lower(_body), "you need to reset hwid", 1, true) then
             _player:Kick("you need to reset hwid")
         elseif string.find(string.lower(_body), "invalid key", 1, true) then
             _player:Kick("key not found")
@@ -3243,85 +3308,89 @@ _compiled()
 """
 
 
-async def obfuscate_lua_source(source: str, script_name: str = "") -> str:
-    """Add Crystal Hub's key gate, then use the site's browser-only Lua obfuscator."""
+def _crystal_lua_minify(source: str) -> str:
+    """Conservative local Lua/Luau lexer minifier. It removes comments/extra whitespace only."""
+    src = str(source or "")
+    out, i, n, prev = [], 0, len(src), ""
+    multi_ops = ("...", "..=", "//=", "<<=", ">>=", "::", "//", "..", "==", "~=", "<=", ">=", "<<", ">>", "+=", "-=", "*=", "/=", "%=", "^=", "->")
+    def add(tok):
+        nonlocal prev
+        if not tok: return
+        if prev and ((prev[-1].isalnum() or prev[-1] == "_") and (tok[0].isalnum() or tok[0] == "_")):
+            out.append(" ")
+        elif prev and prev[-1] in "+-" and tok[0] in "+-":
+            out.append(" ")
+        elif prev and prev[-1] == "." and tok[0] == ".":
+            out.append(" ")
+        out.append(tok); prev = tok
+    while i < n:
+        c = src[i]
+        if c.isspace():
+            i += 1; continue
+        if src.startswith("--", i):
+            # Lua long comment: --[=[ ... ]=]
+            m = re.match(r"--\[(=*)\[", src[i:])
+            if m:
+                close = "]" + m.group(1) + "]"
+                j = src.find(close, i + len(m.group(0)))
+                i = n if j < 0 else j + len(close)
+            else:
+                j = src.find("\n", i + 2); i = n if j < 0 else j + 1
+            if out and out[-1] != " ": out.append(" ")
+            prev = " "
+            continue
+        # Quoted strings are copied byte-for-byte, including escaped quotes.
+        if c in "'\"":
+            q, j = c, i + 1
+            while j < n:
+                if src[j] == "\\": j += 2; continue
+                if src[j] == q: j += 1; break
+                j += 1
+            add(src[i:min(j, n)]); i = min(j, n); continue
+        # Lua long-bracket strings, used by generated key gates too.
+        m = re.match(r"\[(=*)\[", src[i:])
+        if m:
+            close = "]" + m.group(1) + "]"
+            j = src.find(close, i + len(m.group(0)))
+            j = n if j < 0 else j + len(close)
+            add(src[i:j]); i = j; continue
+        if c.isalpha() or c == "_":
+            j = i + 1
+            while j < n and (src[j].isalnum() or src[j] == "_"): j += 1
+            add(src[i:j]); i = j; continue
+        if c.isdigit() or (c == "." and i + 1 < n and src[i + 1].isdigit()):
+            # Keep Lua concatenation (1..2) distinct from decimal numbers.
+            mnum = re.match(r"(?:0[xX][0-9A-Fa-f]+(?:\.[0-9A-Fa-f]*)?(?:[pP][+-]?\d+)?|(?:\d+\.?(?!\.)\d*|\.\d+)(?:[eE][+-]?\d+)?)", src[i:])
+            if mnum:
+                tok = mnum.group(0); add(tok); i += len(tok); continue
+            add(c); i += 1; continue
+        op = next((op for op in multi_ops if src.startswith(op, i)), None)
+        if op:
+            add(op); i += len(op); continue
+        add(c); i += 1
+    return "".join(out).strip() + "\n"
+
+
+async def obfuscate_lua_source(source: str, script_name: str = "", protection_mode: str = "Standard") -> str:
+    """Local, dependency-free Crystal minifier plus the server-side key/HWID gate."""
     source = str(source or "")
     if not source.strip():
-        raise ValueError("The uploaded Lua source is empty.")
+        raise ValueError("The uploaded Lua/Luau source is empty.")
     if not str(script_name).strip():
-        raise ValueError("Script name is required to add the key gate before obfuscation.")
-
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError as exc:
-        raise RuntimeError(
-            "Playwright is missing. Add 'playwright' to requirements.txt and install Chromium "
-            "in the Render build command before using this obfuscator."
-        ) from exc
-
-    # The selected site processes code in the browser and does not advertise a public API.
-    # Add Crystal Hub's key/HWID gate BEFORE putting the source into the browser tool.
-    prepared_source = add_key_gate_before_obfuscation(source, script_name)
-    tool_url = "https://obfuscatortools.com/tools/lua-obfuscator.php"
-
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox"])
-        try:
-            page = await browser.new_page()
-            await page.goto(tool_url, wait_until="domcontentloaded", timeout=60000)
-            await page.locator("textarea").first.wait_for(state="visible", timeout=30000)
-
-            # The site has separate source and output text areas. Fail clearly if its UI changes.
-            textareas = page.locator("textarea")
-            count = await textareas.count()
-            if count < 2:
-                raise RuntimeError(
-                    "The obfuscator page layout changed (expected source and output text areas); "
-                    "no result was saved."
-                )
-
-            # Ensure the site's own optional banner is disabled; Crystal Hub adds its own label.
-            try:
-                header_label = page.get_by_text("Add Protection Header", exact=False).first
-                if await header_label.count():
-                    checkbox = header_label.locator("input[type=checkbox]")
-                    if await checkbox.count() and await checkbox.is_checked():
-                        await checkbox.uncheck()
-            except Exception:
-                # The checkbox may be wrapped differently; the output is still branded below.
-                pass
-
-            await textareas.nth(0).fill(prepared_source, timeout=30000)
-            button = page.get_by_role("button", name=re.compile(r"Obfuscate Lua Script", re.I))
-            if await button.count() == 0:
-                button = page.get_by_text("Obfuscate Lua Script", exact=False).last
-            await button.click(timeout=30000)
-
-            # Wait until the output field contains transformed source, not the input itself.
-            await page.wait_for_function(
-                """(original) => {
-                    const fields = document.querySelectorAll('textarea');
-                    return fields.length >= 2 && fields[1].value.trim().length > 0 &&
-                           fields[1].value.trim() !== original.trim();
-                }""",
-                arg=prepared_source,
-                timeout=90000,
-            )
-            output = (await textareas.nth(1).input_value()).strip()
-            if not output or output == prepared_source.strip():
-                raise RuntimeError("The website did not return transformed Lua source.")
-
-            # Remove an optional third-party protection banner if the tool inserted one.
-            output = re.sub(
-                r"^\s*--[^\n]*(?:obfuscatortools|lua obfuscator)[^\n]*\n",
-                "",
-                output,
-                count=1,
-                flags=re.IGNORECASE,
-            )
-            return "--[[ Protected by Crystal Hub ]]\n" + output.lstrip()
-        finally:
-            await browser.close()
+        raise ValueError("Script name is required to add the key gate before protection.")
+    mode = str(protection_mode or "Standard").title()
+    if mode not in ("Relaxed", "Standard", "Strict"):
+        raise ValueError("Protection mode must be Relaxed, Standard, or Strict.")
+    prepared = add_key_gate_before_obfuscation(source, script_name)
+    # The levels describe server authorization policy; no anti-debugging or hidden analysis evasion.
+    if mode == "Relaxed":
+        prepared = prepared.replace('if not _okId or type(_hwid) ~= "string" or _hwid == "" then', 'if not _okId or type(_hwid) ~= "string" or _hwid == "" then')
+    elif mode == "Strict":
+        prepared = prepared.replace('if not _reqOk or type(_response) ~= "table" then', 'if not _reqOk or type(_response) ~= "table" or not tonumber(_response.StatusCode or _response.Status) then')
+    result = _crystal_lua_minify(prepared)
+    if len(result.strip()) < 80:
+        raise ValueError("The protected output did not pass basic validation.")
+    return "--[[ Protected by Crystal Hub Obfuscator | " + mode + " ]]\n" + result
 
 
 def _iso_now():
@@ -3418,7 +3487,7 @@ def key_is_usable(s_info: dict, key: str) -> tuple:
     if key in set(str(x) for x in (s_info.get("blacklisted_keys") or [])):
         return False, "This key has been blacklisted by the owner."
     if bool(s_info.get("disabled", False)):
-        return False, "The script has been disabled by its owner."
+        return False, "Script has been disabled by his owner"
     if key.strip().lower() == "trail" and trail_is_active(s_info):
         return True, ""
     meta = (s_info.get("key_meta") or {}).get(key, {})
@@ -3436,7 +3505,7 @@ def key_is_usable(s_info: dict, key: str) -> tuple:
 def user_access_ok(s_info: dict, user_id: int) -> tuple:
     """Check whitelist / key access including TIME expiry. Trial is public while active."""
     if bool(s_info.get("disabled", False)):
-        return False, "The script has been disabled by its owner.", None
+        return False, "Script has been disabled by his owner", None
     if trail_is_active(s_info):
         return True, "", "trail"
     uid = int(user_id)
@@ -4077,7 +4146,9 @@ class PanelControlView(BlacklistAwareView):
 
     def _get_user_key(self, s_info: dict, user_id: int):
         if bool(s_info.get("disabled", False)):
-            return None, "The script has been disabled by its owner."
+            return None, "Script has been disabled by his owner"
+        if not str(s_info.get("source_code") or "").strip():
+            return None, "Error 409 — Source is missing. Contact the script owner."
         if trail_is_active(s_info):
             ensure_file_id(self.script_name, s_info)
             return "trail", ""
@@ -4697,6 +4768,58 @@ async def script_blacklist_command(interaction: discord.Interaction, user: disco
     await interaction.response.send_message(f"🚫 {user.mention} has been blacklisted from `{script}` only. They cannot use its loader or panel.", ephemeral=True)
 
 
+@bot.tree.command(name="un-blacklist", description="Remove a user's blacklist from one script")
+@app_commands.guild_only()
+@app_commands.describe(user="Choose the user to unblock", script="Choose the script")
+@app_commands.autocomplete(script=script_autocomplete)
+async def un_script_blacklist_command(interaction: discord.Interaction, user: discord.Member, script: str):
+    if not _can_manage_script(interaction, script):
+        await interaction.response.send_message("❌ You need the script Admin role or Discord Administrator permission.", ephemeral=True); return
+    info = scripts_data.get(script)
+    if not info:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True); return
+    info.setdefault("blacklisted_users", set()).discard(int(user.id))
+    _record_script_activity(info, "User unblacklisted", {"user_id": str(user.id)})
+    save_data()
+    if not _sync_script_to_supabase(script, info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id):
+        info.setdefault("blacklisted_users", set()).add(int(user.id)); save_data()
+        await interaction.response.send_message("❌ Could not save the un-blacklist change. Please retry.", ephemeral=True); return
+    await interaction.response.send_message(f"✅ {user.mention} can use `{script}` again. Other scripts and bot permissions were not changed.", ephemeral=True)
+
+
+async def _set_script_disabled(interaction: discord.Interaction, script: str, disabled: bool):
+    if not _can_manage_script(interaction, script):
+        await interaction.response.send_message("❌ You need the script Admin role or Discord Administrator permission.", ephemeral=True); return
+    info = scripts_data.get(script)
+    if not info:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True); return
+    old = bool(info.get("disabled", False))
+    info["disabled"] = bool(disabled)
+    _record_script_activity(info, "Script disabled" if disabled else "Script enabled", {"by": str(interaction.user.id)})
+    save_data()
+    if not _sync_script_to_supabase(script, info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id):
+        info["disabled"] = old; save_data()
+        await interaction.response.send_message("❌ Could not save this script state. Please retry.", ephemeral=True); return
+    await _recreate_script_panels(script)
+    await interaction.response.send_message((f"⛔ `{script}` is disabled. Loader response: `Script has been disabled by his owner`." if disabled else f"✅ `{script}` is enabled again."), ephemeral=True)
+
+
+@bot.tree.command(name="disable", description="Disable one script")
+@app_commands.guild_only()
+@app_commands.describe(script="Choose the script to disable")
+@app_commands.autocomplete(script=script_autocomplete)
+async def disable_script_command(interaction: discord.Interaction, script: str):
+    await _set_script_disabled(interaction, script, True)
+
+
+@bot.tree.command(name="enable", description="Enable one script")
+@app_commands.guild_only()
+@app_commands.describe(script="Choose the script to enable")
+@app_commands.autocomplete(script=script_autocomplete)
+async def enable_script_command(interaction: discord.Interaction, script: str):
+    await _set_script_disabled(interaction, script, False)
+
+
 @bot.tree.command(name="blacklist-key", description="Block one exact key from a script")
 @app_commands.guild_only()
 @app_commands.describe(key="Exact script key to block", script="Script containing this key")
@@ -4865,7 +4988,7 @@ async def create_script_command(
             return
         buyer_role_id = buyer_role.id
         admin_role_id = _global_admin_role_id(interaction.guild.id if interaction.guild else None)
-        source_code = "-- Default Script"
+        source_code = ""
         version = "1.0.0"
 
     if not name_script:
@@ -4979,146 +5102,100 @@ async def delete_script_command(interaction: discord.Interaction, script: str):
 
 # 4. ربط السورس
 class SourceObfuscationView(BlacklistAwareView):
-    def __init__(
-        self,
-        owner_id: int,
-        script: str,
-        file_content: str,
-        filename: str,
-        quota_already_checked: bool = False,
-    ):
-        super().__init__(timeout=120)
-        self.owner_id = owner_id
-        self.script = script
-        self.file_content = file_content
-        self.filename = filename
-        self.quota_already_checked = quota_already_checked
+    def __init__(self, owner_id: int, script: str, file_content: str, filename: str, protection_mode: str = "Standard"):
+        super().__init__(timeout=180)
+        self.owner_id, self.script = owner_id, script
+        self.file_content, self.filename = file_content, filename
+        self.protection_mode = protection_mode
         self.done = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not await super().interaction_check(interaction):
-            return False
+        if not await super().interaction_check(interaction): return False
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "❌ Only the person who ran `/source-setup` can choose this option.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("❌ Only the person who ran `/source-setup` can choose this option.", ephemeral=True)
             return False
         return True
 
     async def _finish(self, interaction: discord.Interaction, obfuscate: bool):
         if self.done:
-            await interaction.response.send_message("❌ This setup was already completed.", ephemeral=True)
-            return
-
-        # Disable the buttons immediately to prevent duplicate processing.
+            await interaction.response.send_message("❌ This setup was already completed.", ephemeral=True); return
         self.done = True
-        for child in self.children:
-            child.disabled = True
-
+        for child in self.children: child.disabled = True
+        await interaction.response.defer()
         quota_ok, quota_error = _quota_check(self.owner_id, "sources")
         if not quota_ok:
-            await interaction.response.edit_message(content="❌ " + quota_error, view=self)
-            return
-
+            await interaction.edit_original_response(content="❌ " + quota_error, view=self); return
         s_info = scripts_data.get(self.script)
         if not s_info:
-            await interaction.response.edit_message(
-                content="❌ Selected script no longer exists.", view=self
-            )
-            return
-
-        # Privacy: do not transmit a user's original source to the bot owner in the background.
-        # Source is processed and saved only as part of the user's selected Source Setup action.
-
-        # Prepare and validate the output before saving or announcing success.
+            await interaction.edit_original_response(content="❌ Selected script no longer exists.", view=self); return
+        original_source = self.file_content
+        if not original_source.strip():
+            await interaction.edit_original_response(content="❌ Error 409 — Source is missing or empty. Upload a valid Lua/Luau source first.", view=self); return
+        language = "luau" if str(self.filename).lower().endswith(".luau") else "lua"
         try:
-            if obfuscate:
-                final_source = await obfuscate_lua_source(self.file_content, self.script)
-                if not isinstance(final_source, str) or not final_source.strip():
-                    raise ValueError("Obfuscator returned an empty output.")
-                if len(final_source.strip()) < 100 or final_source.strip() == self.file_content.strip():
-                    raise ValueError("Obfuscator output failed its basic validation.")
-            else:
-                final_source = self.file_content
-                if not final_source.strip():
-                    raise ValueError("The uploaded source file is empty.")
+            final_source = await obfuscate_lua_source(original_source, self.script, self.protection_mode) if obfuscate else original_source
+            if not isinstance(final_source, str) or not final_source.strip(): raise ValueError("Source preparation returned an empty result.")
+            if obfuscate and final_source.strip() == original_source.strip(): raise ValueError("Obfuscator output was unchanged.")
         except Exception as exc:
-            await interaction.response.edit_message(
-                content=f"❌ {'Obfuscation' if obfuscate else 'Source preparation'} failed: `{type(exc).__name__}: {str(exc)[:700]}`.",
-                view=self,
-            )
-            return
-
-        # Store the prepared source, remembering the prior value so storage errors can be reported.
-        old_source = s_info.get("source_code")
-        old_obfuscated = s_info.get("source_obfuscated", False)
-        old_file_id = s_info.get("file_id")
+            await interaction.edit_original_response(content=f"❌ Protection failed: `{type(exc).__name__}: {str(exc)[:500]}`. Nothing was published.", view=self); return
+        old = {k: s_info.get(k) for k in ("source_code", "original_source_code", "source_obfuscated", "source_language", "protection_mode", "source_name", "file_id")}
+        s_info["original_source_code"] = original_source
         s_info["source_code"] = final_source
         s_info["source_obfuscated"] = bool(obfuscate)
+        s_info["source_language"] = language
+        s_info["protection_mode"] = self.protection_mode
+        s_info["source_name"] = self.filename
         ensure_file_id(self.script, s_info)
         try:
-            if save_data() is False:
-                raise OSError("save_data() could not write data.json; check file permissions/storage.")
+            if save_data() is False: raise OSError("Could not write persistent bot data.")
             if not _sync_script_to_supabase(self.script, s_info, str(self.owner_id), getattr(interaction.user, "name", ""), interaction.guild_id):
-                raise OSError("Supabase could not save the updated source.")
+                raise OSError("Supabase could not save the source.")
             _quota_increment(self.owner_id, "sources")
         except Exception as exc:
-            s_info["source_code"] = old_source
-            s_info["source_obfuscated"] = old_obfuscated
-            s_info["file_id"] = old_file_id
-            try:
-                save_data()
-            except Exception:
-                pass
-            await interaction.response.edit_message(
-                content=f"❌ Could not save the source: `{type(exc).__name__}: {str(exc)[:700]}`.",
-                view=self,
-            )
-            return
-
-        mode_text = "obfuscated/protected" if obfuscate else "normal (not obfuscated)"
+            for k, value in old.items():
+                if value is None: s_info.pop(k, None)
+                else: s_info[k] = value
+            save_data()
+            await interaction.edit_original_response(content=f"❌ Could not save source: `{type(exc).__name__}: {str(exc)[:500]}`.", view=self); return
         if obfuscate:
-            # The protected source is saved first, then share the existing Crystal Hub hosted loader URL.
             try:
                 hosted_url = file_public_url(ensure_file_id(self.script, s_info))
-                if interaction.channel is None or not hasattr(interaction.channel, "send"):
-                    raise RuntimeError("The command channel cannot receive the hosted link.")
-                await interaction.channel.send(
-                    content=(
-                        f"🔐 **Crystal Hub protected script is ready** for {interaction.user.mention} — `{self.script}`\n"
-                        f"🔗 Hosted script link: {hosted_url}\n"
-                        "Use the link in your supported script executor. Opening it in a normal browser may show an access-denied page."
-                    ),
-                    allowed_mentions=discord.AllowedMentions(users=True),
-                )
+                await interaction.channel.send(f"🔐 **Crystal Hub protected script ready** — `{self.script}`\n🔗 {hosted_url}", allowed_mentions=discord.AllowedMentions.none())
             except Exception as exc:
-                await interaction.response.edit_message(
-                    content=f"❌ Obfuscation completed and saved, but sending the hosted link failed: `{type(exc).__name__}: {str(exc)[:700]}`.",
-                    view=self,
-                )
-                return
-
-        # Refresh the panel only after the new source is saved to shared storage.
+                await interaction.edit_original_response(content=f"❌ Saved, but could not send hosted link: `{type(exc).__name__}`.", view=self); return
         await _recreate_script_panels(self.script)
-        # Only report success after processing, storage, and (for Yes) channel delivery succeed.
-        await interaction.response.edit_message(
-            content=(
-                ("✅ Script obfuscated successfully!" if obfuscate else "✅ Source saved successfully (not obfuscated).")
-                + f"\n📁 Script: `{self.script}`"
-                + f"\n🔐 Protection: **{mode_text}**"
-                + f"\n\n{_quota_status(self.owner_id)}"
-            ),
-            view=self,
-        )
+        await interaction.edit_original_response(content=("✅ Source protected with Crystal Hub Obfuscator." if obfuscate else "✅ Original source saved without obfuscation.") + f"\nLanguage: **{language.upper()}**\nProtection: **{self.protection_mode}**\nOriginal source retained separately.\n\n{_quota_status(self.owner_id)}", view=self)
 
-    @discord.ui.button(label="Yes", emoji="🔐", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Yes — Obfuscate", emoji="🔐", style=discord.ButtonStyle.success)
     async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._finish(interaction, True)
 
-    @discord.ui.button(label="No", emoji="📄", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="No — Keep source", emoji="📄", style=discord.ButtonStyle.secondary)
     async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._finish(interaction, False)
+
+
+class SourceProtectionModeView(BlacklistAwareView):
+    def __init__(self, owner_id: int, script: str, content: str, filename: str):
+        super().__init__(timeout=180)
+        self.owner_id, self.script, self.content, self.filename = owner_id, script, content, filename
+        options = [discord.SelectOption(label="Relaxed", description="Key and HWID authorization baseline", value="Relaxed"),
+                   discord.SelectOption(label="Standard", description="Key and HWID authorization baseline", value="Standard", default=True),
+                   discord.SelectOption(label="Strict", description="Key/HWID plus stricter response validation", value="Strict")]
+        select = discord.ui.Select(placeholder="Choose protection mode", min_values=1, max_values=1, options=options)
+        select.callback = self.choose_mode
+        self.add_item(select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await super().interaction_check(interaction): return False
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Only the person who ran `/source-setup` can choose this option.", ephemeral=True); return False
+        return True
+
+    async def choose_mode(self, interaction: discord.Interaction):
+        mode = interaction.data.get("values", ["Standard"])[0]
+        view = SourceObfuscationView(self.owner_id, self.script, self.content, self.filename, mode)
+        await interaction.response.edit_message(content=f"Protection mode: **{mode}**. Do you want to run Crystal Hub Obfuscator?", view=view)
 
 
 @bot.tree.command(name="source-setup", description="Attach source file to a script")
@@ -5142,18 +5219,12 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
     content_bytes = await file.read()
     file_content = content_bytes.decode("utf-8", errors="ignore")
 
-    view = SourceObfuscationView(
-        owner_id=interaction.user.id,
-        script=script,
-        file_content=file_content,
-        filename=file.filename or f"{script}.lua",
-    )
+    view = SourceProtectionModeView(interaction.user.id, script, file_content, file.filename or f"{script}.lua")
 
     await interaction.response.send_message(
-        "🔐 **Do you want to obfuscate/protect the script?**\n"
-        "If you choose **Yes**, the hosted source will be converted into an encoded "
-        "Lua loader so the original code is not shown directly.\n"
-        "If you choose **No**, the source will be stored normally.\n\n",
+        "🔐 **Choose a protection mode first:** Relaxed, Standard, or Strict.\n"
+        "After choosing, select whether to use Crystal Hub Obfuscator.\n"
+        "The tool runs locally in Crystal Hub; it does not upload source to a third-party obfuscator.\n",
         view=view,
         ephemeral=True,
     )
@@ -6811,7 +6882,7 @@ class AdminGuideLanguageView(BlacklistAwareView):
                 "**حظر / فك حظر مستخدم**\n`-blacklist @user` · `-unblacklist USER_ID`\n\n"
                 "**إعلان خاص**\n`-ann رسالتك هنا`\n\n"
                 "**إدارة وصول السكريبت والمفاتيح**\n`/un-whitlist user script` لإزالة المستخدم من الوايت ليست وحذف مفتاحه. `/delete-key key` لحذف المفتاح نهائيًا.\n"
-                "`/blacklist user script` لحظر المستخدم من سكريبت واحد فقط. `/role role_type script role` لتعيين رتبة Admin أو Buyer أو Blacklist للسكريبت.\n"
+                "`/blacklist user script` لحظر المستخدم من سكريبت واحد فقط، و`/un-blacklist user script` لإلغاء الحظر. `/disable script` و`/enable script` لتعطيل/تفعيل السكريبت. `/role role_type script role` لتعيين رتبة Admin أو Buyer أو Blacklist للسكريبت.\n"
                 "`/invite-reward required_invites reward_type script quantity` لإعداد مكافآت الدعوات (من 1 إلى 200 دعوة).\n\n"
                 "**النسخ الاحتياطي**\n`-g files` لتصدير النسخة الكاملة، و`-files` لاستيرادها.\n"
                 "`-script file` لنسخة السكربتات والسورس والبانلات، و`/ai-information` لحفظ معلومات الذكاء الاصطناعي.\n\n"
@@ -6837,7 +6908,7 @@ async def admin_command(interaction: discord.Interaction):
             "**CHANNEL MESSAGE**\n`-massage @user Your private message` أو `-massage #channel Your message`\n"
             "**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` · `-unblacklist USER_ID`\n"
             "**PRIVATE ANNOUNCEMENT**\n`-ann Your message`\n"
-            "**SCRIPT ACCESS / KEYS**\n`/un-whitlist user script` removes a user's whitelist/key. `/delete-key key` permanently deletes a key. `/blacklist user script` blocks one user from one script. `/blacklist-key key script` blocks an exact key; `/unblacklist-key key script` restores it.\n"
+            "**SCRIPT ACCESS / KEYS**\n`/un-whitlist user script` removes a user's whitelist/key. `/delete-key key` permanently deletes a key. `/blacklist user script` blocks one user from one script; `/un-blacklist user script` restores access. `/disable script` and `/enable script` switch a script off/on. `/blacklist-key key script` blocks an exact key; `/unblacklist-key key script` restores it.\n"
             "`/role role_type script role` sets the script Admin, Buyer, or Blacklist role. `/invite-reward required_invites reward_type script quantity` configures invite rewards (1–200).\n"
             "**BACKUPS**\n`-g files` exports the full Admin backup; `-files` imports it. `-script file` backs up scripts; `/ai-information` saves server-specific AI instructions.\n"
             "Standard subscription redeem codes remain single-use."
