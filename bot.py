@@ -25,7 +25,7 @@ from discord import app_commands
 from discord.http import Route
 from discord.ext import commands, tasks
 
-BUILD_TAG = "CrystalHub-2026-10-30-ACCOUNT-LOGIN-API-V2"
+BUILD_TAG = "CrystalHub-2026-11-06-SOURCE-QUOTAS-KEY-BLACKLIST-V2"
 
 # Render keeps only files under a mounted persistent disk. Set
 # CRYSTAL_HUB_DATA_DIR=/var/data on Render after attaching that disk.
@@ -96,7 +96,7 @@ def _global_admin_status(interaction):
     if _has_global_admin_access(interaction):
         return True, ""
     if not _global_admin_role_id(interaction.guild.id):
-        return False, "❌ Set the server-wide admin role first with `/admin-role`, or use Discord Administrator permission."
+        return False, "❌ Set the server-wide admin role first with `-admin-role @role`, or use Discord Administrator permission."
     return False, "❌ You need the configured admin role or Discord Administrator permission."
 
 # Discord admin redeem access
@@ -140,6 +140,10 @@ def load_data():
                     s_info["valid_keys"] = set(s_info.get("valid_keys", []))
                     s_info["whitelisted_users"] = set(s_info.get("whitelisted_users", []))
                     s_info["user_keys"] = {int(k): v for k, v in s_info.get("user_keys", {}).items()}
+                    s_info["blacklisted_users"] = {int(x) for x in s_info.get("blacklisted_users", []) if str(x).isdigit()}
+                    s_info["blacklisted_keys"] = set(str(x) for x in s_info.get("blacklisted_keys", []))
+                    s_info.setdefault("blacklist_role_id", None)
+                    s_info.setdefault("invite_reward_data", {})
                     # Persistent panel location/message so /panel-setup does not create duplicates.
                     s_info.setdefault("panel_guild_id", None)
                     s_info.setdefault("panel_channel_id", None)
@@ -195,6 +199,10 @@ def save_data():
                 "version": s_info.get("version", "1.0.0"),
                 "buyer_role_id": s_info.get("buyer_role_id"),
                 "admin_role_id": s_info.get("admin_role_id"),
+                "blacklist_role_id": s_info.get("blacklist_role_id"),
+                "blacklisted_users": sorted(int(x) for x in s_info.get("blacklisted_users", set()) if str(x).isdigit()),
+                "blacklisted_keys": sorted(str(x) for x in s_info.get("blacklisted_keys", set())),
+                "invite_reward_data": s_info.get("invite_reward_data", {}) if isinstance(s_info.get("invite_reward_data", {}), dict) else {},
                 "source_code": s_info.get("source_code", "-- Default Script"),
                 "source_obfuscated": bool(s_info.get("source_obfuscated", False)),
                 "panel_guild_id": s_info.get("panel_guild_id"),
@@ -217,6 +225,7 @@ def save_data():
                 "api_key": s_info.get("api_key", ""),
                 "supabase_user_id": s_info.get("supabase_user_id"),
                 "supabase_row_id": s_info.get("supabase_row_id"),
+                "guild_id": s_info.get("guild_id"),
                 "fast_mode": bool(s_info.get("fast_mode", False)),
                 "obfuscator": bool(s_info.get("obfuscator", False)),
                 "ultra_safe": bool(s_info.get("ultra_safe", False)),
@@ -1049,9 +1058,9 @@ def _linked_subscription_plan(user_id):
         return 'Free'
     try:
         rows=_supabase_rest('crystal_subscriptions', {
-            'select':'plan,expires_at,created_at',
+            'select':'plan,expires_at,created_at,updated_at',
             'user_id':'eq.'+urllib.parse.quote(uid,safe=''),
-            'order':'created_at.desc',
+            'order':'updated_at.desc,created_at.desc',
             'limit':'20'
         })
         now=datetime.datetime.now(datetime.timezone.utc)
@@ -1273,6 +1282,10 @@ def _sync_script_to_supabase(script_name: str, info: dict, discord_user_id: str,
             "version": info.get("version", "1.0.0"),
             "buyer_role_id": info.get("buyer_role_id"),
             "admin_role_id": info.get("admin_role_id"),
+            "blacklist_role_id": info.get("blacklist_role_id"),
+            "blacklisted_users": sorted(str(x) for x in (info.get("blacklisted_users") or set())),
+            "blacklisted_keys": sorted(str(x) for x in (info.get("blacklisted_keys") or set())),
+            "invite_reward_data": info.get("invite_reward_data", {}) if isinstance(info.get("invite_reward_data", {}), dict) else {},
             "created_by": str(info.get("created_by") or discord_user_id),
             "panel_created_by": info.get("panel_created_by"),
             "panel_guild_id": info.get("panel_guild_id"),
@@ -1428,6 +1441,10 @@ def _sync_dashboard_scripts_from_supabase():
                 "source_code": row.get("source_code") or row.get("script") or "-- Default Script",
                 "buyer_role_id": bot_data.get("buyer_role_id"),
                 "admin_role_id": bot_data.get("admin_role_id"),
+                "blacklist_role_id": bot_data.get("blacklist_role_id"),
+                "blacklisted_users": _int_set(bot_data.get("blacklisted_users")),
+                "blacklisted_keys": set(str(x) for x in (bot_data.get("blacklisted_keys") or [])),
+                "invite_reward_data": bot_data.get("invite_reward_data") if isinstance(bot_data.get("invite_reward_data"), dict) else info.get("invite_reward_data", {}),
                 "valid_keys": valid_keys,
                 "whitelisted_users": whitelisted,
                 "user_keys": user_keys,
@@ -1465,6 +1482,13 @@ def _sync_dashboard_scripts_from_supabase():
             })
             info["hwid_bindings"] = bot_data.get("hwid_bindings") if isinstance(bot_data.get("hwid_bindings"), dict) else info.get("hwid_bindings", {})
             scripts_data[name] = info
+            # Invite reward progress is stored inside the selected script's bot_data
+            # as well as a local JSON snapshot, so it survives ephemeral host restarts.
+            invite_store = globals().get("invite_reward_state")
+            if isinstance(invite_store, dict):
+                for gid, invite_data in (info.get("invite_reward_data") or {}).items():
+                    if str(gid).isdigit() and isinstance(invite_data, dict):
+                        invite_store.setdefault("guilds", {})[str(gid)] = invite_data
             count += 1
 
         if count:
@@ -1715,6 +1739,16 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             return guild
         return None
 
+    def _dashboard_source_quota(self, account):
+        """Return the Dashboard owner's monthly source quota and usage."""
+        account = account if isinstance(account, dict) else {}
+        plan = _dashboard_account_plan(account)
+        limits = {"Free": 20, "Premium": 100, "Ultra": None, "Admin": None}
+        limit = limits.get(plan, 20)
+        owner_id = str(account.get("discord_user_id") or account.get("supabase_user_id") or account.get("guest_id") or "").strip()
+        used = int(_usage_record(owner_id).get("sources", 0)) if owner_id else 0
+        return {"plan": plan, "used": used, "limit": limit, "remaining": None if limit is None else max(0, limit-used), "month": _month_key()}
+
     def _dashboard_profile(self):
         """Return the Discord profile derived from the verified Supabase session."""
         account = self._dashboard_account()
@@ -1726,7 +1760,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
             "username": str(account.get("discord_username") or account.get("username") or "Discord User"),
             "avatar_url": str(account.get("avatar_url") or ""),
             "supabase_user_id": str(account.get("supabase_user_id") or ""),
-            "plan": _dashboard_account_plan(account)
+            "plan": _dashboard_account_plan(account),
+            "source_quota": self._dashboard_source_quota(account)
         }})
 
     def _dashboard_bot_guilds(self):
@@ -1916,12 +1951,16 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 save_data()
                 _send_script_webhook({**row, 'name': name, 'settings': settings, 'access_mode': access_mode}, 'Script Settings Updated', extra={'Source': 'Dashboard'})
                 _sync_dashboard_scripts_from_supabase()
+                _schedule_script_panel_refresh(name)
                 self._send_json(200, {"ok": True, "name": name, "settings": settings, "access_mode": access_mode}); return
             if action == 'update_source':
                 source = body.get('source_code')
                 source_name = str(body.get('source_name') or 'source.lua')[:255]
                 if not isinstance(source, str) or not source.strip() or len(source) > 1_500_000:
                     self._send_json(400, {"ok": False, "error": "Choose a non-empty source file smaller than 1.5 MB."}); return
+                quota = self._dashboard_source_quota(account)
+                if quota['limit'] is not None and quota['used'] >= quota['limit']:
+                    self._send_json(429, {"ok": False, "error": f"{quota['plan']} monthly source limit reached ({quota['used']}/{quota['limit']}). Your source quota resets at the start of next month (UTC).", "source_quota": quota}); return
                 add_log('Source updated', {'source': 'dashboard', 'source_name': source_name})
                 _supabase_rest('crystal_scripts', {'id':'eq.' + urllib.parse.quote(sid, safe='')}, 'PATCH', {'source_code': source, 'script': source, 'source_name': source_name, 'settings': settings, 'updated_at': _iso_now()}, 'return=minimal')
                 script_name = str(row.get('name') or '')
@@ -1932,7 +1971,14 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                     save_data()
                 _send_script_webhook({**row, 'settings': settings}, 'Source Updated', extra={'Source': 'Dashboard', 'File': source_name})
                 _sync_dashboard_scripts_from_supabase()
-                self._send_json(200, {"ok": True, "source_name": source_name, "settings": settings}); return
+                _schedule_script_panel_refresh(script_name)
+                quota_owner = str(account.get('discord_user_id') or account.get('supabase_user_id') or account.get('guest_id') or '').strip()
+                if quota_owner and quota['limit'] is not None:
+                    rec = _usage_record(quota_owner)
+                    rec['sources'] = int(rec.get('sources', 0)) + 1
+                    _save_json_dict(MONTHLY_USAGE_FILE, monthly_usage)
+                fresh_quota = self._dashboard_source_quota(account)
+                self._send_json(200, {"ok": True, "source_name": source_name, "settings": settings, "source_quota": fresh_quota}); return
             if action == 'save_webhooks':
                 hooks = body.get('webhooks') if isinstance(body.get('webhooks'), dict) else {}
                 clean = {}
@@ -2277,7 +2323,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         # their stable guest_id so the Admin entitlement survives page reloads on that device.
         if hmac.compare_digest(code, ADMIN_REDEEM_CODE):
             if user:
-                _supabase_upsert_subscription(user["id"], "Admin", None, "admin-code")
+                if not _supabase_upsert_subscription(user["id"], "Admin", None, "admin-code"):
+                    self._send_text(500, json.dumps({"error": "Could not save Admin access. Please try again."})); return
             else:
                 now_iso = _iso_now()
                 try:
@@ -2317,7 +2364,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                     patch["redeemed_guest_id"] = guest_id
                 _supabase_rest("crystal_redeem_codes", {"id": "eq." + str(record["id"])}, "PATCH", patch, "return=minimal")
                 if user:
-                    _supabase_upsert_subscription(user["id"], plan, expires_at, "redeem", record["id"])
+                    if not _supabase_upsert_subscription(user["id"], plan, expires_at, "redeem", record["id"]):
+                        raise RuntimeError("Could not save the subscription. Please try again.")
                 else:
                     _supabase_rest("crystal_guest_subscriptions", {}, "POST", {"guest_id": guest_id, "plan": plan, "expires_at": expires_at, "source": "redeem", "redeem_code_id": str(record["id"]), "updated_at": now.isoformat()}, "resolution=merge-duplicates,return=minimal")
                 self._send_text(200, json.dumps({"ok": True, "plan": plan, "duration": "Lifetime" if days <= 0 else f"{days} days", "expiresAt": expires_at})); return
@@ -2343,7 +2391,8 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 record["redeemed_by"] = user["id"]
                 record["redeemed_guest_id"] = None
                 site_entitlements[user["id"]] = {"plan": plan, "redeemed_at": now_redeemed, "expires_at": expires_at, "code_hash": key}
-                _supabase_upsert_subscription(user["id"], plan, expires_at, "legacy-redeem")
+                if not _supabase_upsert_subscription(user["id"], plan, expires_at, "legacy-redeem"):
+                    raise RuntimeError("Could not save the subscription. Please try again.")
             else:
                 # Legacy website codes must also work in Guest mode. Never require
                 # a Supabase account just to redeem a customer subscription.
@@ -2359,7 +2408,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                     pass
             record["redeemed_at"] = now_redeemed
             _save_json_dict(SITE_CODES_FILE, site_redeem_codes); _save_json_dict(SITE_ENTITLEMENTS_FILE, site_entitlements)
-        except OSError:
+        except Exception as exc:
             site_redeem_codes[key] = old_code
             self._send_text(500, json.dumps({"error": "Server could not save redemption. Try again later."})); return
         self._send_text(200, json.dumps({"ok": True, "plan": plan, "duration": "Lifetime" if days <= 0 else f"{days} days", "expiresAt": expires_at}))
@@ -2423,8 +2472,13 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 "updated_at": _iso_now(),
             }
             bd=dict(row["bot_data"]); bd["trail_enabled"]=(row["access_mode"]=="free"); row["bot_data"]=bd
-            existing=_supabase_rest("crystal_scripts", {"select":"id,user_id,guest_id", "api_key":"eq."+urllib.parse.quote(api_key, safe=""), "limit":"1"})
+            existing=_supabase_rest("crystal_scripts", {"select":"id,user_id,guest_id,bot_data", "api_key":"eq."+urllib.parse.quote(api_key, safe=""), "limit":"1"})
             if existing:
+                previous_bot_data = existing[0].get('bot_data') if isinstance(existing[0].get('bot_data'), dict) else {}
+                # Dashboard payloads intentionally omit bot-only fields. Merge them so
+                # script roles, blacklists, panel locations and whitelist/key links survive edits.
+                bot_data = {**previous_bot_data, **bot_data}
+                row['bot_data'] = bot_data
                 same_user = bool(user_id) and str(existing[0].get('user_id') or '') == user_id
                 same_guest = bool(guest_id) and str(existing[0].get('guest_id') or '') == guest_id
                 same_discord = bool(discord_id) and str(existing[0].get('discord_user_id') or '') == discord_id
@@ -2443,6 +2497,7 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
                 row_id=created[0].get("id") if created else None
                 _send_script_webhook({**row, 'settings': new_settings}, 'Script Created', username=str(account.get('discord_username') or account.get('username') or ''), discord_user_id=discord_id)
             _sync_dashboard_scripts_from_supabase()
+            _schedule_script_panel_refresh(name)
             self._send_json(200, {"ok":True,"id":row_id,"api_key":api_key,"name":name,"guild_id":guild_id})
         except Exception as exc:
             self._send_json(500, {"error":"Dashboard sync failed: "+str(exc)[:300]})
@@ -2814,6 +2869,15 @@ class DynamicScriptHandler(BaseHTTPRequestHandler):
         s_info = scripts_data.get(script_name)
         if not s_info:
             self._send_text(403, "denied: invalid key")
+            return
+        # Check identity-based script blacklists before key validation so an owner
+        # blacklist always returns the requested message, even for a consumed key.
+        key_meta = (s_info.get("key_meta") or {}).get(user_key, {})
+        assigned_uid = key_meta.get("assigned_user_id")
+        if not assigned_uid:
+            assigned_uid = next((str(uid) for uid, value in (s_info.get("user_keys") or {}).items() if str(value) == user_key), "")
+        if assigned_uid and _script_blacklist_reason(s_info, int(assigned_uid), bot.get_guild(int(s_info.get("guild_id") or 0)) if str(s_info.get("guild_id") or "").isdigit() else None):
+            self._send_text(403, "denied: You have been blacklisted by the owner")
             return
         ok_key, reason = key_is_usable(s_info, user_key)
         if not ok_key:
@@ -3351,6 +3415,8 @@ def key_is_usable(s_info: dict, key: str) -> tuple:
     key = str(key or "")
     if not key:
         return False, "Key is empty."
+    if key in set(str(x) for x in (s_info.get("blacklisted_keys") or [])):
+        return False, "This key has been blacklisted by the owner."
     if bool(s_info.get("disabled", False)):
         return False, "The script has been disabled by its owner."
     if key.strip().lower() == "trail" and trail_is_active(s_info):
@@ -3374,6 +3440,8 @@ def user_access_ok(s_info: dict, user_id: int) -> tuple:
     if trail_is_active(s_info):
         return True, "", "trail"
     uid = int(user_id)
+    if uid in (s_info.get("blacklisted_users") or set()):
+        return False, "You have been blacklisted by the owner.", None
     access = (s_info.get("user_access") or {}).get(uid)
     key = (s_info.get("user_keys") or {}).get(uid)
     if access and isinstance(access, dict):
@@ -3436,6 +3504,7 @@ def grant_user_access(
         "granted_at": _iso_now(),
     }
     register_key(s_info, key, mode, expires_at, created_by=created_by)
+    s_info.setdefault("key_meta", {}).setdefault(key, {})["assigned_user_id"] = str(uid)
 
 
 async def script_autocomplete(
@@ -3498,6 +3567,11 @@ def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = No
     if is_bot_owner(user_id) or _discord_plan(user_id) == "Admin" or _has_global_admin_access(interaction):
         return True
     if script_name and script_name in scripts_data:
+        role_id = scripts_data[script_name].get("admin_role_id")
+        if role_id and interaction.guild and isinstance(interaction.user, discord.Member):
+            role = interaction.guild.get_role(int(role_id))
+            if role and role in interaction.user.roles:
+                return True
         owner_id = scripts_data[script_name].get("created_by")
         if owner_id is not None and str(owner_id) == str(user_id):
             return True
@@ -3505,6 +3579,34 @@ def is_admin_or_has_role(interaction: discord.Interaction, script_name: str = No
         for panel in (scripts_data[script_name].get("panel_instances") or []):
             if str(panel.get("created_by", "")) == str(user_id):
                 return True
+    return False
+
+
+def _script_blacklist_reason(s_info: dict, user_id: int, guild=None) -> str:
+    """Return the owner blacklist reason for a script user, including a configured blacklist role."""
+    uid = int(user_id)
+    if uid in (s_info.get("blacklisted_users") or set()):
+        return "You have been blacklisted by the owner."
+    role_id = s_info.get("blacklist_role_id")
+    if role_id and guild is not None:
+        member = guild.get_member(uid)
+        role = guild.get_role(int(role_id))
+        if member and role and role in member.roles:
+            return "You have been blacklisted by the owner."
+    return ""
+
+
+def _can_manage_script(interaction: discord.Interaction, script_name: str) -> bool:
+    if not interaction.guild:
+        return False
+    if is_guild_administrator(interaction) or has_admin_editor_role(interaction) or _has_global_admin_access(interaction) or is_bot_owner(interaction.user.id):
+        return True
+    info = scripts_data.get(script_name) or {}
+    role_id = info.get("admin_role_id")
+    if role_id and isinstance(interaction.user, discord.Member):
+        role = interaction.guild.get_role(int(role_id))
+        if role and role in interaction.user.roles:
+            return True
     return False
 
 # Prevent blacklisted users from invoking any slash command, including if they own a server.
@@ -3525,26 +3627,21 @@ async def _global_blacklist_interaction_check(interaction: discord.Interaction) 
     command_name = getattr(getattr(interaction, "command", None), "name", "")
     management_commands = {
         "generate-key", "whitelist", "see-keys", "delete-key", "hwid",
-        "unwhitelist", "trail", "delete-script",
-        "set-buyer-role", "update-script", "reset-hwid-cooldown",
+        "un-whitlist", "blacklist", "trail", "delete-script",
+        "role", "update-script", "reset-hwid-cooldown",
         "ai-bot",
         "list-servers", "send-server-message",
     }
     if command_name in management_commands:
-        # /whitelist is strictly server-wide: configured Admin role OR Discord
-        # Administrator. It must never require Dashboard/API linking, Admin redeem,
-        # script ownership, or a per-script admin role.
-        if command_name == "whitelist":
-            allowed, message = _global_admin_status(interaction)
-            if not allowed:
-                try:
-                    await interaction.response.send_message(
-                        message or "❌ You need the server-wide Admin role or Discord Administrator permission.",
-                        ephemeral=True,
-                    )
-                except discord.HTTPException:
-                    pass
-                return False
+        # Script-specific Admin roles are checked against the selected script.
+        options = interaction.data.get("options", []) if isinstance(interaction.data, dict) else []
+        selected_script = next((str(x.get("value")) for x in options if isinstance(x, dict) and x.get("name") == "script"), None)
+        if selected_script and _can_manage_script(interaction, selected_script):
+            return True
+        # Commands without a script option perform their own scoped permission check.
+        if command_name in ("un-whitlist", "delete-key", "blacklist", "role"):
+            return True
+        if command_name in ("whitelist", "generate-key"):
             return True
 
         is_admin_tier = _discord_plan(interaction.user.id) == "Admin"
@@ -3612,63 +3709,124 @@ class BlacklistAwareModal(discord.ui.Modal):
         return await _deny_blacklisted_interaction(interaction)
 
 
+INVITE_REWARD_FILE = "crystal_hub_invite_rewards.json"
+
+def _load_invite_reward_state():
+    try:
+        with open(INVITE_REWARD_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else {"guilds": {}}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {"guilds": {}}
+
+invite_reward_state = _load_invite_reward_state()
+INVITE_USE_CACHE = {}
+
+def _save_invite_reward_state():
+    _atomic_write_json(INVITE_REWARD_FILE, invite_reward_state)
+
+def _invite_guild_state(guild_id):
+    guilds = invite_reward_state.setdefault("guilds", {})
+    state = guilds.setdefault(str(guild_id), {"config": {}, "members": {}, "claimed": []})
+    state.setdefault("config", {}); state.setdefault("members", {}); state.setdefault("claimed", [])
+    return state
+
+def _invite_count(guild_id, inviter_id):
+    state = _invite_guild_state(guild_id)
+    claimed = set(str(x) for x in state.get("claimed", []))
+    return sum(1 for member_id, owner_id in state.get("members", {}).items()
+               if str(owner_id) == str(inviter_id) and str(member_id) not in claimed)
+
+def _persist_invite_guild_state(guild_id):
+    """Mirror invite counts/config into the selected script's Supabase bot_data."""
+    state = _invite_guild_state(guild_id)
+    script_name = str((state.get("config") or {}).get("script") or "")
+    info = scripts_data.get(script_name)
+    if not info:
+        _save_invite_reward_state()
+        return False
+    info.setdefault("invite_reward_data", {})[str(guild_id)] = json.loads(json.dumps(state, ensure_ascii=False))
+    save_data()
+    _save_invite_reward_state()
+    return _sync_script_to_supabase(script_name, info, str(info.get("created_by") or ""), str(info.get("discord_username") or ""), guild_id)
+
+async def _cache_guild_invites(guild):
+    try:
+        invites = await guild.invites()
+        INVITE_USE_CACHE[guild.id] = {x.code: int(x.uses or 0) for x in invites}
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        INVITE_USE_CACHE[guild.id] = {}
+        return False
+
 class InviteRewardView(BlacklistAwareView):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Check Invites 📊", style=discord.ButtonStyle.primary, custom_id="check_invites")
+    @discord.ui.button(label="Check Invites", style=discord.ButtonStyle.primary, custom_id="crystal_invite_check")
     async def check_invites_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id in blacklisted_users:
-            await interaction.response.send_message("❌ You are blacklisted from using the reward system!", ephemeral=True)
-            return
+        count = _invite_count(interaction.guild_id, interaction.user.id)
+        cfg = _invite_guild_state(interaction.guild_id).get("config", {})
+        needed = int(cfg.get("required_invites") or 1)
+        await interaction.response.send_message(f"You have **{count}** active invite(s). Reward requirement: **{needed}**.", ephemeral=True)
 
-        total_invites = 0
-        try:
-            invites = await interaction.guild.invites()
-            for invite in invites:
-                if invite.inviter and invite.inviter.id == interaction.user.id:
-                    total_invites += invite.uses
-        except Exception:
-            pass
-
-        await interaction.response.send_message(f"📈 You currently have **{total_invites}** invite(s).", ephemeral=True)
-
-    @discord.ui.button(label="Get Invite Link 🔗", style=discord.ButtonStyle.success, custom_id="get_invite_link")
+    @discord.ui.button(label="Get Invite Link", style=discord.ButtonStyle.success, custom_id="crystal_invite_link")
     async def get_invite_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id in blacklisted_users:
-            await interaction.response.send_message("❌ You are blacklisted!", ephemeral=True)
-            return
-
-        invite = await interaction.channel.create_invite(max_age=0, max_uses=0, unique=True, reason=f"Invite for {interaction.user}")
-        await interaction.response.send_message(f"🔗 Here is your personal invite link:\n{invite.url}", ephemeral=True)
-
-    @discord.ui.button(label="Redeem Script 🎁", style=discord.ButtonStyle.danger, custom_id="redeem_script")
-    async def redeem_script_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id in blacklisted_users:
-            await interaction.response.send_message("❌ You are blacklisted!", ephemeral=True)
-            return
-
-        total_invites = 0
+        if not interaction.channel:
+            await interaction.response.send_message("Could not create an invite in this channel.", ephemeral=True); return
         try:
-            invites = await interaction.guild.invites()
-            for invite in invites:
-                if invite.inviter and invite.inviter.id == interaction.user.id:
-                    total_invites += invite.uses
+            invite = await interaction.channel.create_invite(max_age=0, max_uses=0, unique=True, reason=f"Invite reward for {interaction.user}")
+            await interaction.response.send_message(f"Your personal invite link:\n{invite.url}", ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message("I need Create Invite permission in this channel.", ephemeral=True)
+
+    @discord.ui.button(label="Claim Reward", style=discord.ButtonStyle.danger, custom_id="crystal_invite_claim")
+    async def claim_reward_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = _invite_guild_state(interaction.guild_id)
+        cfg = state.get("config", {})
+        required = int(cfg.get("required_invites") or 0)
+        script = str(cfg.get("script") or "")
+        reward_type = str(cfg.get("reward_type") or "key")
+        quantity = max(1, min(10, int(cfg.get("quantity") or 1)))
+        info = scripts_data.get(script)
+        if not required or not info:
+            await interaction.response.send_message("Invite rewards are not configured yet.", ephemeral=True); return
+        count = _invite_count(interaction.guild_id, interaction.user.id)
+        if count < required:
+            await interaction.response.send_message(f"You need **{required - count}** more active invite(s). You currently have **{count}**.", ephemeral=True); return
+        mode = str(cfg.get("duration_type") or "PERM").upper()
+        expires_at = cfg.get("expires_at")
+        created_keys = []
+        try:
+            if reward_type == "whitelist":
+                new_key = generate_random_key()
+                grant_user_access(info, interaction.user.id, new_key, mode, expires_at, created_by="invite-reward")
+                created_keys.append(new_key)
+            else:
+                for _ in range(quantity):
+                    new_key = generate_random_key()
+                    register_key(info, new_key, mode, expires_at, created_by=interaction.user.id)
+                    created_keys.append(new_key)
+            claimed = set(str(x) for x in state.get("claimed", []))
+            candidates = [mid for mid, owner in state.get("members", {}).items() if str(owner) == str(interaction.user.id) and str(mid) not in claimed]
+            state["claimed"] = list(claimed | set(candidates[:required]))
+            info.setdefault("invite_reward_data", {})[str(interaction.guild_id)] = json.loads(json.dumps(state, ensure_ascii=False))
+            save_data()
+            if not _sync_script_to_supabase(script, info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id):
+                raise RuntimeError("Could not save the reward to shared storage.")
+            _save_invite_reward_state()
+        except Exception as exc:
+            await interaction.response.send_message(f"Reward could not be saved: {str(exc)[:180]}", ephemeral=True); return
+        when = "Lifetime" if mode == "PERM" else format_remaining(expires_at)
+        try:
+            if reward_type == "whitelist":
+                await interaction.user.send(f"Your invite reward for **{script}** is ready. You have been whitelisted automatically. Key: `{created_keys[0]}` · {when}")
+            else:
+                await interaction.user.send(f"Your invite reward for **{script}** is ready. Here are your {len(created_keys)} key(s) · {when}:\n" + "\n".join(f"`{x}`" for x in created_keys))
         except Exception:
             pass
+        await interaction.response.send_message("Reward claimed successfully. The required invite count has been deducted.", ephemeral=True)
 
-        if total_invites >= 4:
-            await interaction.response.send_message(
-                "🎉 **Congratulations!** You have enough invites for **2 Days**. Please go and open a ticket in **୧・buy・💰-شراء** to claim your reward!",
-                ephemeral=True
-            )
-        elif total_invites >= 2:
-            await interaction.response.send_message(
-                "🎉 **Congratulations!** You have enough invites for **12 Hours**. Please go and open a ticket in **୧・buy・💰-شراء** to claim your reward!",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(f"⚠️ You need at least **2 invites** (for 12 hours) or **4 invites** (for 2 days). You currently have **{total_invites}** invites.", ephemeral=True)
 
 
 class ObfuscateConfirmView(BlacklistAwareView):
@@ -3742,11 +3900,13 @@ class AddSourceModal(BlacklistAwareModal, title="Crystal Hub — Add Source"):
         s_info = scripts_data[self.script_name]
         old_source = s_info.get("source_code")
         s_info["source_code"] = str(self.source.value)
-        if save_data() is False:
+        if save_data() is False or not _sync_script_to_supabase(self.script_name, s_info, str(self.owner_id), getattr(interaction.user, "name", ""), interaction.guild_id):
             s_info["source_code"] = old_source
-            await interaction.response.send_message("❌ Could not save the source. Please try again.", ephemeral=True)
+            save_data()
+            await interaction.response.send_message("❌ Could not save the source to shared storage. Please try again.", ephemeral=True)
             return
         _quota_increment(self.owner_id, "sources")
+        await _recreate_script_panels(self.script_name)
         await interaction.response.send_message(
             f"✅ Source added to `{self.script_name}`.\\n{_quota_status(self.owner_id)}",
             ephemeral=True
@@ -3788,6 +3948,10 @@ class ScriptRedeemModal(BlacklistAwareModal, title="Crystal Hub — Redeem a Key
         s_info = scripts_data.get(self.script_name)
         if not s_info:
             await interaction.response.send_message("❌ Script not found.", ephemeral=True)
+            return
+        blocked_reason = _script_blacklist_reason(s_info, interaction.user.id, interaction.guild)
+        if blocked_reason:
+            await interaction.response.send_message(f"🚫 {blocked_reason}", ephemeral=True)
             return
 
         if supplied in s_info.get("valid_keys", set()) or supplied in set((s_info.get("user_keys") or {}).values()):
@@ -3853,6 +4017,16 @@ class ViewMobileResponseView(BlacklistAwareView):
         self.script_name = script_name
         self.user_key = user_key
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await super().interaction_check(interaction):
+            return False
+        info = scripts_data.get(self.script_name) or {}
+        reason = _script_blacklist_reason(info, interaction.user.id, interaction.guild)
+        if reason:
+            await interaction.response.send_message(f"🚫 {reason}", ephemeral=True)
+            return False
+        return True
+
     @discord.ui.button(label="View Mobile 📱", style=discord.ButtonStyle.secondary)
     async def view_mobile_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s_info = scripts_data.get(self.script_name)
@@ -3879,6 +4053,16 @@ class PanelControlView(BlacklistAwareView):
     def __init__(self, script_name: str):
         super().__init__(timeout=None)
         self.script_name = script_name
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await super().interaction_check(interaction):
+            return False
+        info = scripts_data.get(self.script_name) or {}
+        reason = _script_blacklist_reason(info, interaction.user.id, interaction.guild)
+        if reason:
+            await interaction.response.send_message(f"🚫 {reason}", ephemeral=True)
+            return False
+        return True
 
     def _script_message(self, s_info: dict, user_key: str):
         file_id = ensure_file_id(self.script_name, s_info)
@@ -4030,6 +4214,79 @@ class PanelControlView(BlacklistAwareView):
 
 # ==================== Commands ==================== #
 
+async def _recreate_script_panels(script_name: str):
+    """Delete and recreate saved panels for one script after an Auto Panel update."""
+    info = scripts_data.get(script_name)
+    if not info:
+        return False
+    settings = info.get("settings") if isinstance(info.get("settings"), dict) else {}
+    if settings.get("auto_panel") is not True and info.get("auto_panel") is not True:
+        return False
+    instances = info.get("panel_instances") if isinstance(info.get("panel_instances"), list) else []
+    if not instances and info.get("panel_guild_id") and info.get("panel_channel_id"):
+        instances = [{"guild_id": info.get("panel_guild_id"), "channel_id": info.get("panel_channel_id"), "message_id": info.get("panel_message_id"), "name": info.get("panel_name"), "description": info.get("panel_description", ""), "created_by": info.get("panel_created_by")}]
+    refreshed = []
+    for panel in instances:
+        guild_id, channel_id = panel.get("guild_id"), panel.get("channel_id")
+        if not guild_id or not channel_id:
+            continue
+        try:
+            guild = bot.get_guild(int(guild_id))
+            if guild is None:
+                refreshed.append(panel); continue
+            channel = guild.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
+            title = str(panel.get("name") or info.get("panel_name") or script_name)[:256]
+            description = str(panel.get("description") or info.get("panel_description") or f"Best {script_name.lower()}\n\nCrystal Hub • Script Management")[:4000]
+            embed = discord.Embed(title=title, description=description, color=0xd4af37)
+            embed.set_footer(text=f"Access: {'FREE' if str(info.get('access_mode', 'paid')).lower() == 'free' else 'PAID'} • Crystal Hub")
+            if bot.user:
+                embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
+            old_message = None
+            old_id = panel.get("message_id")
+            if old_id:
+                try:
+                    old_message = await channel.fetch_message(int(old_id))
+                    await old_message.delete()
+                except discord.NotFound:
+                    old_message = None
+                except (discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+                    # If delete permission is missing, update the existing panel instead
+                    # of creating a duplicate in the same channel.
+                    try:
+                        old_message = await channel.fetch_message(int(old_id))
+                        await old_message.edit(embed=embed, view=PanelControlView(script_name))
+                        refreshed.append({**panel, "name": title, "description": description})
+                        continue
+                    except Exception:
+                        refreshed.append(panel); continue
+            new_message = await channel.send(embed=embed, view=PanelControlView(script_name))
+            refreshed.append({"guild_id": int(guild_id), "channel_id": int(channel_id), "message_id": int(new_message.id), "name": title, "description": description, "created_by": panel.get("created_by", info.get("panel_created_by", info.get("created_by")))})
+        except Exception as exc:
+            print(f"Auto Panel refresh failed for {script_name}: {type(exc).__name__}: {exc}")
+            refreshed.append(panel)
+    if refreshed:
+        info["panel_instances"] = refreshed
+        latest = refreshed[-1]
+        info["panel_guild_id"] = latest.get("guild_id")
+        info["panel_channel_id"] = latest.get("channel_id")
+        info["panel_message_id"] = latest.get("message_id")
+        info["panel_name"] = latest.get("name")
+        info["panel_description"] = latest.get("description", "")
+        save_data()
+        _sync_script_to_supabase(script_name, info, str(info.get("created_by") or ""), str(info.get("discord_username") or ""), latest.get("guild_id"))
+        return True
+    return False
+
+
+def _schedule_script_panel_refresh(script_name: str):
+    """Schedule an Auto Panel refresh from the synchronous HTTP handler thread."""
+    try:
+        if bot.loop and bot.loop.is_running():
+            asyncio.run_coroutine_threadsafe(_recreate_script_panels(script_name), bot.loop)
+    except Exception as exc:
+        print(f"Could not schedule Auto Panel refresh for {script_name}: {type(exc).__name__}: {exc}")
+
+
 async def _refresh_saved_panels_after_startup():
     """Recreate every saved panel instance after a process restart/update."""
     changed = False
@@ -4070,6 +4327,7 @@ async def _refresh_saved_panels_after_startup():
                 title = str(panel.get("name") or info.get("panel_name") or script_name)[:256]
                 description = panel.get("description") or info.get("panel_description") or f"Best {script_name.lower()}\n\nCrystal Hub • Script Management"
                 embed = discord.Embed(title=title, description=str(description)[:4000], color=0xd4af37)
+                embed.set_footer(text=f"Access: {'FREE' if str(info.get('access_mode', 'paid')).lower() == 'free' else 'PAID'} • Crystal Hub")
                 if bot.user:
                     embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
                 view = PanelControlView(script_name=script_name)
@@ -4156,7 +4414,10 @@ async def on_ready():
     if not getattr(bot, "_crystal_admin_view_registered", False):
         bot.add_view(AdminGuideLanguageView())
         bot.add_view(ExplainHomeView("en"))
+        bot.add_view(InviteRewardView())
         bot._crystal_admin_view_registered = True
+    for guild in bot.guilds:
+        await _cache_guild_invites(guild)
     # Global-only registration prevents every slash command from appearing twice.
     # Discord guild copies are intentionally NOT created.
     await _sync_global_commands()
@@ -4170,6 +4431,47 @@ async def on_ready():
     if not getattr(bot, "_crystal_panels_refreshed_this_process", False):
         bot._crystal_panels_refreshed_this_process = True
         await _refresh_saved_panels_after_startup()
+
+@bot.event
+async def on_member_join(member):
+    guild = member.guild
+    before = INVITE_USE_CACHE.get(guild.id, {})
+    try:
+        current_invites = await guild.invites()
+    except (discord.Forbidden, discord.HTTPException):
+        return
+    used = next((inv for inv in current_invites if int(inv.uses or 0) > int(before.get(inv.code, 0))), None)
+    INVITE_USE_CACHE[guild.id] = {inv.code: int(inv.uses or 0) for inv in current_invites}
+    if member.bot or not used or not used.inviter or used.inviter.bot:
+        return
+    state = _invite_guild_state(guild.id)
+    # A member can only count once; replace any prior attribution if they rejoin.
+    state.setdefault("members", {})[str(member.id)] = str(used.inviter.id)
+    state["claimed"] = [x for x in state.get("claimed", []) if str(x) != str(member.id)]
+    try:
+        await asyncio.to_thread(_persist_invite_guild_state, guild.id)
+    except Exception as exc: print(f"Invite reward join save failed: {type(exc).__name__}: {exc}")
+
+
+@bot.event
+async def on_member_remove(member):
+    state = _invite_guild_state(member.guild.id)
+    state.setdefault("members", {}).pop(str(member.id), None)
+    state["claimed"] = [x for x in state.get("claimed", []) if str(x) != str(member.id)]
+    try:
+        await asyncio.to_thread(_persist_invite_guild_state, member.guild.id)
+    except Exception as exc: print(f"Invite reward leave save failed: {type(exc).__name__}: {exc}")
+
+
+@bot.event
+async def on_invite_create(invite):
+    await _cache_guild_invites(invite.guild)
+
+
+@bot.event
+async def on_invite_delete(invite):
+    await _cache_guild_invites(invite.guild)
+
 
 @bot.event
 async def on_guild_join(guild):
@@ -4193,9 +4495,8 @@ async def generate_key_command(
 ):
     # /generate-key is available to Free/Premium/Ultra users too, but only
     # when the user has the configured Admin role or Discord Administrator permission.
-    role_ok = has_admin_editor_role(interaction) or is_guild_administrator(interaction) or _has_global_admin_access(interaction)
-    if not (is_bot_owner(interaction.user.id) or role_ok):
-        await interaction.response.send_message("❌ You need the configured Admin role or Discord Administrator permission to generate keys.", ephemeral=True)
+    if not _can_manage_script(interaction, script):
+        await interaction.response.send_message("❌ You need the Admin role configured for this script or Discord Administrator permission to generate keys.", ephemeral=True)
         return
     if script not in scripts_data:
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
@@ -4234,12 +4535,8 @@ async def whitelist_command(
     duration_type: app_commands.Choice[str] = None,
     duration: str = None,
 ):
-    allowed, permission_error = _global_admin_status(interaction)
-    if not allowed:
-        await interaction.response.send_message(
-            permission_error or "❌ You need the server-wide Admin role or Discord Administrator permission.",
-            ephemeral=True,
-        )
+    if not _can_manage_script(interaction, script):
+        await interaction.response.send_message("❌ You need the Admin role configured for this script or Discord Administrator permission.", ephemeral=True)
         return
     if script not in scripts_data:
         await interaction.response.send_message("❌ Script not found.", ephemeral=True)
@@ -4300,6 +4597,164 @@ async def whitelist_command(
 # Removed duplicate whitelist alias `/whilst`; `/whitelist` is the canonical command.
 
 
+@bot.tree.command(name="un-whitlist", description="Remove a user's whitelist and script key")
+@app_commands.guild_only()
+@app_commands.describe(user="Choose the user to remove", script="Choose the script")
+@app_commands.autocomplete(script=script_autocomplete)
+async def un_whitlist_command(interaction: discord.Interaction, user: discord.Member, script: str):
+    if not _can_manage_script(interaction, script):
+        await interaction.response.send_message("❌ You need the script Admin role or Discord Administrator permission.", ephemeral=True); return
+    info = scripts_data.get(script)
+    if not info:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True); return
+    uid = int(user.id)
+    previous_access = (info.get("user_access") or {}).get(uid) or {}
+    key = (info.get("user_keys") or {}).pop(uid, None) or (previous_access.get("key") if isinstance(previous_access, dict) else None)
+    (info.get("whitelisted_users") or set()).discard(uid)
+    (info.get("user_access") or {}).pop(uid, None)
+    if key:
+        (info.get("valid_keys") or set()).discard(str(key))
+        (info.get("key_meta") or {}).pop(str(key), None)
+        hwid_bindings.pop(f"{script}:{key}", None)
+        save_hwid_bindings()
+    _record_script_activity(info, "Whitelist removed", {"user": str(user), "user_id": str(uid)})
+    save_data()
+    if not _sync_script_to_supabase(script, info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id):
+        await interaction.response.send_message("❌ The change could not be synced to shared storage. Please retry.", ephemeral=True); return
+    _send_script_webhook(info, "Whitelist Removed", username=getattr(user, "name", ""), discord_user_id=str(uid), key=key or "")
+    await interaction.response.send_message(f"✅ Removed {user.mention} from `{script}` whitelist and deleted their assigned key.", ephemeral=True)
+
+
+@bot.tree.command(name="delete-key", description="Permanently delete a script key and revoke its user access")
+@app_commands.guild_only()
+@app_commands.describe(key="Paste the exact script key to delete")
+async def delete_key_command(interaction: discord.Interaction, key: str):
+    raw_key = str(key or "").strip()[:200]
+    if not raw_key:
+        await interaction.response.send_message("❌ Enter the exact key.", ephemeral=True); return
+    matches = []
+    for name, info in scripts_data.items():
+        if not _script_in_guild(info, interaction.guild_id):
+            continue
+        user_keys = info.get("user_keys") or {}
+        if raw_key in set(str(v) for v in user_keys.values()) or raw_key in set(str(v) for v in (info.get("valid_keys") or set())) or raw_key in (info.get("key_meta") or {}):
+            matches.append((name, info))
+    if not matches:
+        await interaction.response.send_message("❌ Key not found in this server's scripts.", ephemeral=True); return
+    if not all(_can_manage_script(interaction, name) for name, _info in matches):
+        await interaction.response.send_message("❌ You need the Admin role configured for the matching script or Discord Administrator permission.", ephemeral=True); return
+    removed_from = []
+    for name, info in matches:
+        (info.get("valid_keys") or set()).discard(raw_key)
+        (info.get("key_meta") or {}).pop(raw_key, None)
+        removed_users = [int(uid) for uid, value in list((info.get("user_keys") or {}).items()) if str(value) == raw_key]
+        for uid in removed_users:
+            info["user_keys"].pop(uid, None)
+            (info.get("whitelisted_users") or set()).discard(uid)
+            (info.get("user_access") or {}).pop(uid, None)
+        for uid, access in list((info.get("user_access") or {}).items()):
+            if isinstance(access, dict) and str(access.get("key") or "") == raw_key:
+                info["user_access"].pop(uid, None)
+                try: (info.get("whitelisted_users") or set()).discard(int(uid))
+                except (TypeError, ValueError): pass
+        hwid_bindings.pop(f"{name}:{raw_key}", None)
+        _record_script_activity(info, "Key deleted", {"key": raw_key, "deleted_by": getattr(interaction.user, "name", "")})
+        save_data()
+        if not _sync_script_to_supabase(name, info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id):
+            await interaction.response.send_message(f"❌ Could not sync deletion for `{name}`. Please retry.", ephemeral=True); return
+        _send_script_webhook(info, "Key Deleted", username=getattr(interaction.user, "name", ""), discord_user_id="", key=raw_key)
+        removed_from.append(name)
+    save_hwid_bindings()
+    await interaction.response.send_message(f"✅ Key permanently deleted from: {', '.join(f'`{x}`' for x in removed_from)}. Any linked user access was revoked.", ephemeral=True)
+
+
+@bot.tree.command(name="blacklist", description="Blacklist a user from one script only")
+@app_commands.guild_only()
+@app_commands.describe(user="Choose the user to blacklist", script="Choose the script")
+@app_commands.autocomplete(script=script_autocomplete)
+async def script_blacklist_command(interaction: discord.Interaction, user: discord.Member, script: str):
+    if not _can_manage_script(interaction, script):
+        await interaction.response.send_message("❌ You need the script Admin role or Discord Administrator permission.", ephemeral=True); return
+    info = scripts_data.get(script)
+    if not info:
+        await interaction.response.send_message("❌ Script not found.", ephemeral=True); return
+    if user.id == interaction.user.id:
+        await interaction.response.send_message("❌ You cannot blacklist yourself.", ephemeral=True); return
+    info.setdefault("blacklisted_users", set()).add(int(user.id))
+    # Keep the assigned key-to-user link intact: the loader needs that identity to
+    # return the exact owner-blacklist message instead of a generic invalid-key error.
+    assigned_key = (info.get("user_keys") or {}).get(int(user.id))
+    _record_script_activity(info, "User blacklisted", {"user": str(user), "user_id": str(user.id)})
+    save_data()
+    if not _sync_script_to_supabase(script, info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id):
+        info["blacklisted_users"].discard(int(user.id)); save_data()
+        await interaction.response.send_message("❌ Could not save the blacklist. Please retry.", ephemeral=True); return
+    _send_script_webhook(info, "User Blacklisted", username=getattr(user, "name", ""), discord_user_id=str(user.id), key=assigned_key or "")
+    try:
+        await user.send(f"You have been blacklisted by the owner from **{script}**. You can no longer use this script or its panel.")
+    except Exception:
+        pass
+    await interaction.response.send_message(f"🚫 {user.mention} has been blacklisted from `{script}` only. They cannot use its loader or panel.", ephemeral=True)
+
+
+@bot.tree.command(name="blacklist-key", description="Block one exact key from a script")
+@app_commands.guild_only()
+@app_commands.describe(key="Exact script key to block", script="Script containing this key")
+@app_commands.autocomplete(script=script_autocomplete)
+async def blacklist_key_command(interaction: discord.Interaction, key: str, script: str):
+    if not _can_manage_script(interaction, script):
+        await interaction.response.send_message("❌ You need the script Admin role or Discord Administrator permission.", ephemeral=True); return
+    info = scripts_data.get(script)
+    key = str(key or "").strip()
+    if not info or not key or key not in (info.get("key_meta") or {}) and key not in (info.get("valid_keys") or set()):
+        await interaction.response.send_message("❌ That exact key was not found in this script.", ephemeral=True); return
+    info.setdefault("blacklisted_keys", set()).add(key)
+    meta = info.setdefault("key_meta", {}).setdefault(key, {})
+    meta["blacklisted"] = True
+    meta["disabled"] = True
+    # Remove its device binding so it cannot keep an active device session.
+    hwid_bindings.pop(f"{script}:{key}", None)
+    save_hwid_bindings()
+    _record_script_activity(info, "Key blacklisted", {"key": key})
+    save_data()
+    owner = str(info.get("created_by") or interaction.user.id)
+    if not _sync_script_to_supabase(script, info, owner, str(interaction.user), interaction.guild_id):
+        info["blacklisted_keys"].discard(key)
+        meta["blacklisted"] = False
+        meta["disabled"] = False
+        save_data()
+        await interaction.response.send_message("❌ Could not save the key blacklist. Please retry.", ephemeral=True); return
+    _send_script_webhook(info, "Key Blacklisted", key=key, extra={"Source": "Discord Admin"})
+    await interaction.response.send_message("🚫 This key is now blacklisted and cannot be used. Anyone who clicks Get Script with this key will see the blacklist message.", ephemeral=True)
+
+
+@bot.tree.command(name="unblacklist-key", description="Restore one blacklisted key")
+@app_commands.guild_only()
+@app_commands.describe(key="Exact script key to restore", script="Script containing this key")
+@app_commands.autocomplete(script=script_autocomplete)
+async def unblacklist_key_command(interaction: discord.Interaction, key: str, script: str):
+    if not _can_manage_script(interaction, script):
+        await interaction.response.send_message("❌ You need the script Admin role or Discord Administrator permission.", ephemeral=True); return
+    info = scripts_data.get(script)
+    key = str(key or "").strip()
+    if not info or key not in set(str(x) for x in (info.get("blacklisted_keys") or [])):
+        await interaction.response.send_message("❌ That key is not blacklisted in this script.", ephemeral=True); return
+    info.setdefault("blacklisted_keys", set()).discard(key)
+    meta = info.setdefault("key_meta", {}).setdefault(key, {})
+    meta.pop("blacklisted", None)
+    meta["disabled"] = False
+    _record_script_activity(info, "Key blacklist removed", {"key": key})
+    save_data()
+    owner = str(info.get("created_by") or interaction.user.id)
+    if not _sync_script_to_supabase(script, info, owner, str(interaction.user), interaction.guild_id):
+        info.setdefault("blacklisted_keys", set()).add(key)
+        meta["blacklisted"] = True
+        meta["disabled"] = True
+        save_data()
+        await interaction.response.send_message("❌ Could not save the key update. Please retry.", ephemeral=True); return
+    await interaction.response.send_message("✅ Key blacklist removed. The key can be used again if it is still valid and not expired.", ephemeral=True)
+
+
 @bot.tree.command(name="trail", description="Enable or disable free Trail access for a script")
 @app_commands.describe(script="Target script", state="ON or OFF", duration_type="PERM or TIME (used when enabling)", duration="Required for TIME (e.g. 1m, 1h, 1d)")
 @app_commands.autocomplete(script=script_autocomplete)
@@ -4334,6 +4789,7 @@ async def trail_command(
         s_info["access_mode"] = "paid"
         save_data()
         _sync_script_to_supabase(script, s_info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
+        await _recreate_script_panels(script)
         await interaction.response.send_message(f"✅ Trail **OFF** for `{script}` — Paid/Key access is active again on Dashboard and Discord.", ephemeral=True)
         return
     mode = (duration_type.value if duration_type else "PERM").upper()
@@ -4349,6 +4805,7 @@ async def trail_command(
     ensure_file_id(script, s_info)
     save_data()
     _sync_script_to_supabase(script, s_info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
+    await _recreate_script_panels(script)
     when = "permanent" if mode == "PERM" else f"TIME — ends in {format_remaining(expires_at)}"
     await interaction.response.send_message(
         f"✅ Trail **ON** for `{script}` ({when}) — Free access is now active on Dashboard and Discord.",
@@ -4603,6 +5060,8 @@ class SourceObfuscationView(BlacklistAwareView):
         try:
             if save_data() is False:
                 raise OSError("save_data() could not write data.json; check file permissions/storage.")
+            if not _sync_script_to_supabase(self.script, s_info, str(self.owner_id), getattr(interaction.user, "name", ""), interaction.guild_id):
+                raise OSError("Supabase could not save the updated source.")
             _quota_increment(self.owner_id, "sources")
         except Exception as exc:
             s_info["source_code"] = old_source
@@ -4640,6 +5099,8 @@ class SourceObfuscationView(BlacklistAwareView):
                 )
                 return
 
+        # Refresh the panel only after the new source is saved to shared storage.
+        await _recreate_script_panels(self.script)
         # Only report success after processing, storage, and (for Yes) channel delivery succeed.
         await interaction.response.edit_message(
             content=(
@@ -4699,53 +5160,34 @@ async def source_setup_command(interaction: discord.Interaction, file: discord.A
 
 
 # 5. تعديل رول الباير
-@bot.tree.command(name="set-buyer-role", description="Change the buyer role for a script")
-@app_commands.describe(script="Choose the script", buyer_role="Select the new buyer role")
+@bot.tree.command(name="role", description="Set a script Admin, Buyer, or Blacklist role")
+@app_commands.guild_only()
+@app_commands.describe(role_type="Choose which role type to configure", script="Choose the script", role="Choose the Discord role")
 @app_commands.autocomplete(script=script_autocomplete)
-async def set_buyer_role_command(interaction: discord.Interaction, script: str, buyer_role: discord.Role):
-    if not is_admin_or_has_role(interaction, script):
-        _, admin_error = _global_admin_status(interaction)
-        await interaction.response.send_message(admin_error or "❌ You need the configured admin role or Discord Administrator permission.", ephemeral=True)
+@app_commands.choices(role_type=[
+    app_commands.Choice(name="Blacklist Role", value="blacklist"),
+    app_commands.Choice(name="Admin Role", value="admin"),
+    app_commands.Choice(name="Buyer Role", value="buyer"),
+])
+async def configure_script_role_command(interaction: discord.Interaction, role_type: app_commands.Choice[str], script: str, role: discord.Role):
+    if not interaction.guild or not (is_guild_administrator(interaction) or _has_global_admin_access(interaction) or is_bot_owner(interaction.user.id)):
+        await interaction.response.send_message("❌ Only a Discord Administrator or the configured global Admin role can configure script roles.", ephemeral=True)
         return
-
-    if script not in scripts_data:
-        await interaction.response.send_message("❌ Selected script does not exist.", ephemeral=True)
+    info = scripts_data.get(script)
+    if not info or not _script_in_guild(info, interaction.guild_id):
+        await interaction.response.send_message("❌ Selected script does not exist in this server.", ephemeral=True)
         return
-
-    scripts_data[script]["buyer_role_id"] = buyer_role.id
-    save_data()
-    await interaction.response.send_message(f"✅ Buyer role for `{script}` updated to {buyer_role.mention}!", ephemeral=True)
-
-
-# Server-wide admin role — applies to bot management actions, not to subscription quotas.
-# Prefix-only admin command: -set-admin-role @role
-@bot.tree.command(name="admin-role", description="Set the server-wide role allowed to manage Crystal Hub")
-@app_commands.describe(admin_role="The role allowed to manage scripts and bot settings")
-async def set_admin_role_command(interaction: discord.Interaction, admin_role: discord.Role):
-    if not interaction.guild or not is_guild_administrator(interaction):
-        await interaction.response.send_message(
-            "❌ Only a Discord server Administrator can configure the global admin role.",
-            ephemeral=True,
-        )
+    field = {"admin": "admin_role_id", "buyer": "buyer_role_id", "blacklist": "blacklist_role_id"}[role_type.value]
+    previous = info.get(field)
+    info[field] = role.id
+    if not save_data() or not _sync_script_to_supabase(script, info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild.id):
+        info[field] = previous
+        save_data()
+        await interaction.response.send_message("❌ Could not save this role. Try again.", ephemeral=True)
         return
-
-    GLOBAL_ADMIN_ROLE_IDS[str(interaction.guild.id)] = admin_role.id
-    if not _save_global_admin_roles():
-        GLOBAL_ADMIN_ROLE_IDS.pop(str(interaction.guild.id), None)
-        await interaction.response.send_message(
-            "❌ Could not save the admin role setting. Check the bot's storage and logs.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.send_message(
-        f"✅ Server-wide admin role set to {admin_role.mention}. This role can manage bot features across all scripts. "
-        "It does **not** bypass Free/Premium/Ultra quotas or redeem-code requirements.",
-        ephemeral=True,
-    )
+    await interaction.response.send_message(f"✅ {role_type.name} for `{script}` is now {role.mention}.", ephemeral=True)
 
 
-# Dashboard authentication is handled by Supabase Discord OAuth; no /api slash command is registered.
 @bot.tree.command(name="hwid", description="Reset a user's HWID for one selected script")
 @app_commands.describe(
     script="Required: choose the script",
@@ -5028,6 +5470,7 @@ async def panel_setup_command(
                          or s_info.get("panel_description")
                          or f"Best {script.lower()}\n\nCrystal Hub • Script Management")
     embed = discord.Embed(title=name_panel, description=panel_description, color=0xd4af37)
+    embed.set_footer(text=f"Access: {'FREE' if str(s_info.get('access_mode', 'paid')).lower() == 'free' else 'PAID'} • Crystal Hub")
     embed.set_author(name="Crystal Hub", icon_url=bot.user.display_avatar.url)
     view = PanelControlView(script_name=script)
 
@@ -5138,6 +5581,8 @@ async def update_script_command(interaction: discord.Interaction, script: str, r
     if script in scripts_data:
         scripts_data[script]["version"] = revision
         save_data()
+        _sync_script_to_supabase(script, scripts_data[script], str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
+        await _recreate_script_panels(script)
 
     ping_text = "@everyone @here"
     embed = discord.Embed(
@@ -5149,20 +5594,45 @@ async def update_script_command(interaction: discord.Interaction, script: str, r
 
 
 # 9. مكافآت الدعوة
-@bot.tree.command(name="invite-reward", description="Send the invite rewards panel")
-async def invite_reward_command(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
-        return
+@bot.tree.command(name="invite-reward", description="Configure and publish the invite rewards panel")
+@app_commands.guild_only()
+@app_commands.describe(required_invites="Required active invites (1–200)", reward_type="Choose Key or automatic Whitelist", script="Choose the script", quantity="Number of keys when Key is selected (1–10); Whitelist grants one access", duration_type="Key duration", duration="Required for TIME (e.g. 1d, 12h)")
+@app_commands.autocomplete(script=script_autocomplete)
+@app_commands.choices(reward_type=[app_commands.Choice(name="Key", value="key"), app_commands.Choice(name="Whitelist", value="whitelist")], duration_type=[app_commands.Choice(name="Permanent", value="PERM"), app_commands.Choice(name="Timed", value="TIME")])
+async def invite_reward_command(interaction: discord.Interaction, required_invites: app_commands.Range[int, 1, 200], reward_type: app_commands.Choice[str], script: str, quantity: app_commands.Range[int, 1, 10] = 1, duration_type: app_commands.Choice[str] = None, duration: str = None):
+    if not interaction.guild or not _can_manage_script(interaction, script):
+        await interaction.response.send_message("Only the script Admin role or a Discord Administrator can configure invite rewards.", ephemeral=True); return
+    info = scripts_data.get(script)
+    if not info or not _script_in_guild(info, interaction.guild_id):
+        await interaction.response.send_message("Choose a script that belongs to this server.", ephemeral=True); return
+    mode = (duration_type.value if duration_type else "PERM").upper()
+    try:
+        mode, expires_at = resolve_expires(mode, duration)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True); return
+    if reward_type.value == "whitelist":
+        quantity = 1
+    if not await _cache_guild_invites(interaction.guild):
+        await interaction.response.send_message("I need the Manage Server permission to track invite usage. Grant it to the bot, then run /invite-reward again.", ephemeral=True); return
+    state = _invite_guild_state(interaction.guild_id)
+    previous_script = str((state.get("config") or {}).get("script") or "")
+    if previous_script and previous_script != script and previous_script in scripts_data:
+        scripts_data[previous_script].setdefault("invite_reward_data", {}).pop(str(interaction.guild_id), None)
+        save_data()
+        _sync_script_to_supabase(previous_script, scripts_data[previous_script], str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
+    state["config"] = {"required_invites": int(required_invites), "reward_type": reward_type.value, "script": script, "quantity": int(quantity), "duration_type": mode, "expires_at": expires_at}
+    info.setdefault("invite_reward_data", {})[str(interaction.guild_id)] = json.loads(json.dumps(state, ensure_ascii=False))
+    try:
+        save_data()
+        _save_invite_reward_state()
+        if not _sync_script_to_supabase(script, info, str(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id):
+            raise RuntimeError("Could not save invite reward settings to shared storage.")
+    except Exception as exc:
+        await interaction.response.send_message(f"Could not save invite reward settings: {str(exc)[:160]}", ephemeral=True); return
+    embed = discord.Embed(title="🎁 Crystal Hub Invite Rewards", description=(f"Invite **{required_invites}** active member(s) to claim **{reward_type.name}** for **{script}**.\n" + (f"Reward quantity: **{quantity} key(s)**." if reward_type.value == "key" else "Your whitelist will be granted automatically.") + "\n\nUse the buttons below to check your invites, get your link, or claim your reward."), color=0x8B5CF6)
+    await interaction.response.send_message("Invite reward panel created and settings saved.", ephemeral=True)
+    await interaction.channel.send(embed=embed, view=InviteRewardView())
 
-    embed = discord.Embed(
-        title="🎁 Invite Rewards System",
-        description="• **2 Invites** = 12 Hours Script ⏳\n• **4 Invites** = 2 Days Script 🚀\n___________________\nUse the buttons below to check invites and claim rewards.",
-        color=0x2b2d31
-    )
-    view = InviteRewardView()
-    await interaction.response.send_message("Panel created successfully!", ephemeral=True)
-    await interaction.channel.send(embed=embed, view=view)
 
 
 # Configure the HWID reset cooldown in seconds.
@@ -5249,6 +5719,10 @@ def _backup_snapshot(backup_type):
             "version": info.get("version", "1.0.0"),
             "buyer_role_id": info.get("buyer_role_id"),
             "admin_role_id": info.get("admin_role_id"),
+            "blacklist_role_id": info.get("blacklist_role_id"),
+            "blacklisted_users": sorted(int(x) for x in info.get("blacklisted_users", set()) if str(x).isdigit()),
+            "blacklisted_keys": sorted(str(x) for x in info.get("blacklisted_keys", set())),
+            "invite_reward_data": info.get("invite_reward_data", {}) if isinstance(info.get("invite_reward_data", {}), dict) else {},
             "source_code": info.get("source_code", "-- Default Script"),
             "source_obfuscated": bool(info.get("source_obfuscated", False)),
             "panel_guild_id": info.get("panel_guild_id"),
@@ -5268,6 +5742,7 @@ def _backup_snapshot(backup_type):
             "user_access": {str(k): v for k, v in (info.get("user_access") or {}).items()},
             "created_by": info.get("created_by"),
             "panel_created_by": info.get("panel_created_by"),
+            "guild_id": info.get("guild_id"),
         }
 
     snapshot = {
@@ -5283,6 +5758,7 @@ def _backup_snapshot(backup_type):
         "monthly_usage": monthly_usage,
         "known_users": sorted(KNOWN_USERS),
         "ai_information": AI_INFORMATION,
+        "invite_reward_state": invite_reward_state,
     }
 
     # Normal backups intentionally DO NOT carry any personal subscription/
@@ -5318,7 +5794,7 @@ def _restore_settings_backup(snapshot, backup_type, guild_id=None):
     global site_redeem_codes, site_entitlements, monthly_usage
     global AI_CHAT_CHANNELS, GLOBAL_ADMIN_ROLE_IDS
     global admin_redeemed_users, discord_plan_codes, discord_plan_entitlements
-    global KNOWN_USERS
+    global KNOWN_USERS, invite_reward_state
 
     if not isinstance(snapshot, dict) or snapshot.get("backup_version") != SETTINGS_BACKUP_VERSION:
         raise ValueError("This is not a compatible Crystal Hub settings backup.")
@@ -5352,6 +5828,9 @@ def _restore_settings_backup(snapshot, backup_type, guild_id=None):
             item["whitelisted_users"] = set(item.get("whitelisted_users", []))
             item["user_keys"] = {int(k): v for k, v in (item.get("user_keys") or {}).items() if str(k).lstrip("-").isdigit()}
             item["user_access"] = {int(k): v for k, v in (item.get("user_access") or {}).items() if str(k).lstrip("-").isdigit()}
+            item["blacklisted_users"] = {int(x) for x in item.get("blacklisted_users", []) if str(x).isdigit()}
+            item["blacklisted_keys"] = set(str(x) for x in item.get("blacklisted_keys", []))
+            item.setdefault("blacklist_role_id", None)
             item.setdefault("key_meta", {})
             restored_scripts[str(name)] = item
     scripts_data = restored_scripts
@@ -5371,6 +5850,9 @@ def _restore_settings_backup(snapshot, backup_type, guild_id=None):
         AI_INFORMATION.clear()
         AI_INFORMATION.update({str(g): str(v)[:12000] for g, v in snapshot["ai_information"].items() if str(g).isdigit() and isinstance(v, str)})
         _save_ai_information()
+    if isinstance(snapshot.get("invite_reward_state"), dict):
+        invite_reward_state = snapshot["invite_reward_state"]
+        _save_invite_reward_state()
 
     if isinstance(snapshot.get("site_redeem_codes"), dict):
         site_redeem_codes = snapshot["site_redeem_codes"]
@@ -6295,7 +6777,7 @@ async def explain_command(interaction: discord.Interaction):
 
 
 class AdminGuideLanguageView(BlacklistAwareView):
-    """Persistent bilingual guide for the two supported prefix administration commands."""
+    """Persistent bilingual guide for Crystal Hub slash and prefix admin commands."""
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -6309,6 +6791,9 @@ class AdminGuideLanguageView(BlacklistAwareView):
                 "**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` · `-unblacklist USER_ID`\n\n"
                 "**PRIVATE ANNOUNCEMENT**\n`-ann Your message`\n"
                 "DM an announcement to known users.\n\n"
+                "**SCRIPT ACCESS / KEYS**\n`/un-whitlist user script` removes a user's whitelist and assigned key. `/delete-key key` permanently deletes a key and linked access.\n"
+                "`/blacklist user script` blocks that user from the selected script only. `/blacklist-key key script` blocks one exact key; `/unblacklist-key key script` restores it. `/role role_type script role` configures the script Admin, Buyer, or Blacklist role.\n"
+                "`/invite-reward required_invites reward_type script quantity` configures invite rewards (1–200 invites).\n\n"
                 "**BACKUPS**\n`-g files` exports the full Admin backup; `-files` imports it.\n"
                 "`-script file` backs up scripts/source/panels; `/ai-information` saves server-specific AI instructions (Admin/Ultra + Admin role or Administrator).\n\n"
                 "Standard subscription redeem codes remain single-use."
@@ -6325,6 +6810,9 @@ class AdminGuideLanguageView(BlacklistAwareView):
                 "**إرسال رسالة لقناة**\n`-massage #channel رسالتك هنا`\n\n"
                 "**حظر / فك حظر مستخدم**\n`-blacklist @user` · `-unblacklist USER_ID`\n\n"
                 "**إعلان خاص**\n`-ann رسالتك هنا`\n\n"
+                "**إدارة وصول السكريبت والمفاتيح**\n`/un-whitlist user script` لإزالة المستخدم من الوايت ليست وحذف مفتاحه. `/delete-key key` لحذف المفتاح نهائيًا.\n"
+                "`/blacklist user script` لحظر المستخدم من سكريبت واحد فقط. `/role role_type script role` لتعيين رتبة Admin أو Buyer أو Blacklist للسكريبت.\n"
+                "`/invite-reward required_invites reward_type script quantity` لإعداد مكافآت الدعوات (من 1 إلى 200 دعوة).\n\n"
                 "**النسخ الاحتياطي**\n`-g files` لتصدير النسخة الكاملة، و`-files` لاستيرادها.\n"
                 "`-script file` لنسخة السكربتات والسورس والبانلات، و`/ai-information` لحفظ معلومات الذكاء الاصطناعي.\n\n"
                 "أكواد الاشتراك العادية تظل استخدامًا واحدًا."
@@ -6335,8 +6823,9 @@ class AdminGuideLanguageView(BlacklistAwareView):
 
 
 @bot.tree.command(name="admin", description="Show the Crystal Hub administration guide")
+@app_commands.guild_only()
 async def admin_command(interaction: discord.Interaction):
-    if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users or _discord_plan(interaction.user.id) == "Admin"):
+    if not (is_bot_owner(interaction.user.id) or str(interaction.user.id) in admin_redeemed_users or _discord_plan(interaction.user.id) == "Admin" or is_guild_administrator(interaction) or _has_global_admin_access(interaction)):
         await interaction.response.send_message(
             "❌ This command requires internal bot authorization.",
             ephemeral=True,
@@ -6348,7 +6837,9 @@ async def admin_command(interaction: discord.Interaction):
             "**CHANNEL MESSAGE**\n`-massage @user Your private message` أو `-massage #channel Your message`\n"
             "**GLOBAL USER BLOCK / UNBLOCK**\n`-blacklist @user` · `-unblacklist USER_ID`\n"
             "**PRIVATE ANNOUNCEMENT**\n`-ann Your message`\n"
-            "**BACKUPS**\n`-g files` exports the full Admin backup; `-files` imports it. `-script file` backs up scripts; `/ai-information` saves server-specific AI instructions (Admin/Ultra + Admin role or Administrator).\n"
+            "**SCRIPT ACCESS / KEYS**\n`/un-whitlist user script` removes a user's whitelist/key. `/delete-key key` permanently deletes a key. `/blacklist user script` blocks one user from one script. `/blacklist-key key script` blocks an exact key; `/unblacklist-key key script` restores it.\n"
+            "`/role role_type script role` sets the script Admin, Buyer, or Blacklist role. `/invite-reward required_invites reward_type script quantity` configures invite rewards (1–200).\n"
+            "**BACKUPS**\n`-g files` exports the full Admin backup; `-files` imports it. `-script file` backs up scripts; `/ai-information` saves server-specific AI instructions.\n"
             "Standard subscription redeem codes remain single-use."
         ),
         color=discord.Color.gold(),
